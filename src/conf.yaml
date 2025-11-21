@@ -1,0 +1,9 @@
+#
+# The maximum number of simultaneous connections is unknown, but with thread = 1, it may be around 200.
+#
+# For the setting items, please refer to the following URL:
+#  https://www.pingorarust.com/user_guide/conf
+version: 1
+threads: 10
+# The size of the keepalive pool for each upstream host.
+upstream_keepalive_pool_size: 1

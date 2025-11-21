@@ -1,0 +1,32 @@
+[package]
+name = "spngw"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["sync", "time"] }
+pingora = { version = "0.6", features = [ "lb", "boringssl" ] }
+boring = "4"
+async-trait = "0.1"
+
+dashmap = "6"
+env_logger = "0.11"
+hex = "0.4"
+log = "0.4"
+rand = "0.8"
+chrono = "0.4"
+uuid = { version = "1", features = ["v4"] }
+arc-swap = "1.7"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+bytes = "1"
+jsonwebtoken = "9"
+serde = { version = "1.0", features = ["derive"] }
+serde_urlencoded = "0.7"
+serde_json = "1.0"
+
+once_cell = "1.19"
+rsa = "0.9"
+
+hyper = { version = "0.14", features = ["full"] }
+cookie = "0.18"
