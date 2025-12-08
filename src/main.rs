@@ -86,6 +86,9 @@ impl JwtSigningKeys {
     }
 }
 
+type SessionStore = Arc<DashMap<String, Arc<ApplicationSession>>>;
+// NEW pub type SessionStore = Arc<RwLock<HashMap<String, ApplicationSession>>>;
+
 /// Represents a user's application-level session.
 ///
 /// An instance of this struct is created for each unique client session, identified
@@ -112,14 +115,14 @@ struct ApplicationSession {
 ///
 /// It manages two primary forms of client state via cookies:
 /// - **Application Session**: A stateful session identified by the `MY_APP_SESSION`
-///   cookie, storing server-side data like OAuth tokens in `application_sessions`.
+///   cookie, storing server-side data like OAuth tokens in `session_store`.
 /// - **Device Cookie**: A stateless JWT (`DEVICE_CONTEXT`) used to identify a
 ///   client device or browser instance, signed using keys from `JwtSigningKeys`.
 ///
 /// A single instance is created at startup and shared immutably across all
 /// worker threads for the lifetime of the application.
-struct TLSGatewayRouter {
-    application_sessions: Arc<DashMap<String, Arc<ApplicationSession>>>,
+struct GatewayRouter {
+    session_store: SessionStore,
     upstreams: Arc<DashMap<String, Arc<HttpPeer>>>,
     no_sni_upstream: Arc<HttpPeer>,
     fallback_upstream: Arc<HttpPeer>,
@@ -128,7 +131,33 @@ struct TLSGatewayRouter {
     start_time: Instant,
 }
 
-impl TLSGatewayRouter {
+/// A custom context that holds state for a single HTTP request.
+///
+/// An instance of this struct is created for each request via `ProxyHttp::new_ctx()`
+/// and is passed through the different phases of the request proxying lifecycle
+/// (e.g., `request_filter`, `upstream_peer`). Its lifetime is tied to a single
+/// request-response cycle.
+pub struct GatewayCtx {
+    // A reference to the shared session store.
+    session_store: SessionStore,
+    span: tracing::Span,
+    start_time: Instant,
+    upstream_sni_name: Option<String>,
+    session_id: Option<String>,
+    app_session_is_new: bool,
+    device_context_is_new: bool,
+}
+
+/// Claims for the device context JWT
+#[derive(Debug, Serialize, Deserialize)]
+struct DeviceContext {
+    iss: String, // Issuer
+    sub: String, // Subject (device/session ID)
+    iat: u64,    // Issued At
+    exp: u64,    // Expiration Time
+}
+
+impl GatewayRouter {
     /// Verifies the application-level session from the incoming request.
     ///
     /// This function inspects the `SPN_SESSION` cookie.
@@ -139,7 +168,7 @@ impl TLSGatewayRouter {
     ///
     /// Note: This function *does not* create the session object in the shared map;
     /// that is deferred to `create_application_session_if_new` in the response phase.
-    fn verify_application_session(&self, session: &Session, ctx: &mut ProxyCTX) {
+    fn verify_application_session(&self, session: &Session, ctx: &mut GatewayCtx) {
         let cookie_value = session
             .get_header("Cookie")
             .and_then(|header| header.to_str().ok())
@@ -157,8 +186,8 @@ impl TLSGatewayRouter {
             });
 
         if let Some(sid) = cookie_value {
-            if sid.len() == 32 && self.application_sessions.contains_key(&sid) {
-                if let Some(data) = self.application_sessions.get(&sid) {
+            if sid.len() == 32 && ctx.session_store.contains_key(&sid) {
+                if let Some(data) = ctx.session_store.get(&sid) {
                     tracing::info!(
                         "Application Session SPN_SESSION: Existing session found: {}",
                         sid
@@ -202,7 +231,7 @@ impl TLSGatewayRouter {
     /// the shared map, and adds a `Set-Cookie` header to the upstream response.
     fn create_application_session_if_new(
         &self,
-        ctx: &ProxyCTX,
+        ctx: &GatewayCtx,
         upstream_response: &mut ResponseHeader,
     ) -> Result<()> {
         if !ctx.app_session_is_new {
@@ -225,7 +254,7 @@ impl TLSGatewayRouter {
             refresh_token: ArcSwapOption::from(None),
             access_token_expires_at: ArcSwapOption::from(None),
         });
-        self.application_sessions
+        ctx.session_store
             .insert(new_sid.to_string(), app_session);
 
         // Issue session cookie
@@ -238,7 +267,7 @@ impl TLSGatewayRouter {
 
         // Log all current session IDs
         let session_ids: Vec<String> = self
-            .application_sessions
+            .session_store
             .iter()
             .map(|entry| entry.key().clone())
             .collect();
@@ -256,8 +285,8 @@ impl TLSGatewayRouter {
     /// This function is called from `request_filter`. It checks for the presence of
     /// the `DEVICE_CONTEXT` cookie. If found, it validates the JWT's signature and
     /// claims. If validation fails (e.g., invalid signature, expired), it sets a
-    /// flag in the `ProxyCTX` to signal that a new cookie should be issued.
-    fn verify_device_cookie(&self, session: &Session, ctx: &mut ProxyCTX) {
+    /// flag in the `GatewayCtx` to signal that a new cookie should be issued.
+    fn verify_device_cookie(&self, session: &Session, ctx: &mut GatewayCtx) {
         let jwt_cookie_value = session.get_header("Cookie").and_then(|c| {
             c.to_str().ok().and_then(|cookie_str| {
                 cookie_str.split(';').find_map(|s| {
@@ -331,36 +360,13 @@ impl TLSGatewayRouter {
     }
 }
 
-/// Claims for the device context JWT
-#[derive(Debug, Serialize, Deserialize)]
-struct DeviceContext {
-    iss: String, // Issuer
-    sub: String, // Subject (device/session ID)
-    iat: u64,    // Issued At
-    exp: u64,    // Expiration Time
-}
-
-/// A custom context that holds state for a single HTTP request.
-///
-/// An instance of this struct is created for each request via `ProxyHttp::new_ctx()`
-/// and is passed through the different phases of the request proxying lifecycle
-/// (e.g., `request_filter`, `upstream_peer`). Its lifetime is tied to a single
-/// request-response cycle.
-pub struct ProxyCTX {
-    span: tracing::Span,
-    start_time: Instant,
-    upstream_sni_name: Option<String>,
-    session_id: Option<String>,
-    app_session_is_new: bool,
-    device_context_is_new: bool,
-}
-
 #[async_trait]
-impl ProxyHttp for TLSGatewayRouter {
-    type CTX = ProxyCTX;
+impl ProxyHttp for GatewayRouter {
+    type CTX = GatewayCtx;
 
     fn new_ctx(&self) -> Self::CTX {
-        ProxyCTX {
+        GatewayCtx {
+            session_store: Arc::clone(&self.session_store),
             span: tracing::info_span!("proxy_request", req_id = %Uuid::new_v4()),
             start_time: Instant::now(),
             upstream_sni_name: None,
@@ -501,7 +507,7 @@ impl ProxyHttp for TLSGatewayRouter {
                                         //tracing::info!("[BFF] Storing access_token {}.", token);
                                         if let Some(sid) = &ctx.session_id {
                                             if let Some(app_session) =
-                                                self.application_sessions.get(sid)
+                                                ctx.session_store.get(sid)
                                             {
                                                 app_session
                                                     .access_token
@@ -629,7 +635,7 @@ impl ProxyHttp for TLSGatewayRouter {
             {
                 if let Some(sid) = &ctx.session_id {
                     tracing::info!("[BFF] API call ... session id {}", sid);
-                    if let Some(app_session) = self.application_sessions.get(sid) {
+                    if let Some(app_session) = ctx.session_store.get(sid) {
                         tracing::info!("[BFF] API call ... app_session exists");
                         if let Some(access_token_arc) = app_session.access_token.load_full() {
                             // Check if the access token is expired
@@ -1109,23 +1115,23 @@ impl BackgroundService for CertificateReloader {
 // A background service to periodically clean up expired sessions.
 struct SessionPurger {
     start_time: Instant,
-    application_sessions: Arc<DashMap<String, Arc<ApplicationSession>>>,
+    session_store: SessionStore,
     session_ttl: Duration,
 }
 
 impl SessionPurger {
     fn cleanup_expired_sessions(&self) {
-        let before_count = self.application_sessions.len();
+        let before_count = self.session_store.len();
         if before_count == 0 {
             return; // No sessions to clean up.
         }
         let now = Instant::now();
-        self.application_sessions.retain(|_sid, session| {
+        self.session_store.retain(|_sid, session| {
             let last_accessed_secs = session.last_accessed.load(Ordering::Relaxed);
             let last_accessed_instant = self.start_time + Duration::from_secs(last_accessed_secs);
             now.duration_since(last_accessed_instant) < self.session_ttl
         });
-        let after_count = self.application_sessions.len();
+        let after_count = self.session_store.len();
         let cleaned_count = before_count - after_count;
         if cleaned_count > 0 {
             tracing::info!(
@@ -1232,8 +1238,8 @@ fn main() -> pingora::Result<()> {
     // Fallback for any other SNI (e.g., www2.example.com)
     let fallback_upstream = Arc::new(HttpPeer::new("127.0.0.1:8089", false, "".to_string()));
 
-    let router_logic = TLSGatewayRouter {
-        application_sessions: sessions.clone(),
+    let router_logic = GatewayRouter {
+        session_store: sessions.clone(),
         upstreams,
         no_sni_upstream,
         fallback_upstream,
@@ -1259,7 +1265,7 @@ fn main() -> pingora::Result<()> {
     let session_ttl = Duration::from_secs(30 * 60); // 30 minutes
     let purger_logic = Arc::new(SessionPurger {
         start_time,
-        application_sessions: sessions.clone(),
+        session_store: sessions.clone(),
         session_ttl,
     });
     let purger_service = pingora::services::background::GenBackgroundService::new(
