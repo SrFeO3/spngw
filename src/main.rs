@@ -107,6 +107,18 @@ struct ApplicationSession {
     access_token_expires_at: ArcSwapOption<SystemTime>,
 }
 
+/// A container for all upstream peer definitions.
+///
+/// This struct centralizes the management of different upstream categories:
+/// - `sni_map`: A map for SNI-based and path-based routing lookups.
+/// - `no_sni`: The default upstream for requests without an SNI header.
+/// - `fallback`: The default upstream for requests with an unrecognized SNI.
+struct UpstreamSet {
+    sni_map: Arc<DashMap<String, Arc<HttpPeer>>>,
+    no_sni: Arc<HttpPeer>,
+    fallback: Arc<HttpPeer>,
+}
+
 /// The core logic and shared state for the proxy service.
 ///
 /// This struct implements the `ProxyHttp` trait and holds all shared resources
@@ -123,9 +135,7 @@ struct ApplicationSession {
 /// worker threads for the lifetime of the application.
 struct GatewayRouter {
     session_store: SessionStore,
-    upstreams: Arc<DashMap<String, Arc<HttpPeer>>>,
-    no_sni_upstream: Arc<HttpPeer>,
-    fallback_upstream: Arc<HttpPeer>,
+    upstreams: UpstreamSet,
     sni_ex_data_index: Index<Ssl, Option<String>>,
     keys: Arc<JwtSigningKeys>,
     start_time: Instant,
@@ -392,15 +402,15 @@ impl ProxyHttp for GatewayRouter {
                 tracing::info!("SNI found: {}. Looking for specific upstream.", sni_name);
                 // For bff.example.com, we just pass the SNI name to upstream_peer for path-based routing.
                 // For other SNIs, we check if a specific upstream exists.
-                if sni_name == "bff.wgd.example.com" || self.upstreams.contains_key(sni_name) {
+                if sni_name == "bff.wgd.example.com" || self.upstreams.sni_map.contains_key(sni_name) {
                     sni_name.to_string()
                 } else {
-                    self.fallback_upstream.sni.clone()
+                    self.upstreams.fallback.sni.clone()
                 }
             }
             None => {
                 tracing::info!("No SNI found. Using no-SNI upstream.");
-                self.no_sni_upstream.sni.clone()
+                self.upstreams.no_sni.sni.clone()
             }
         };
         ctx.upstream_sni_name = Some(upstream_sni_name);
@@ -805,27 +815,27 @@ impl ProxyHttp for GatewayRouter {
             let path = session.req_header().uri.path();
             tracing::info!("Path-based routing for bff.example.com, path: {}", path);
             if path.starts_with("/api") {
-                self.upstreams.get("bff_api").unwrap().value().clone()
+                self.upstreams.sni_map.get("bff_api").unwrap().value().clone()
             } else {
-                self.upstreams.get("bff_root").unwrap().value().clone()
+                self.upstreams.sni_map.get("bff_root").unwrap().value().clone()
             }
         } else {
-            if upstream_sni_name == self.no_sni_upstream.sni {
-                self.no_sni_upstream.clone()
-            } else if upstream_sni_name == self.fallback_upstream.sni {
-                self.fallback_upstream.clone()
+            if upstream_sni_name == self.upstreams.no_sni.sni {
+                self.upstreams.no_sni.clone()
+            } else if upstream_sni_name == self.upstreams.fallback.sni {
+                self.upstreams.fallback.clone()
             } else {
                 // Look up the peer from the upstreams map.
                 // If not found (which shouldn't happen if logic is consistent), use fallback.
                 self.upstreams
-                    .get(upstream_sni_name)
+                    .sni_map.get(upstream_sni_name)
                     .map(|p| p.value().clone())
                     .unwrap_or_else(|| {
                         tracing::warn!(
                             "Upstream for SNI '{}' not found, using fallback.",
                             upstream_sni_name
                         );
-                        self.fallback_upstream.clone()
+                        self.upstreams.fallback.clone()
                     })
             }
         };
@@ -1238,11 +1248,15 @@ fn main() -> pingora::Result<()> {
     // Fallback for any other SNI (e.g., www2.example.com)
     let fallback_upstream = Arc::new(HttpPeer::new("127.0.0.1:8089", false, "".to_string()));
 
+    let upstream_set = UpstreamSet {
+        sni_map: upstreams,
+        no_sni: no_sni_upstream,
+        fallback: fallback_upstream,
+    };
+
     let router_logic = GatewayRouter {
         session_store: sessions.clone(),
-        upstreams,
-        no_sni_upstream,
-        fallback_upstream,
+        upstreams: upstream_set,
         sni_ex_data_index: sni_ex_data_index.clone(),
         keys,
         start_time,
