@@ -51,8 +51,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::SystemTime;
 use std::time::{Duration, Instant};
-use tracing;
 use uuid::Uuid;
+
+use log::{info, warn, error};
 
 /// Holds the application's cryptographic keys.
 ///
@@ -150,7 +151,6 @@ struct GatewayRouter {
 pub struct GatewayCtx {
     // A reference to the shared session store.
     session_store: SessionStore,
-    span: tracing::Span,
     start_time: Instant,
     upstream_sni_name: Option<String>,
     session_id: Option<String>,
@@ -198,7 +198,7 @@ impl GatewayRouter {
         if let Some(sid) = cookie_value {
             if sid.len() == 32 && ctx.session_store.contains_key(&sid) {
                 if let Some(data) = ctx.session_store.get(&sid) {
-                    tracing::info!(
+                    info!(
                         "Application Session SPN_SESSION: Existing session found: {}",
                         sid
                     );
@@ -211,12 +211,12 @@ impl GatewayRouter {
                     return;
                 }
             }
-            tracing::warn!(
+            warn!(
                 "Application Session SPN_SESSION: Session ID '{}' from cookie is invalid or not found. A new session will be created.",
                 sid
             );
         } else {
-            tracing::info!(
+            info!(
                 "Application Session SPN_SESSION: No valid cookie found. A new session will be created."
             );
         }
@@ -226,7 +226,7 @@ impl GatewayRouter {
         rand::thread_rng().fill_bytes(&mut new_sid_bytes);
         let new_sid = hex::encode(new_sid_bytes);
 
-        tracing::info!(
+        info!(
             "Application Session SPN_SESSION: Generated new session ID for pending creation: {}",
             new_sid
         );
@@ -272,7 +272,7 @@ impl GatewayRouter {
             "SPN_SESSION={}; Path=/; HttpOnly; Secure; SameSite=Lax",
             new_sid
         );
-        tracing::info!("Setting new HTTP session cookie: {}", &cookie_header);
+        info!("Setting new HTTP session cookie: {}", &cookie_header);
         upstream_response.insert_header("Set-Cookie", cookie_header)?;
 
         // Log all current session IDs
@@ -281,7 +281,7 @@ impl GatewayRouter {
             .iter()
             .map(|entry| entry.key().clone())
             .collect();
-        tracing::info!(
+        info!(
             "Application Session SPN_SESSION: Current active sessions ({}): {:?}",
             session_ids.len(),
             session_ids
@@ -318,7 +318,7 @@ impl GatewayRouter {
             ) {
                 Ok(token_data) => {
                     let claims = token_data.claims;
-                    tracing::info!(
+                    info!(
                         "Successfully validated DEVICE_CONTEXT JWT. iss: {}, sub: {}, iat: {}, exp: {}",
                         claims.iss,
                         claims.sub,
@@ -327,7 +327,7 @@ impl GatewayRouter {
                     );
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to validate DEVICE_CONTEXT JWT: {}", e);
+                    warn!("Failed to validate DEVICE_CONTEXT JWT: {}", e);
                     ctx.device_context_is_new = true;
                 }
             }
@@ -364,7 +364,7 @@ impl GatewayRouter {
             "DEVICE_CONTEXT={}; Path=/; Secure; SameSite=Lax; Max-Age={}",
             token, max_age_seconds
         );
-        tracing::info!("Setting new JWT cookie.");
+        info!("Setting new JWT cookie.");
         upstream_response.append_header("Set-Cookie", jwt_cookie_header)?;
         Ok(())
     }
@@ -377,7 +377,6 @@ impl ProxyHttp for GatewayRouter {
     fn new_ctx(&self) -> Self::CTX {
         GatewayCtx {
             session_store: Arc::clone(&self.session_store),
-            span: tracing::info_span!("proxy_request", req_id = %Uuid::new_v4()),
             start_time: Instant::now(),
             upstream_sni_name: None,
             session_id: None,
@@ -399,7 +398,7 @@ impl ProxyHttp for GatewayRouter {
 
         let upstream_sni_name = match sni.as_deref() {
             Some(sni_name) => {
-                tracing::info!("SNI found: {}. Looking for specific upstream.", sni_name);
+                info!("SNI found: {}. Looking for specific upstream.", sni_name);
                 // For bff.example.com, we just pass the SNI name to upstream_peer for path-based routing.
                 // For other SNIs, we check if a specific upstream exists.
                 if sni_name == "bff.wgd.example.com" || self.upstreams.sni_map.contains_key(sni_name) {
@@ -409,24 +408,11 @@ impl ProxyHttp for GatewayRouter {
                 }
             }
             None => {
-                tracing::info!("No SNI found. Using no-SNI upstream.");
+                info!("No SNI found. Using no-SNI upstream.");
                 self.upstreams.no_sni.sni.clone()
             }
         };
         ctx.upstream_sni_name = Some(upstream_sni_name);
-
-        // Enter the span to associate logs with this request.
-        // The block limits the scope of the immutable borrow on `ctx`.
-        {
-            let _enter = ctx.span.enter();
-            tracing::info!(
-                "Request started for {} {} from client {:?} with SNI: {:?}",
-                session.req_header().method,
-                session.req_header().uri,
-                session.client_addr(),
-                sni,
-            );
-        }
 
         // First, ensure the application session is handled for all requests.
         self.verify_application_session(session, ctx);
@@ -434,22 +420,21 @@ impl ProxyHttp for GatewayRouter {
         // SAMPLE REQ-1 BFF get token
         if session.req_header().method == "POST" && session.req_header().uri.path() == "/api/token"
         {
-            let _enter = ctx.span.enter();
-            tracing::info!("Received POST request for /api/token. Reading body...");
+            info!("Received POST request for /api/token. Reading body...");
 
             // Read the entire request body.
             // This consumes the body. Since we are responding directly, we don't need to put it back.
             if let Some(body_bytes) = session.read_request_body().await? {
-                tracing::info!("Request body read, size: {} bytes.", body_bytes.len());
+                info!("Request body read, size: {} bytes.", body_bytes.len());
 
                 // Parse the application/x-www-form-urlencoded body
                 // Parse into a HashMap to display all key-value pairs.
                 if let Ok(form_data) =
                     serde_urlencoded::from_bytes::<HashMap<String, String>>(&body_bytes)
                 {
-                    tracing::info!("[BFF] Received form data for /api/token:");
+                    info!("[BFF] Received form data for /api/token:");
                     for (key, value) in &form_data {
-                        tracing::info!("[BFF] front -> bff   {}: {}", key, value);
+                        info!("[BFF] front -> bff   {}: {}", key, value);
                     }
 
                     // Convert HashMap to slice of tuples for the function call
@@ -459,7 +444,7 @@ impl ProxyHttp for GatewayRouter {
                         .collect();
 
                     // Send the form data to the auth server
-                    tracing::info!(
+                    info!(
                         "[BFF] Fetching form data to http://192.168.10.132:8082/api/token"
                     );
                     match send_form_post_request(
@@ -471,14 +456,14 @@ impl ProxyHttp for GatewayRouter {
                     .await
                     {
                         Ok((resp, _cookies)) => {
-                            tracing::info!("[BFF] Auth server response status: {}", resp.status());
+                            info!("[BFF] Auth server response status: {}", resp.status());
                             // Read response body
                             let body_bytes = to_bytes(resp.into_body()).await.unwrap_or_default();
                             match serde_json::from_slice::<HashMap<String, serde_json::Value>>(
                                 &body_bytes,
                             ) {
                                 Ok(json_body) => {
-                                    tracing::info!("[BFF] Parsed auth server JSON response.");
+                                    info!("[BFF] Parsed auth server JSON response.");
 
                                     // extract access_token, id_token, refresh_token, token_type, expires_in
                                     let access_token =
@@ -498,7 +483,7 @@ impl ProxyHttp for GatewayRouter {
                                         SystemTime::now().checked_add(Duration::from_secs(secs))
                                     });
 
-                                    tracing::info!(
+                                    info!(
                                         "[BFF] Extracted tokens: access_token: {:?}, id_token: {:?}, refresh_token: {:?}, token_type: {:?}, expires_in: {:?}, scope: {:?}, expires_at: {:?}",
                                         access_token,
                                         id_token,
@@ -514,7 +499,7 @@ impl ProxyHttp for GatewayRouter {
                                     {
                                         //app_session.access_token.store(Some(Arc::new(token.to_string())));
                                         //access_token = token;
-                                        //tracing::info!("[BFF] Storing access_token {}.", token);
+                                        //info!("[BFF] Storing access_token {}.", token);
                                         if let Some(sid) = &ctx.session_id {
                                             if let Some(app_session) =
                                                 ctx.session_store.get(sid)
@@ -528,20 +513,20 @@ impl ProxyHttp for GatewayRouter {
                                                 app_session
                                                     .access_token_expires_at
                                                     .store(expires_at.map(Arc::new));
-                                                tracing::info!(
+                                                info!(
                                                     "[BFF] Stored access_token, expires_at, refresh_token stored at session {}",
                                                     sid
                                                 );
                                             }
                                         }
                                     } else {
-                                        tracing::warn!(
+                                        warn!(
                                             "[BFF] No access_token found in auth server response."
                                         );
                                     }
                                 }
                                 Err(e) => {
-                                    tracing::error!(
+                                    error!(
                                         "[BFF] Failed to parse auth server response as JSON: {}",
                                         e
                                     );
@@ -549,14 +534,14 @@ impl ProxyHttp for GatewayRouter {
                             }
                         }
                         Err(e) => {
-                            tracing::error!("[BFF] Error sending request to auth server: {}", e);
+                            error!("[BFF] Error sending request to auth server: {}", e);
                         }
                     }
                 } else {
-                    tracing::warn!("Failed to parse token request form.");
+                    warn!("Failed to parse token request form.");
                 }
             } else {
-                tracing::info!("POST request to /api/token had no body.");
+                info!("POST request to /api/token had no body.");
             }
 
             // Return only "OK" or "NG" to the SPA JavaScript.
@@ -583,7 +568,7 @@ impl ProxyHttp for GatewayRouter {
         // SAMPLE REQ-2
         // Block requests to www1.example.com and return a direct response.
         if ctx.upstream_sni_name.as_deref() == Some("www1.example.com") {
-            tracing::warn!("Blocking NO SNI request as per policy");
+            warn!("Blocking NO SNI request as per policy");
             let body = "NO SNI Request is blocked by the proxy.";
             let mut resp = ResponseHeader::build(403, None)?; // 403 Forbidden is more appropriate
             resp.insert_header("Content-Type", "text/plain")?;
@@ -603,7 +588,7 @@ impl ProxyHttp for GatewayRouter {
                 .get_header("Access-Control-Request-Method")
                 .is_some()
         {
-            tracing::info!("Handling CORS preflight request");
+            info!("Handling CORS preflight request");
             let mut resp = ResponseHeader::build(204, None)?;
 
             // For this example, we reflect the request's Origin header.
@@ -638,15 +623,15 @@ impl ProxyHttp for GatewayRouter {
         self.verify_device_cookie(session, ctx);
 
         // [BFF] Add Authorization header for /api/* requests
-        tracing::info!("[BFF] API call ... adding token");
+        info!("[BFF] API call ... adding token");
         if let Some(sni_name) = &sni {
             if sni_name == "bff.wgd.example.com"
                 && session.req_header().uri.path().starts_with("/api")
             {
                 if let Some(sid) = &ctx.session_id {
-                    tracing::info!("[BFF] API call ... session id {}", sid);
+                    info!("[BFF] API call ... session id {}", sid);
                     if let Some(app_session) = ctx.session_store.get(sid) {
-                        tracing::info!("[BFF] API call ... app_session exists");
+                        info!("[BFF] API call ... app_session exists");
                         if let Some(access_token_arc) = app_session.access_token.load_full() {
                             // Check if the access token is expired
                             if let Some(expires_at_arc) =
@@ -660,14 +645,14 @@ impl ProxyHttp for GatewayRouter {
                                     .unwrap_or_else(|e| -(e.duration().as_secs() as i64));
 
                                 if now < expires_at {
-                                    tracing::info!(
+                                    info!(
                                         "[BFF] Access token is valid. Expires at: {:?}, Now: {:?}, Diff: {:?}",
                                         expires_at,
                                         now,
                                         remaining_secs
                                     );
                                 } else {
-                                    tracing::warn!(
+                                    warn!(
                                         "[BFF] Access token has expired. Expired at: {:?}, Now: {:?},  Diff: {:?}",
                                         expires_at,
                                         now,
@@ -685,7 +670,7 @@ impl ProxyHttp for GatewayRouter {
                                             ("client_id", "fruit-shop"),
                                         ];
 
-                                        tracing::info!(
+                                        info!(
                                             "[BFF] Refreshing token. Fetching form data to http://192.168.10.132:8082/api/token"
                                         );
                                         match send_form_post_request(
@@ -697,7 +682,7 @@ impl ProxyHttp for GatewayRouter {
                                         .await
                                         {
                                             Ok((resp, _cookies)) => {
-                                                tracing::info!(
+                                                info!(
                                                     "[BFF] Auth server response status for refresh: {}",
                                                     resp.status()
                                                 );
@@ -710,7 +695,7 @@ impl ProxyHttp for GatewayRouter {
                                                 >(
                                                     &body_bytes
                                                 ) {
-                                                    tracing::info!(
+                                                    info!(
                                                         "[BFF] Parsed token refresh response."
                                                     );
                                                     // Update access token, refresh token (if rotated), and expiration
@@ -730,7 +715,7 @@ impl ProxyHttp for GatewayRouter {
                                                             )
                                                         });
 
-                                                    tracing::info!(
+                                                    info!(
                                                         "[BFF] Refreshed tokens: new_access_token: {:?}, new_refresh_token: {:?}, expires_in: {:?}, new_expires_at: {:?}",
                                                         new_access_token,
                                                         new_refresh_token,
@@ -746,52 +731,52 @@ impl ProxyHttp for GatewayRouter {
                                                         app_session
                                                             .refresh_token
                                                             .store(Some(Arc::new(rt.to_string())));
-                                                        tracing::info!(
+                                                        info!(
                                                             "[BFF] Refresh token was rotated."
                                                         );
                                                     }
                                                     app_session
                                                         .access_token_expires_at
                                                         .store(new_expires_at.map(Arc::new));
-                                                    tracing::info!(
+                                                    info!(
                                                         "[BFF] Session tokens refreshed successfully."
                                                     );
                                                 } else {
-                                                    tracing::error!(
+                                                    error!(
                                                         "[BFF] Failed to parse token refresh response as JSON."
                                                     );
                                                 }
                                             }
                                             Err(e) => {
-                                                tracing::error!(
+                                                error!(
                                                     "[BFF] Error sending token refresh request: {}",
                                                     e
                                                 );
                                             }
                                         }
                                     } else {
-                                        tracing::warn!(
+                                        warn!(
                                             "[BFF] Access token expired, but no refresh token available."
                                         );
                                     }
                                 }
                             } else {
-                                tracing::info!("[BFF] Access token expiration time not set.");
+                                info!("[BFF] Access token expiration time not set.");
                             }
 
                             // get access token
-                            tracing::info!("[BFF] API call ... access_token loaded");
+                            info!("[BFF] API call ... access_token loaded");
                             let token_str = &*access_token_arc;
                             let auth_header_value = format!("Bearer {}", token_str);
                             session
                                 .req_header_mut()
                                 .insert_header("Authorization", auth_header_value)?;
-                            tracing::info!(
+                            info!(
                                 "[BFF] API call ... Added Authorization header to upstream request for session {}.",
                                 sid
                             );
                         } else {
-                            tracing::info!("[BFF] API call ... no access_token");
+                            info!("[BFF] API call ... no access_token");
                         }
                     }
                 }
@@ -806,14 +791,13 @@ impl ProxyHttp for GatewayRouter {
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        let _enter = ctx.span.enter();
 
         // Use the upstream name that was already determined in request_filter.
         let upstream_sni_name = ctx.upstream_sni_name.as_deref().unwrap_or_default();
 
         let upstream = if upstream_sni_name == "bff.wgd.example.com" {
             let path = session.req_header().uri.path();
-            tracing::info!("Path-based routing for bff.example.com, path: {}", path);
+            info!("Path-based routing for bff.example.com, path: {}", path);
             if path.starts_with("/api") {
                 self.upstreams.sni_map.get("bff_api").unwrap().value().clone()
             } else {
@@ -831,7 +815,7 @@ impl ProxyHttp for GatewayRouter {
                     .sni_map.get(upstream_sni_name)
                     .map(|p| p.value().clone())
                     .unwrap_or_else(|| {
-                        tracing::warn!(
+                        warn!(
                             "Upstream for SNI '{}' not found, using fallback.",
                             upstream_sni_name
                         );
@@ -840,7 +824,7 @@ impl ProxyHttp for GatewayRouter {
             }
         };
 
-        tracing::info!("Forwarding to upstream: {}", upstream);
+        info!("Forwarding to upstream: {}", upstream);
         // HttpPeer is Clone, so we can clone it from the Arc.
         Ok(Box::new((*upstream).clone()))
     }
@@ -852,12 +836,11 @@ impl ProxyHttp for GatewayRouter {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         {
-            let _enter = ctx.span.enter();
 
             // Use the upstream name that was already determined in request_filter.
             let upstream_sni_name = ctx.upstream_sni_name.as_deref().unwrap_or("");
 
-            tracing::info!(
+            info!(
                 "Reesponse started for {} {} from client {:?} with SNI: {:?}",
                 session.req_header().method,
                 session.req_header().uri,
@@ -873,13 +856,13 @@ impl ProxyHttp for GatewayRouter {
             upstream_response.insert_header("Access-Control-Allow-Origin", origin.clone())?;
             upstream_response.insert_header("Vary", "Origin")?;
             if let Ok(origin_str) = origin.to_str() {
-                tracing::info!("CORS: {}", origin_str);
+                info!("CORS: {}", origin_str);
             } else {
-                tracing::warn!("CORS: origin header contains non-UTF8 characters");
+                warn!("CORS: origin header contains non-UTF8 characters");
             }
         } else {
             upstream_response.insert_header("Access-Control-Allow-Origin", "*")?;
-            tracing::info!("CORS: *");
+            info!("CORS: *");
         }
 
         // SAMPLE RES-2 DEVICE Cookie
@@ -908,11 +891,10 @@ impl ProxyHttp for GatewayRouter {
     }
 
     async fn logging(&self, session: &mut Session, _e: Option<&Error>, ctx: &mut Self::CTX) {
-        let _enter = ctx.span.enter();
         let response_code = session
             .response_written()
             .map_or(0, |resp| resp.status.as_u16());
-        tracing::info!(
+        info!(
             "Request finished for {} {} from {:?} with status {} in {:?}",
             session.req_header().method,
             session.req_header().uri,
@@ -971,9 +953,9 @@ impl CertificateCache {
                 .entries_by_nid(pingora::tls::nid::Nid::COMMONNAME)
                 .next()
                 .and_then(|e| e.data().as_utf8().ok());
-            tracing::info!("Loaded certificate from {}", cert_path);
-            tracing::info!("  Subject CN: {}", cn.as_deref().map_or("N/A", |s| &*s));
-            tracing::info!(
+            info!("Loaded certificate from {}", cert_path);
+            info!("  Subject CN: {}", cn.as_deref().map_or("N/A", |s| &*s));
+            info!(
                 "  Validity: Not Before: {}, Not After: {}",
                 cert.not_before(),
                 cert.not_after()
@@ -982,7 +964,7 @@ impl CertificateCache {
             Ok(Arc::new(CertAndKey { cert, key }))
         }
 
-        tracing::info!("Loading certificates and keys into memory...");
+        info!("Loading certificates and keys into memory...");
 
         let mut cert_map = HashMap::new();
 
@@ -1019,7 +1001,7 @@ impl CertificateCache {
             "../cert_server/server-key-www.pem",
         )?;
 
-        tracing::info!("Certificates and keys loaded successfully.");
+        info!("Certificates and keys loaded successfully.");
 
         Ok(CertificateCache {
             cert_map,
@@ -1050,7 +1032,7 @@ impl pingora::listeners::TlsAccept for SniCertificateSelector {
         let sni_opt_string = ssl
             .servername(pingora::tls::ssl::NameType::HOST_NAME)
             .map(|s| s.to_string());
-        tracing::info!("SNI from client: {:?}", sni_opt_string.as_deref());
+        info!("SNI from client: {:?}", sni_opt_string.as_deref());
 
         // Store SNI in ex_data to pass it to the http proxy phase.
         ssl.set_ex_data(self.sni_ex_data_index, sni_opt_string.clone());
@@ -1070,12 +1052,12 @@ impl pingora::listeners::TlsAccept for SniCertificateSelector {
 
         // Apply the selected certificate and key to the SSL context.
         if let Err(e) = pingora::tls::ext::ssl_use_certificate(ssl, &cert_and_key.cert) {
-            tracing::error!("ssl_use_certificate failed: {}", e);
+            error!("ssl_use_certificate failed: {}", e);
             // The connection will be terminated by the TLS library.
             return;
         }
         if let Err(e) = pingora::tls::ext::ssl_use_private_key(ssl, &cert_and_key.key) {
-            tracing::error!("ssl_use_private_key failed: {}", e);
+            error!("ssl_use_private_key failed: {}", e);
             // The connection will be terminated by the TLS library.
             return;
         }
@@ -1093,7 +1075,7 @@ impl BackgroundService for CertificateReloader {
         // Define the reload interval.
         let reload_interval = Duration::from_secs(60 * 60 * 2); // 2 hours
 
-        tracing::info!(
+        info!(
             "Certificate reloader service started. Will reload every {} seconds.",
             reload_interval.as_secs()
         );
@@ -1101,20 +1083,20 @@ impl BackgroundService for CertificateReloader {
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(reload_interval) => {
-                    tracing::info!("Attempting to reload certificates...");
+                    info!("Attempting to reload certificates...");
                     match CertificateCache::load() {
                         Ok(new_cache) => {
                             // Atomically swap the cache with the new one.
                             self.cache.store(Arc::new(new_cache));
-                            tracing::info!("Certificates reloaded successfully.");
+                            info!("Certificates reloaded successfully.");
                         }
                         Err(e) => {
-                            tracing::error!("Failed to reload certificates, keeping old ones. Error: {}", e);
+                            error!("Failed to reload certificates, keeping old ones. Error: {}", e);
                         }
                     }
                 }
                 _ = shutdown.changed() => {
-                    tracing::info!("Certificate reloader service shutting down.");
+                    info!("Certificate reloader service shutting down.");
                     break;
                 }
             }
@@ -1144,7 +1126,7 @@ impl SessionPurger {
         let after_count = self.session_store.len();
         let cleaned_count = before_count - after_count;
         if cleaned_count > 0 {
-            tracing::info!(
+            info!(
                 "Cleaned up {} expired sessions. Current count: {}",
                 cleaned_count,
                 after_count
@@ -1159,7 +1141,7 @@ impl BackgroundService for SessionPurger {
         // Check for expired sessions more frequently than the TTL.
         // For example, check every 5 minutes for a 30-minute TTL.
         let mut interval = tokio::time::interval(self.session_ttl.min(Duration::from_secs(5 * 60)));
-        tracing::info!(
+        info!(
             "Session purger service started. Session TTL is {:?}, check interval is {:?}.",
             self.session_ttl,
             interval.period()
@@ -1171,7 +1153,7 @@ impl BackgroundService for SessionPurger {
                     self.cleanup_expired_sessions();
                 }
                 _ = shutdown.changed() => {
-                    tracing::info!("Session purger service shutting down.");
+                    info!("Session purger service shutting down.");
                     break;
                 }
             }
@@ -1180,8 +1162,7 @@ impl BackgroundService for SessionPurger {
 }
 
 fn main() -> pingora::Result<()> {
-    // env_logger::init(); // Initialize the logger
-    tracing_subscriber::fmt().with_thread_ids(true).init();
+    env_logger::init();
 
     let start_time = Instant::now();
     let keys = Arc::new(JwtSigningKeys::new());
