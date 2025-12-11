@@ -6,10 +6,14 @@ edition = "2024"
 [dependencies]
 arc-swap = "1.7"
 async-trait = "0.1"
+base64 = "0.22"
 boring = "4"
+bytes = "1"
 dashmap = "6"
 env_logger = "0.11"
 log = "0.4"
 pingora = { version = "0.6", features = [ "lb", "boringssl" ] }
 rand = "0.9"
+sha2 = "0.10"
 tokio = { version = "1", features = ["sync", "time"] }
+url = "2.5"

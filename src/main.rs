@@ -9,12 +9,15 @@
 //   RUST_LOG=info cargo run
 //
 // TODO:
-//   - Implement proxy rule action pipeline
-//   - Implement application session and background session cleaner
-//   - Implement operational settings to be configured externally.
-//   - Implement /api/logout endpoint to invalidate session and tokens.
-//   - Implement a lock for token refresh to prevent dog-piling effect.
-//   - Review the backend SSL implementation for Pingora (currently using boringssl).
+// - Consider adding a route for requests with no SNI found in the filter
+// - Consider handling cases where no upstream is found in upstream_peer
+// - Implement RequireAuthentication action
+// - Implement the proxy rule action pipeline
+// - Implement application sessions and background session cleaner
+// - Implement operational settings to be configured externally
+// - Implement `/api/logout` endpoint to invalidate sessions and tokens
+// - Implement a lock for token refresh to prevent the dog-piling effect
+// - Review the backend SSL implementation using Pingora (currently using boringssl)
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
@@ -31,6 +34,9 @@ use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+mod actions;
+use actions::{GatewayAction, RouteLogic};
 
 const JWT_PRIVATE_KEY_PEM_STRING: &str = r#"-----BEGIN PRIVATE KEY-----
 MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQD3rI43cNccdLsM
@@ -232,13 +238,6 @@ impl BackgroundService for CertificateReloader {
     }
 }
 
-/// Container for all upstream peer definitions
-struct UpstreamSet {
-    sni_map: Arc<DashMap<String, Arc<HttpPeer>>>,
-    no_sni: Arc<HttpPeer>,
-    fallback: Arc<HttpPeer>,
-}
-
 /// Core logic and shared state for the proxy service
 ///
 /// This struct implements the `ProxyHttp` trait and holds all shared resources
@@ -248,7 +247,7 @@ struct UpstreamSet {
 /// A single instance is created at startup and shared immutably across all
 /// worker threads for the lifetime of the application.
 struct GatewayRouter {
-    upstreams: UpstreamSet,
+    upstream_peer_cache: Arc<DashMap<String, Arc<HttpPeer>>>,
     sni_ex_data_index: Index<Ssl, Option<String>>,
     keys: Arc<JwtSigningKeys>,
     gateway_start_time: Instant,
@@ -264,6 +263,29 @@ struct GatewayCtx {
     request_id: String,
     request_start_time: Instant,
     upstream_sni_name: Option<String>,
+    // Pipeline of routes to be applied to the request
+    action_pipeline: Vec<GatewayAction>,
+    // The default upstream address for the request, can be overridden by an action.
+    pub default_upstream_addr: Option<String>,
+    // The upstream address set by an action, which overrides the default.
+    pub override_upstream_addr: Option<String>,
+
+    // --- State for GatewayActions ---
+    // These fields store state that is shared across the lifecycle of a single request.
+    // They are set and read by different filter hooks within GatewayActions.
+    //
+    // WARNING: Each field is shared by all instances of a given action type within the
+    // pipeline. For example, if two `IssueDeviceCookie` actions are in the pipeline,
+    // they will both read from and write to the *same* `action_new_dev_cookie` field.
+    // This can lead to state being overwritten. The current design assumes that each
+    // action type appears at most once in the pipeline.
+
+    // Set by IssueDeviceCookie action
+    pub action_state_new_dev_cookie: Option<String>,
+    // Set by RequireAuthentication action when a new session is created
+    pub action_state_new_app_session_cookie: Option<(String, String)>, // (value, scope_name)
+    // Set by RequireAuthentication action
+    pub action_state_app_session: Option<actions::ApplicationSession>,
 }
 
 #[async_trait]
@@ -275,12 +297,21 @@ impl ProxyHttp for GatewayRouter {
             request_id: format!("req-{}", rand::random::<u32>()),
             request_start_time: Instant::now(),
             upstream_sni_name: None,
+            action_pipeline: Vec::new(),
+            default_upstream_addr: None,
+            override_upstream_addr: None,
+            action_state_new_dev_cookie: None,
+            action_state_new_app_session_cookie: None,
+            action_state_app_session: None,
         }
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
+        info!("[{}] New request received for path: {}", ctx.request_id, session.req_header().uri.path());
+
+        //
         // Get SNI from the ex_data stored during the TLS handshake and set to no_sni_upstream.sni.
-        // This is the earliest point where we can determine the upstream based on SNI.
+        //
         let sni_opt = session
             .stream()
             .unwrap()
@@ -289,24 +320,125 @@ impl ProxyHttp for GatewayRouter {
         let sni: Option<String> = sni_opt.and_then(|s| s.as_deref().map(String::from));
         let upstream_sni_name = match sni.as_deref() {
             Some(sni_name) => {
-                if sni_name == "bff.wgd.example.com"
-                    || self.upstreams.sni_map.contains_key(sni_name)
-                {
-                    info!("[{}] SNI found: {}. Got specific upstream.", ctx.request_id, sni_name);
-                    sni_name.to_string()
-                } else {
-                    info!("[{}] SNI found: {}. But no specific upstream. Using fallback upstream.", ctx.request_id, sni_name);
-                    self.upstreams.fallback.sni.clone()
-                }
+                info!("[{}] SNI found: {}", ctx.request_id, sni_name);
+                sni_name.to_string()
             }
             None => {
                 info!("[{}] No SNI found. Using no-SNI upstream.", ctx.request_id);
-                self.upstreams.no_sni.sni.clone()
+                "bad sni".to_string()   // !!!!!
             }
         };
         ctx.upstream_sni_name = Some(upstream_sni_name);
 
-        // filter logincs here
+        // gateway actions
+        // Set the default upstream for all routes that fall into this block.
+        ctx.default_upstream_addr = Some("127.0.0.1:8081".to_string());
+
+        // Build the pipeline of routes based on the request path.
+        let path = session.req_header().uri.path();
+        ctx.action_pipeline.clear();
+
+        //
+        // Set the action pipeline actions for this request.
+        //
+
+        // Set the default upstream for all routes that fall into this block.
+        ctx.default_upstream_addr = Some("127.0.0.1:8081".to_string());
+
+        // Build the pipeline of routes based on the request path.
+        let path = session.req_header().uri.path();
+        ctx.action_pipeline.clear();
+
+        // All for DeviceCookie
+        ctx.action_pipeline.push(GatewayAction::IssueDeviceCookie);
+
+        // Terminal Actions
+        if path == "/hello" {
+            // This route terminates the request with a static response.
+            ctx.action_pipeline.push(GatewayAction::ReturnStaticText {
+                content: "Hello from your new generic route!".into(),
+                status_code: 200,
+            });
+        } else if path == "/robot.txt" {
+            // This route terminates the request with a static response.
+            ctx.action_pipeline.push(GatewayAction::ReturnStaticText {
+                content: "User-agent: *\nDisallow: /".into(),
+                status_code: 200,
+            });
+        } else if path.starts_with("/static") {
+            // This route proxies to a specific upstream.
+            ctx.action_pipeline.push(GatewayAction::ProxyTo { upstream: "127.0.0.1:8083".into() });
+        } else if path.starts_with("/external") {
+            // This route terminates the request with a redirect.
+            ctx.action_pipeline.push(GatewayAction::Redirect { url: "https://ext.example.com/hello".into() });
+        }
+
+        // Modifier Actions:
+        match path {
+            "/fruit/apple" => ctx.action_pipeline.push(GatewayAction::SetUpstreamRequestHeader { name: "X-Sweet".into(), value: "pie".into() }),
+            "/fruit/orange" => ctx.action_pipeline.push(GatewayAction::SetUpstreamRequestHeader { name: "X-Drink".into(), value: "juice".into() }),
+            "/fruit/banana" => ctx.action_pipeline.push(GatewayAction::SetDownstreamResponseHeader { name: "X-Powered-By".into(), value: "BFF-proxy".into() }),
+            _ => {}
+        }
+
+        // Composite Actions
+        if path.starts_with("/private/") {
+            ctx.action_pipeline.push(GatewayAction::RequireAuthentication {
+                protected_backend_addr: "127.0.0.1:8082".into(),      // Proxy to this backend if authenticated
+                oidc_login_redirect_url: "https://auth2.example.com/auth".into(), // OIDC provider's authorization endpoint
+                oidc_client_id: "my-client-2".into(),
+                oidc_callback_url: "http://127.0.0.1:8002/auth/callback".into(), // BFF's callback endpoint
+                oidc_token_endpoint_url: "http://127.0.0.1:8082/api/token".into(), // The OIDC token endpoint
+                scope_name: "private_scope".into(),
+            });
+        } else if path.starts_with("/protected/") {
+            ctx.action_pipeline.push(GatewayAction::RequireAuthentication {
+                protected_backend_addr: "127.0.0.1:8083".into(),      // Proxy to this backend if authenticated
+                oidc_login_redirect_url: "https://auth.example.com/auth".into(), // OIDC provider's authorization endpoint
+                oidc_client_id: "my-client-1".into(),
+                oidc_callback_url: "http://127.0.0.1:8001/auth/callback".into(), // BFF's callback endpoint
+                oidc_token_endpoint_url: "http://127.0.0.1:8081/api/token".into(), // The OIDC token endpoint
+                scope_name: "protected_scope".into(),
+            });
+        }
+
+        //
+        // Execute the pipeline for request_filter_and_prepare_upstream_peer.
+        //
+        for action in ctx.action_pipeline.clone() {
+            info!("[{}] Pipeline: Executing request_filter_and_prepare_upstream_peer for action: {:?}", ctx.request_id, action);
+            // Pass the session stores to the dispatch macro so it can construct the full scope.
+            let early_exit = match action {
+                GatewayAction::ReturnStaticText { content, status_code } => {
+                    let logic = actions::ReturnStaticTextRoute { content, status_code };
+                    logic.request_filter_and_prepare_upstream_peer(session, ctx).await
+                }
+                GatewayAction::SetUpstreamRequestHeader { name, value } => {
+                    let logic = actions::SetUpstreamRequestHeaderRoute { name, value };
+                    logic.request_filter_and_prepare_upstream_peer(session, ctx).await
+                }
+                GatewayAction::SetDownstreamResponseHeader { name, value } => {
+                    let logic = actions::SetDownstreamResponseHeaderRoute { name, value };
+                    logic.request_filter_and_prepare_upstream_peer(session, ctx).await
+                }
+                GatewayAction::RequireAuthentication { protected_backend_addr, oidc_login_redirect_url, oidc_client_id, oidc_callback_url, oidc_token_endpoint_url, scope_name } => {
+                    let logic = actions::RequireAuthenticationRoute { protected_backend_addr, oidc_login_redirect_url, oidc_client_id, oidc_callback_url, oidc_token_endpoint_url, scope_name };
+                    logic.request_filter_and_prepare_upstream_peer(session, ctx).await
+                }
+                GatewayAction::Redirect { url } => {
+                    let logic = actions::RedirectRoute { url };
+                    logic.request_filter_and_prepare_upstream_peer(session, ctx).await
+                }
+                GatewayAction::ProxyTo { upstream } => {
+                    let logic = actions::ProxyToRoute { upstream };
+                    logic.request_filter_and_prepare_upstream_peer(session, ctx).await
+                }
+                GatewayAction::IssueDeviceCookie => actions::IssueDeviceCookieRoute.request_filter_and_prepare_upstream_peer(session, ctx).await,
+            }?;
+            if early_exit {
+                return Ok(true); // Stop the pipeline if a filter decides to exit early.
+            }
+        }
 
         Ok(false) // Continue to the next phase
     }
@@ -316,57 +448,111 @@ impl ProxyHttp for GatewayRouter {
         _session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
-        // Use the upstream name that was already determined in request_filter.
-        let upstream_sni_name = ctx.upstream_sni_name.as_deref().unwrap_or_default();
+        // The upstream address is now determined during the request_filter_and_prepare_upstream_peer phase and stored in the context.
+        // We prioritize the address set by a specific action, and fall back to the default if none is set.
+        let upstream_addr = ctx.override_upstream_addr.as_ref().or(ctx.default_upstream_addr.as_ref())
+            .expect("Upstream address not set in GatewayCtx, neither by an action nor as a default");
 
-        let upstream = {
-            if upstream_sni_name == self.upstreams.no_sni.sni {
-                self.upstreams.no_sni.clone()
-            } else if upstream_sni_name == self.upstreams.fallback.sni {
-                self.upstreams.fallback.clone()
-            } else {
-                // Look up the peer from the upstreams map.
-                // If not found (which shouldn't happen if logic is consistent), use fallback.
-                self.upstreams
-                    .sni_map
-                    .get(upstream_sni_name)
-                    .map(|p| p.value().clone())
-                    .unwrap_or_else(|| {
-                        warn!(
-                            "[{}] Upstream for SNI '{}' not found, using fallback.",
-                            ctx.request_id,
-                            upstream_sni_name
-                        );
-                        self.upstreams.fallback.clone()
-                    })
-            }
-        };
+        info!("[{}] Selecting upstream peer for address: {}", ctx.request_id, upstream_addr);
 
-        info!("[{}] Forwarding to upstream: {}", ctx.request_id, upstream);
-        // HttpPeer is Clone, so we can clone it from the Arc.
-        Ok(Box::new((*upstream).clone()))
+        // Retrieve the pre-configured HttpPeer from the cache.
+        // !!!!!
+        let peer = self.upstream_peer_cache.get(upstream_addr)
+            .map(|p| p.value().clone())
+            .unwrap_or_else(|| panic!("[{}] Upstream peer not found in cache for address: {}", ctx.request_id, upstream_addr));
+
+        Ok(Box::new((*peer).clone()))
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        ctx: &mut Self::CTX,
+    ) -> Result<()> {
+        // Dispatch to the correct upstream request filter logic.
+        // Loop through the pipeline to apply all relevant filters.
+        for action in ctx.action_pipeline.clone() {
+            info!("[{}] Pipeline: Executing upstream_request_filter for action: {:?}", ctx.request_id, action);
+            // Use the dispatch macro to call the upstream_request_filter method.
+            match action {
+                GatewayAction::ReturnStaticText { content, status_code } => {
+                    let logic = actions::ReturnStaticTextRoute { content, status_code };
+                    logic.upstream_request_filter(session, upstream_request, ctx).await
+                }
+                GatewayAction::SetUpstreamRequestHeader { name, value } => {
+                    let logic = actions::SetUpstreamRequestHeaderRoute { name, value };
+                    logic.upstream_request_filter(session, upstream_request, ctx).await
+                }
+                GatewayAction::SetDownstreamResponseHeader { name, value } => {
+                    let logic = actions::SetDownstreamResponseHeaderRoute { name, value };
+                    logic.upstream_request_filter(session, upstream_request, ctx).await
+                }
+                GatewayAction::RequireAuthentication { protected_backend_addr, oidc_login_redirect_url, oidc_client_id, oidc_callback_url, oidc_token_endpoint_url, scope_name } => {
+                    let logic = actions::RequireAuthenticationRoute { protected_backend_addr, oidc_login_redirect_url, oidc_client_id, oidc_callback_url, oidc_token_endpoint_url, scope_name };
+                    logic.upstream_request_filter(session, upstream_request, ctx).await
+                }
+                GatewayAction::IssueDeviceCookie => {
+                    actions::IssueDeviceCookieRoute.upstream_request_filter(session, upstream_request, ctx).await
+                }
+                GatewayAction::Redirect { url } => {
+                    let logic = actions::RedirectRoute { url };
+                    logic.upstream_request_filter(session, upstream_request, ctx).await
+                }
+                GatewayAction::ProxyTo { upstream } => {
+                    let logic = actions::ProxyToRoute { upstream };
+                    logic.upstream_request_filter(session, upstream_request, ctx).await
+                }
+            }?;
+        }
+
+        Ok(())
     }
 
     async fn response_filter(
         &self,
         session: &mut Session,
-        _upstream_response: &mut ResponseHeader,
+        response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
-        {
-            // Use the upstream name that was already determined in request_filter.
-            let upstream_sni_name = ctx.upstream_sni_name.as_deref().unwrap_or("");
+        // Dispatch to the response filter logic.
+        // Loop through the pipeline in reverse order to apply response filters.
+        // This follows the common middleware pattern (LIFO - Last-In, First-Out),
+        // ensuring that the last request filter added is the first response filter executed.
+        // We clone the pipeline to avoid borrow checker issues with `ctx`.
+        for action in ctx.action_pipeline.clone().iter().rev() {
+            info!("[{}] Pipeline: Executing response_filter for action: {:?}", ctx.request_id, action);
 
-            info!(
-                "[{}] Reesponse started for {} {} from client {:?} with SNI: {:?}",
-                ctx.request_id,
-                session.req_header().method,
-                session.req_header().uri,
-                session.client_addr(),
-                upstream_sni_name,
-            );
+            match action {
+                GatewayAction::ReturnStaticText { content, status_code } => {
+                    let logic = actions::ReturnStaticTextRoute { content: content.clone(), status_code: *status_code };
+                    logic.response_filter(session, response, ctx).await
+                }
+                GatewayAction::SetUpstreamRequestHeader { name, value } => {
+                    let logic = actions::SetUpstreamRequestHeaderRoute { name: name.clone(), value: value.clone() };
+                    logic.response_filter(session, response, ctx).await
+                }
+                GatewayAction::SetDownstreamResponseHeader { name, value } => {
+                    let logic = actions::SetDownstreamResponseHeaderRoute { name: name.clone(), value: value.clone() };
+                    logic.response_filter(session, response, ctx).await
+                }
+                GatewayAction::RequireAuthentication { protected_backend_addr, oidc_login_redirect_url, oidc_client_id, oidc_callback_url, oidc_token_endpoint_url, scope_name } => {
+                    let logic = actions::RequireAuthenticationRoute { protected_backend_addr: protected_backend_addr.clone(), oidc_login_redirect_url: oidc_login_redirect_url.clone(), oidc_client_id: oidc_client_id.clone(), oidc_callback_url: oidc_callback_url.clone(), oidc_token_endpoint_url: oidc_token_endpoint_url.clone(), scope_name: scope_name.clone() };
+                    logic.response_filter(session, response, ctx).await
+                }
+                GatewayAction::IssueDeviceCookie => {
+                    actions::IssueDeviceCookieRoute.response_filter(session, response, ctx).await
+                }
+                GatewayAction::Redirect { url } => {
+                    let logic = actions::RedirectRoute { url: url.clone() };
+                    logic.response_filter(session, response, ctx).await
+                }
+                GatewayAction::ProxyTo { upstream } => {
+                    let logic = actions::ProxyToRoute { upstream: upstream.clone() };
+                    logic.response_filter(session, response, ctx).await
+                }
+            }?;
         }
-
         Ok(())
     }
 
@@ -452,6 +638,20 @@ fn main() -> pingora::Result<()> {
         conf: Some("src/conf.yaml".to_string()),
         ..Default::default()
     };
+
+    // Register authentication scopes. This initializes the session stores within the actions module.
+    actions::register_auth_scope("protected_scope");
+    actions::register_auth_scope("private_scope");
+    // Add more scopes as needed, e.g., for /admin, /shop, etc.
+    // actions::register_auth_scope("admin_scope");
+
+    // Create an upstream peer cache to store pre-configured HttpPeer objects for each backend.
+    let upstream_peer_cache = Arc::new(DashMap::new());
+    upstream_peer_cache.insert("127.0.0.1:8081".to_string(), Arc::new(HttpPeer::new("127.0.0.1:8081", false, "".to_string())));
+    upstream_peer_cache.insert("127.0.0.1:8082".to_string(), Arc::new(HttpPeer::new("127.0.0.1:8082", false, "".to_string())));
+    upstream_peer_cache.insert("127.0.0.1:8083".to_string(), Arc::new(HttpPeer::new("127.0.0.1:8083", false, "".to_string())));
+    // Add more upstreams as needed, e.g., for 127.0.0.1:9001, 127.0.0.1:9002 etc.
+
     let mut my_server = Server::new(Some(opt))?;
 
     // Create an index to store SNI in the SSL session
@@ -464,48 +664,14 @@ fn main() -> pingora::Result<()> {
         }
     };
 
-    let upstreams = Arc::new(DashMap::new());
-
-    // FOR BFF TEST
-    let www1_peer = HttpPeer::new(
-        "192.168.10.132:8080",
-        false,
-        "www.wgd.example.com".to_string(),
-    );
-    upstreams.insert("www.wgd.example.com".to_string(), Arc::new(www1_peer));
-    let www2_peer = HttpPeer::new(
-        "192.168.10.132:5001",
-        false,
-        "api.wgd.example.com".to_string(),
-    );
-    upstreams.insert("api.wgd.example.com".to_string(), Arc::new(www2_peer));
-    let www3_peer = HttpPeer::new(
-        "192.168.10.132:8082",
-        false,
-        "auth.wgd.example.com".to_string(),
-    );
-    upstreams.insert("auth.wgd.example.com".to_string(), Arc::new(www3_peer));
-
-    // Upstream for requests with no SNI
-    let no_sni_upstream = Arc::new(HttpPeer::new("127.0.0.1:8080", false, "".to_string()));
-
-    // Fallback for any other SNI
-    let fallback_upstream = Arc::new(HttpPeer::new("127.0.0.1:8089", false, "".to_string()));
-
-    let upstream_set = UpstreamSet {
-        sni_map: upstreams,
-        no_sni: no_sni_upstream,
-        fallback: fallback_upstream,
-    };
-
-    let router_logic = GatewayRouter {
-        upstreams: upstream_set,
+    let gw = GatewayRouter {
+        upstream_peer_cache,
         sni_ex_data_index: sni_ex_data_index.clone(),
         keys,
         gateway_start_time,
     };
 
-    let mut http_service = http_proxy_service(&my_server.configuration, router_logic);
+    let mut http_service = http_proxy_service(&my_server.configuration, gw);
     let selector = SniCertificateSelector::new(sni_ex_data_index.clone())?;
 
     // Create and add the background service for reloading certificates
