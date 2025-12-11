@@ -1,6 +1,6 @@
 [package]
 name = "spngw"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 
 [dependencies]
@@ -11,6 +11,5 @@ dashmap = "6"
 env_logger = "0.11"
 log = "0.4"
 pingora = { version = "0.6", features = [ "lb", "boringssl" ] }
-rand = "0.8"
-rsa = "0.9"
+rand = "0.9"
 tokio = { version = "1", features = ["sync", "time"] }

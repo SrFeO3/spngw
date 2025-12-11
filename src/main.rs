@@ -27,14 +27,49 @@ use pingora::server::ShutdownWatch;
 use pingora::services::background::BackgroundService;
 use pingora::tls::pkey::Private;
 use pingora::tls::ssl::Ssl;
-use rand::rngs::OsRng;
-use rsa::RsaPrivateKey;
-use rsa::pkcs1::EncodeRsaPublicKey;
-use rsa::pkcs8::EncodePrivateKey;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+const JWT_PRIVATE_KEY_PEM_STRING: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQD3rI43cNccdLsM
+x97iHVZVLJEkj+aSso2AOYhuggZhg1wEAsxuULchGAT2ASloYnUuX4C3nKXhQX3S
+Ku77gqv9s9FGOcJQEjIHO1ftNxE+VsfjN+9gfH28m1S5yRUQvDOZXPlPUrpSBtdA
+5m/3pjo81wGetz8zTNbsZYipyS0Qy5J1wyVh0nxUlg0Dix+lJAsl9kj6P3ri2OhW
+GvYk2yKQicbpNmY0GOM9KoW0PNMvELXaeDElANS43UhGoBxJyGNYwXBjru+hWlLf
+27acVWOtuccUxTxuSZMXdaLMv7pk8o9Tbz5atjEfgQgSFOjIiGS0Jv0NIpRKIgZr
+r4q+l83LAgMBAAECggEALuPI0v82gokpBozqigWC3EJBQlpKDVjniDCcP0u3mIuN
+hqbe/D2kxgutmMN0ivIk/EARdvGdyA0lnH4LW6uME06RXsm9m3ouZYcbKOplhddZ
+JY/n7mzzQxtnSXsj1VTEMhNTkex4IOJxqzRVW13ppa4Q/PL1cKlqATxhyL8xHH4G
+pmq8Q899T7OW7vLdysede68sjbA04fL/gaPNxPj5TpsPKvreIQRpziXDoJCalMp9
+EUi0CbzpoVheahJlSi6In9byRxGauVIao+BgNh/NNYqVnj/Tp6X2YGnhN5UXYA+j
+V4xMjmKFgHIFaptpUTudpyAZZnG/WQVKJDeixhscaQKBgQD9MpJw0cgLhRenwL0V
+zJeMlt1OwnA4sbbmxUS67eAy31cZzUS6N2cF+2RaP0WjGSnZyxcXPA72HXnM8/dP
+B5tX6ce9PJ0px7YtOnwwcjGMKqQsPALF9Uvm5FfuWlCdHaHzfUv2wUGS8ON6cJDW
+qgufBrMynmtw8ZG1Wr+5MIiRgwKBgQD6alUzZrAJOwM/IYdIte3YISx4a69j0epc
+Vh7Bzm3tQYF02nSFpMSKX8sQeQ5wFx4gjhGWJp3tn0xrWrsN44b0oG4zKE9QaRVJ
+hCzBa/Ka+p/EsXc/kc9CSMuylJ20LtA0B5TEgYJ8QzzCA8BsRUc47+JkR3gO1N9w
+jS5bPfyIGQKBgQC6f9Kv+UXBfoJDFUvxz6Zdbw6KIdxpVjWj2/BZRDgdILdWkQUr
+qP1gwaBUfUB8918FRnu2qI1YqbN6zMUAWFkLM27lq80T5kABJpAtWx+13/7XekiM
+qbcD1nQSZEH2yMnuwP8APa9gXcEhAeMdy1kOBPBfu6LmKXmrPLH15ZLiowKBgDgO
+u7oA/+FhG43zZISLbY4XhwwCF0ZCRLOc98+s9YDKTD+rc7BDPVg4r42le+ztz+m7
+xAYX6Py7z3Cs4/js+VYj3+eF25OFoqVNeHNoRewZtNBkZeyOKJaPE0KL8G3YmPU8
+yTngQCSvLJfGHTpfm90MHmMSeLbhQo/AmyMD0ldpAoGBAJ9tQ3R33AYkkjCJSc/u
+8X121N2+URZxuA23bMJH6OoJddtz8AFyKV36ihbVKrJ1/mcXkdZ9+WEszQaVsGsm
+CvsxaZWlMj4yZoVCx7ZqrFx17AThlxCpi7rFoFZbkk+M9+RX6U8d8r39qyfqjJFp
+0kaUPHgv1Qgvn5SYcebU+AQ4
+-----END PRIVATE KEY-----"#;
+
+const JWT_PUBLIC_KEY_PEM_STRING: &str = r#"-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA96yON3DXHHS7DMfe4h1W
+VSyRJI/mkrKNgDmIboIGYYNcBALMblC3IRgE9gEpaGJ1Ll+At5yl4UF90iru+4Kr
+/bPRRjnCUBIyBztX7TcRPlbH4zfvYHx9vJtUuckVELwzmVz5T1K6UgbXQOZv96Y6
+PNcBnrc/M0zW7GWIqcktEMuSdcMlYdJ8VJYNA4sfpSQLJfZI+j964tjoVhr2JNsi
+kInG6TZmNBjjPSqFtDzTLxC12ngxJQDUuN1IRqAcSchjWMFwY67voVpS39u2nFVj
+rbnHFMU8bkmTF3WizL+6ZPKPU28+WrYxH4EIEhToyIhktCb9DSKUSiIGa6+KvpfN
+ywIDAQAB
+-----END PUBLIC KEY-----"#;
 
 /// Application's cryptographic keys
 ///　Used for signing and validating JWTs. (e.g., `DEVICE_CONTEXT`).
@@ -45,22 +80,9 @@ struct JwtSigningKeys {
 
 impl JwtSigningKeys {
     fn new() -> Self {
-        let mut rng = OsRng;
-        let private_key = RsaPrivateKey::new(&mut rng, 2048).expect("failed to generate a key");
-        let public_key = private_key.to_public_key();
-        let public_key_pem = public_key
-            .to_pkcs1_pem(Default::default())
-            .expect("Failed to encode public key to PEM")
-            .as_bytes()
-            .to_vec();
-        let private_key_pem = private_key
-            .to_pkcs8_pem(Default::default())
-            .expect("Failed to encode private key to PEM")
-            .as_bytes()
-            .to_vec();
         JwtSigningKeys {
-            public_key_pem,
-            private_key_pem,
+            public_key_pem: JWT_PUBLIC_KEY_PEM_STRING.as_bytes().to_vec(),
+            private_key_pem: JWT_PRIVATE_KEY_PEM_STRING.as_bytes().to_vec(),
         }
     }
 }
@@ -463,11 +485,6 @@ fn main() -> pingora::Result<()> {
         "auth.wgd.example.com".to_string(),
     );
     upstreams.insert("auth.wgd.example.com".to_string(), Arc::new(www3_peer));
-    let www4_peer = HttpPeer::new(
-        "192.168.10.132:8080",
-        false,
-        "bff.wgd.example.com".to_string(),
-    );
 
     // Upstream for requests with no SNI
     let no_sni_upstream = Arc::new(HttpPeer::new("127.0.0.1:8080", false, "".to_string()));
