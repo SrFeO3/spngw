@@ -1,3 +1,30 @@
+/// # Gateway Actions and Logic
+///
+/// This file defines the core routing and middleware architecture. The `GatewayAction`
+/// enum represents the set of possible operations in a request pipeline. Each variant
+/// is implemented as a struct that fulfills the `RouteLogic` trait.
+///
+/// ## Action Categories
+///
+/// Actions are categorized based on their behavior within the request pipeline:
+///
+/// ### 1. Terminal Actions
+/// These actions terminate the pipeline and generate a final response.
+/// (Note: `response_filter` is not executed for these actions).
+/// - `ReturnStaticText`: Responds with a predefined static body and status.
+/// - `Redirect`: Issues a 302 redirect to a specified URL.
+///
+/// ### 2. Modifier Actions
+/// These actions modify the request or response but allow the pipeline to continue.
+/// - `ProxyTo`: Overrides the default upstream and proxies the request.
+/// - `IssueDeviceCookie`: Ensures a device identifier cookie (`DEV_COOKIE`) exists.
+/// - `SetUpstreamRequestHeader`: Adds or replaces a header sent to the upstream.
+/// - `SetDownstreamResponseHeader`: Adds or replaces a header sent to the client.
+///
+/// ### 3. Composite Actions
+/// These are complex, multi-step workflows encapsulated into a single action.
+/// - `RequireAuthentication`: An action for paths that require OIDC authentication. It manages
+///   the redirect-based login flow. (Note: Callback handling is not yet implemented).
 use crate::GatewayCtx;
 
 use async_trait::async_trait;
