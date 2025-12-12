@@ -13,6 +13,7 @@
 // - Consider handling cases where no upstream is found in upstream_peer
 // - Implement RequireAuthentication action
 // - Implement the proxy rule action pipeline
+// - Consider default TLS cert
 // - Implement application sessions and background session cleaner
 // - Implement operational settings to be configured externally
 // - Implement `/api/logout` endpoint to invalidate sessions and tokens
@@ -23,7 +24,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use boring::ex_data::Index;
 use dashmap::DashMap;
-use log::{error, info};
+use log::{error, info, warn};
 use pingora::http::ResponseHeader;
 use pingora::prelude::*;
 use pingora::server::ShutdownWatch;
@@ -38,205 +39,8 @@ use std::time::{Duration, Instant};
 mod actions;
 use actions::{GatewayAction, RouteLogic};
 
-const JWT_PRIVATE_KEY_PEM_STRING: &str = r#"-----BEGIN PRIVATE KEY-----
-MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQD3rI43cNccdLsM
-x97iHVZVLJEkj+aSso2AOYhuggZhg1wEAsxuULchGAT2ASloYnUuX4C3nKXhQX3S
-Ku77gqv9s9FGOcJQEjIHO1ftNxE+VsfjN+9gfH28m1S5yRUQvDOZXPlPUrpSBtdA
-5m/3pjo81wGetz8zTNbsZYipyS0Qy5J1wyVh0nxUlg0Dix+lJAsl9kj6P3ri2OhW
-GvYk2yKQicbpNmY0GOM9KoW0PNMvELXaeDElANS43UhGoBxJyGNYwXBjru+hWlLf
-27acVWOtuccUxTxuSZMXdaLMv7pk8o9Tbz5atjEfgQgSFOjIiGS0Jv0NIpRKIgZr
-r4q+l83LAgMBAAECggEALuPI0v82gokpBozqigWC3EJBQlpKDVjniDCcP0u3mIuN
-hqbe/D2kxgutmMN0ivIk/EARdvGdyA0lnH4LW6uME06RXsm9m3ouZYcbKOplhddZ
-JY/n7mzzQxtnSXsj1VTEMhNTkex4IOJxqzRVW13ppa4Q/PL1cKlqATxhyL8xHH4G
-pmq8Q899T7OW7vLdysede68sjbA04fL/gaPNxPj5TpsPKvreIQRpziXDoJCalMp9
-EUi0CbzpoVheahJlSi6In9byRxGauVIao+BgNh/NNYqVnj/Tp6X2YGnhN5UXYA+j
-V4xMjmKFgHIFaptpUTudpyAZZnG/WQVKJDeixhscaQKBgQD9MpJw0cgLhRenwL0V
-zJeMlt1OwnA4sbbmxUS67eAy31cZzUS6N2cF+2RaP0WjGSnZyxcXPA72HXnM8/dP
-B5tX6ce9PJ0px7YtOnwwcjGMKqQsPALF9Uvm5FfuWlCdHaHzfUv2wUGS8ON6cJDW
-qgufBrMynmtw8ZG1Wr+5MIiRgwKBgQD6alUzZrAJOwM/IYdIte3YISx4a69j0epc
-Vh7Bzm3tQYF02nSFpMSKX8sQeQ5wFx4gjhGWJp3tn0xrWrsN44b0oG4zKE9QaRVJ
-hCzBa/Ka+p/EsXc/kc9CSMuylJ20LtA0B5TEgYJ8QzzCA8BsRUc47+JkR3gO1N9w
-jS5bPfyIGQKBgQC6f9Kv+UXBfoJDFUvxz6Zdbw6KIdxpVjWj2/BZRDgdILdWkQUr
-qP1gwaBUfUB8918FRnu2qI1YqbN6zMUAWFkLM27lq80T5kABJpAtWx+13/7XekiM
-qbcD1nQSZEH2yMnuwP8APa9gXcEhAeMdy1kOBPBfu6LmKXmrPLH15ZLiowKBgDgO
-u7oA/+FhG43zZISLbY4XhwwCF0ZCRLOc98+s9YDKTD+rc7BDPVg4r42le+ztz+m7
-xAYX6Py7z3Cs4/js+VYj3+eF25OFoqVNeHNoRewZtNBkZeyOKJaPE0KL8G3YmPU8
-yTngQCSvLJfGHTpfm90MHmMSeLbhQo/AmyMD0ldpAoGBAJ9tQ3R33AYkkjCJSc/u
-8X121N2+URZxuA23bMJH6OoJddtz8AFyKV36ihbVKrJ1/mcXkdZ9+WEszQaVsGsm
-CvsxaZWlMj4yZoVCx7ZqrFx17AThlxCpi7rFoFZbkk+M9+RX6U8d8r39qyfqjJFp
-0kaUPHgv1Qgvn5SYcebU+AQ4
------END PRIVATE KEY-----"#;
-
-const JWT_PUBLIC_KEY_PEM_STRING: &str = r#"-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA96yON3DXHHS7DMfe4h1W
-VSyRJI/mkrKNgDmIboIGYYNcBALMblC3IRgE9gEpaGJ1Ll+At5yl4UF90iru+4Kr
-/bPRRjnCUBIyBztX7TcRPlbH4zfvYHx9vJtUuckVELwzmVz5T1K6UgbXQOZv96Y6
-PNcBnrc/M0zW7GWIqcktEMuSdcMlYdJ8VJYNA4sfpSQLJfZI+j964tjoVhr2JNsi
-kInG6TZmNBjjPSqFtDzTLxC12ngxJQDUuN1IRqAcSchjWMFwY67voVpS39u2nFVj
-rbnHFMU8bkmTF3WizL+6ZPKPU28+WrYxH4EIEhToyIhktCb9DSKUSiIGa6+KvpfN
-ywIDAQAB
------END PUBLIC KEY-----"#;
-
-/// Application's cryptographic keys
-///　Used for signing and validating JWTs. (e.g., `DEVICE_CONTEXT`).
-struct JwtSigningKeys {
-    public_key_pem: Vec<u8>,
-    private_key_pem: Vec<u8>,
-}
-
-impl JwtSigningKeys {
-    fn new() -> Self {
-        JwtSigningKeys {
-            public_key_pem: JWT_PUBLIC_KEY_PEM_STRING.as_bytes().to_vec(),
-            private_key_pem: JWT_PRIVATE_KEY_PEM_STRING.as_bytes().to_vec(),
-        }
-    }
-}
-
-// Certificate and its corresponding private key
-struct CertAndKey {
-    cert: pingora::tls::x509::X509,
-    key: pingora::tls::pkey::PKey<Private>,
-}
-
-// All loaded certificates, which can be reloaded atomically
-struct CertificateCache {
-    // A map from SNI hostname to its certificate and key.
-    cert_map: HashMap<String, Arc<CertAndKey>>,
-    // The default certificate and key to use when a specific SNI is not found.
-    default_cert: Arc<CertAndKey>,
-    // The certificate and key to use when no SNI is provided.
-    no_sni_cert: Arc<CertAndKey>,
-}
-
-impl CertificateCache {
-    fn load() -> Result<Self> {
-        fn load_cert_key(cert_path: &str, key_path: &str) -> Result<Arc<CertAndKey>> {
-            let cert_bytes = fs::read(cert_path).map_err(|e| {
-                let mut err = pingora::Error::new(pingora::ErrorType::InternalError);
-                err.context = Some(format!("failed to read cert {}: {}", cert_path, e).into());
-                err.set_cause(e);
-                err
-            })?;
-            let key_bytes = fs::read(key_path).map_err(|e| {
-                let mut err = pingora::Error::new(pingora::ErrorType::InternalError);
-                err.context = Some(format!("failed to read key {}: {}", key_path, e).into());
-                err.set_cause(e);
-                err
-            })?;
-            let cert = pingora::tls::x509::X509::from_pem(&cert_bytes).map_err(|e| {
-                let mut err = pingora::Error::new(pingora::ErrorType::InternalError);
-                err.set_cause(e);
-                err
-            })?;
-            let key = pingora::tls::pkey::PKey::private_key_from_pem(&key_bytes).map_err(|e| {
-                let mut err = pingora::Error::new(pingora::ErrorType::InternalError);
-                err.set_cause(e);
-                err
-            })?;
-            // Log certificate details
-            let cn = cert
-                .subject_name()
-                .entries_by_nid(pingora::tls::nid::Nid::COMMONNAME)
-                .next()
-                .and_then(|e| e.data().as_utf8().ok());
-            info!("Loaded certificate from {}", cert_path);
-            info!("  Subject CN: {}", cn.as_deref().map_or("N/A", |s| &*s));
-            info!(
-                "  Validity: Not Before: {}, Not After: {}",
-                cert.not_before(),
-                cert.not_after()
-            );
-
-            Ok(Arc::new(CertAndKey { cert, key }))
-        }
-
-        info!("Loading certificates and keys into memory...");
-
-        let mut cert_map = HashMap::new();
-
-        // Load certificates for www, api, authm bff
-        let cert_www = load_cert_key(
-            "../cert_server/server-www.pem",
-            "../cert_server/server-key-www.pem",
-        )?;
-        cert_map.insert("www.wgd.example.com".to_string(), cert_www);
-        let cert_api = load_cert_key(
-            "../cert_server/server-api.pem",
-            "../cert_server/server-key-api.pem",
-        )?;
-        cert_map.insert("api.wgd.example.com".to_string(), cert_api);
-        let cert_auth = load_cert_key(
-            "../cert_server/server-auth.pem",
-            "../cert_server/server-key-auth.pem",
-        )?;
-        cert_map.insert("auth.wgd.example.com".to_string(), cert_auth);
-        let cert_bff = load_cert_key(
-            "../cert_server/server-bff.pem",
-            "../cert_server/server-key-bff.pem",
-        )?;
-        cert_map.insert("bff.wgd.example.com".to_string(), cert_bff);
-
-        // Load the fallback/default certificate (for www2, etc.)
-        let default_cert = load_cert_key(
-            "../cert_server/server-www.pem",
-            "../cert_server/server-key-www.pem",
-        )?;
-        // Load the certificate for requests with no SNI
-        let no_sni_cert = load_cert_key(
-            "../cert_server/server-www.pem",
-            "../cert_server/server-key-www.pem",
-        )?;
-
-        info!("Certificates and keys loaded successfully.");
-
-        Ok(CertificateCache {
-            cert_map,
-            default_cert,
-            no_sni_cert,
-        })
-    }
-}
-
-// Background service to periodically reload certificates.
-struct CertificateReloader {
-    cache: Arc<ArcSwap<CertificateCache>>,
-}
-
-#[async_trait]
-impl BackgroundService for CertificateReloader {
-    async fn start(&self, mut shutdown: ShutdownWatch) {
-        // Define the reload interval.
-        let reload_interval = Duration::from_secs(60 * 60 * 2); // 2 hours
-
-        info!(
-            "Certificate reloader service started. Will reload every {} seconds.",
-            reload_interval.as_secs()
-        );
-
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(reload_interval) => {
-                    info!("Attempting to reload certificates...");
-                    match CertificateCache::load() {
-                        Ok(new_cache) => {
-                            // Atomically swap the cache with the new one.
-                            self.cache.store(Arc::new(new_cache));
-                            info!("Certificates reloaded successfully.");
-                        }
-                        Err(e) => {
-                            error!("Failed to reload certificates, keeping old ones. Error: {}", e);
-                        }
-                    }
-                }
-                _ = shutdown.changed() => {
-                    info!("Certificate reloader service shutting down.");
-                    break;
-                }
-            }
-        }
-    }
-}
+mod config;
+use crate::config::{AppConfig, CertificateCache, JwtSigningKeys, RealmConfig};
 
 /// Core logic and shared state for the proxy service
 ///
@@ -249,7 +53,7 @@ impl BackgroundService for CertificateReloader {
 struct GatewayRouter {
     upstream_peer_cache: Arc<DashMap<String, Arc<HttpPeer>>>,
     sni_ex_data_index: Index<Ssl, Option<String>>,
-    jwt_keys: Arc<JwtSigningKeys>,
+    jwt_keys: Arc<ArcSwap<JwtSigningKeys>>,
     _gateway_start_time: Instant,
 }
 
@@ -263,7 +67,7 @@ struct GatewayCtx {
     request_id: String,
     request_start_time: Instant,
     // JWT signing keys for the current request, passed from the GatewayRouter.
-    pub jwt_keys: Arc<JwtSigningKeys>,
+    jwt_keys: Arc<JwtSigningKeys>,
     upstream_sni_name: Option<String>,
     // Pipeline of routes to be applied to the request
     action_pipeline: Vec<GatewayAction>,
@@ -298,7 +102,10 @@ impl ProxyHttp for GatewayRouter {
         GatewayCtx {
             request_id: format!("req-{}", rand::random::<u32>()),
             request_start_time: Instant::now(),
-            jwt_keys: self.jwt_keys.clone(),
+            // Load the current value from the ArcSwap.
+            // .load() returns a Guard, which dereferences to an Arc<JwtSigningKeys>.
+            // We clone the Arc so that the context owns it for the lifetime of the request.
+            jwt_keys: self.jwt_keys.load().clone(),
             upstream_sni_name: None,
             action_pipeline: Vec::new(),
             default_upstream_addr: None,
@@ -730,17 +537,8 @@ impl ProxyHttp for GatewayRouter {
 //
 struct SniCertificateSelector {
     sni_ex_data_index: Index<Ssl, Option<String>>,
-    cache: Arc<ArcSwap<CertificateCache>>,
-}
-
-impl SniCertificateSelector {
-    fn new(sni_ex_data_index: Index<Ssl, Option<String>>) -> Result<Self> {
-        let cache = CertificateCache::load()?;
-        Ok(SniCertificateSelector {
-            sni_ex_data_index,
-            cache: Arc::new(ArcSwap::new(Arc::new(cache))),
-        })
-    }
+    cert_cache: Arc<ArcSwap<CertificateCache>>,
+    default_cert: Arc<config::CertAndKey>,
 }
 
 #[async_trait]
@@ -753,28 +551,39 @@ impl pingora::listeners::TlsAccept for SniCertificateSelector {
 
         // Store SNI in ex_data to pass it to the http proxy phase.
         ssl.set_ex_data(self.sni_ex_data_index, sni_opt_string.clone());
-
         // Load the current certificate cache. This is a lock-free operation.
-        let cache = self.cache.load();
+        let cert_cache = self.cert_cache.load();
 
         // Select the certificate and key from the in-memory cache.
+        // If SNI is present and a matching certificate is found, use it.
+        // Otherwise, fall back to the default certificate.
         let cert_and_key = match sni_opt_string.as_deref() {
-            Some(sni) => cache
-                .cert_map
-                .get(sni)
-                .unwrap_or(&cache.default_cert)
-                .clone(),
-            None => cache.no_sni_cert.clone(),
+            Some(hostname) => {
+                if let Some(cert) = cert_cache.cert_map.get(hostname) {
+                    info!("Found matching certificate for SNI: {}", hostname);
+                    cert.clone()
+                } else {
+                    warn!(
+                        "No matching certificate for SNI: {}. Falling back to default.",
+                        hostname
+                    );
+                    self.default_cert.clone()
+                }
+            }
+            None => {
+                info!("No SNI provided. Using default certificate.");
+                self.default_cert.clone()
+            }
         };
 
         // Apply the selected certificate and key to the SSL context.
         if let Err(e) = pingora::tls::ext::ssl_use_certificate(ssl, &cert_and_key.cert) {
-            error!("ssl_use_certificate failed: {}", e);
+            warn!("ssl_use_certificate failed: {}", e);
             // The connection will be terminated by the TLS library.
             return;
         }
         if let Err(e) = pingora::tls::ext::ssl_use_private_key(ssl, &cert_and_key.key) {
-            error!("ssl_use_private_key failed: {}", e);
+            warn!("ssl_use_private_key failed: {}", e);
             // The connection will be terminated by the TLS library.
             return;
         }
@@ -784,13 +593,39 @@ impl pingora::listeners::TlsAccept for SniCertificateSelector {
 fn main() -> pingora::Result<()> {
     env_logger::init();
 
-    let gateway_start_time = Instant::now();
-    let jwt_keys = Arc::new(JwtSigningKeys::new());
-
     let opt = Opt {
         conf: Some("src/conf.yaml".to_string()),
         ..Default::default()
     };
+
+    let gateway_start_time = Instant::now();
+    let app_config = config::load_app_config();
+
+    // Load initial JWT signing keys and wrap them in ArcSwap for hot-reloading.
+    // For simplicity, we'll use the keys from the first realm defined in the config.
+    // A more advanced implementation might select a realm based on the request's hostname.
+    let initial_keys = config::JwtSigningKeys::from_realm_config(
+        app_config
+            .realms
+            .get(0)
+            .expect("Configuration must contain at least one realm."),
+    );
+    let jwt_keys = Arc::new(ArcSwap::new(Arc::new(initial_keys)));
+
+    // Load initial certificates and wrap them in ArcSwap for hot-reloading.
+    let initial_certs = CertificateCache::load_from_config(app_config.clone())
+        .expect("Failed to load initial certificates");
+    let cert_cache = Arc::new(ArcSwap::new(Arc::new(initial_certs)));
+
+    // Determine the default certificate. For simplicity, we use the first one found.
+    // !!!!!
+    let default_cert = cert_cache
+        .load()
+        .cert_map
+        .values()
+        .next()
+        .expect("At least one certificate must be configured to serve as the default.")
+        .clone();
 
     // Register authentication scopes. This initializes the session stores within the actions module.
     actions::register_auth_scope("protected_scope");
@@ -826,6 +661,19 @@ fn main() -> pingora::Result<()> {
         }
     };
 
+    // Read the initial config content to pass to the hot-reload service.
+    // This ensures the service starts with the same state as the main application.
+    let initial_config_content = std::fs::read_to_string(config::CONFIG_PATH)
+        .expect("Failed to read initial configuration file content.");
+
+    // Create and add the configuration hot reload service.
+    let config_reload_service = config::ConfigHotReloadService::new(
+        jwt_keys.clone(),
+        cert_cache.clone(),
+        initial_config_content,
+    );
+    my_server.add_service(background_service("Config Reloader", config_reload_service));
+
     let gw = GatewayRouter {
         upstream_peer_cache,
         sni_ex_data_index: sni_ex_data_index.clone(),
@@ -834,17 +682,11 @@ fn main() -> pingora::Result<()> {
     };
 
     let mut http_service = http_proxy_service(&my_server.configuration, gw);
-    let selector = SniCertificateSelector::new(sni_ex_data_index.clone())?;
-
-    // Create and add the background service for reloading certificates
-    let reloader_logic = Arc::new(CertificateReloader {
-        cache: selector.cache.clone(),
-    });
-    let reloader_service = pingora::services::background::GenBackgroundService::new(
-        "Certificate Reloader".to_string(),
-        reloader_logic,
-    );
-    my_server.add_service(reloader_service);
+    let selector = SniCertificateSelector {
+        sni_ex_data_index: sni_ex_data_index.clone(),
+        cert_cache,
+        default_cert,
+    };
 
     // TLS settings for select Certificate and get SNI
     let tls_settings_tcp =
