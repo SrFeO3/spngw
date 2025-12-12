@@ -5,5 +5,5 @@
 #  https://www.pingorarust.com/user_guide/conf
 version: 1
 threads: 10
-# The size of the keepalive pool for each upstream host.
+# The size of the keepalive pool for each upstream host. 
 upstream_keepalive_pool_size: 1
