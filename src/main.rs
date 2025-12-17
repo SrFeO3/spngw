@@ -40,7 +40,7 @@ mod actions;
 use actions::{GatewayAction, RouteLogic};
 
 mod config;
-use crate::config::{AppConfig, CertificateCache, JwtSigningKeys, RealmConfig};
+use crate::config::{ActionConfig, AppConfig, CertificateCache, JwtSigningKeys, UpstreamCache};
 
 /// Core logic and shared state for the proxy service
 ///
@@ -51,9 +51,10 @@ use crate::config::{AppConfig, CertificateCache, JwtSigningKeys, RealmConfig};
 /// A single instance is created at startup and shared immutably across all
 /// worker threads for the lifetime of the application.
 struct GatewayRouter {
-    upstream_peer_cache: Arc<DashMap<String, Arc<HttpPeer>>>,
+    upstream_peer_cache: Arc<ArcSwap<UpstreamCache>>,
     sni_ex_data_index: Index<Ssl, Option<String>>,
     jwt_keys: Arc<ArcSwap<JwtSigningKeys>>,
+    main_config: Arc<ArcSwap<AppConfig>>,
     _gateway_start_time: Instant,
 }
 
@@ -144,14 +145,6 @@ impl ProxyHttp for GatewayRouter {
         };
         ctx.upstream_sni_name = Some(upstream_sni_name);
 
-        // gateway actions
-        // Set the default upstream for all routes that fall into this block.
-        ctx.default_upstream_addr = Some("127.0.0.1:8081".to_string());
-
-        // Build the pipeline of routes based on the request path.
-        let path = session.req_header().uri.path();
-        ctx.action_pipeline.clear();
-
         //
         // Set the action pipeline actions for this request.
         //
@@ -159,84 +152,144 @@ impl ProxyHttp for GatewayRouter {
         // Set the default upstream for all routes that fall into this block.
         ctx.default_upstream_addr = Some("127.0.0.1:8081".to_string());
 
-        // Build the pipeline of routes based on the request path.
-        let path = session.req_header().uri.path();
         ctx.action_pipeline.clear();
 
         // All for DeviceCookie
         ctx.action_pipeline.push(GatewayAction::IssueDeviceCookie);
 
-        // Terminal Actions
-        if path == "/hello" {
-            // This route terminates the request with a static response.
-            ctx.action_pipeline.push(GatewayAction::ReturnStaticText {
-                content: "Hello from your new generic route!".into(),
-                status_code: 200,
-            });
-        } else if path == "/robot.txt" {
-            // This route terminates the request with a static response.
-            ctx.action_pipeline.push(GatewayAction::ReturnStaticText {
-                content: "User-agent: *\nDisallow: /".into(),
-                status_code: 200,
-            });
-        } else if path.starts_with("/static") {
-            // This route proxies to a specific upstream.
-            ctx.action_pipeline.push(GatewayAction::ProxyTo {
-                upstream: "127.0.0.1:8083".into(),
-            });
-        } else if path.starts_with("/external") {
-            // This route terminates the request with a redirect.
-            ctx.action_pipeline.push(GatewayAction::Redirect {
-                url: "https://ext.example.com/hello".into(),
-            });
-        }
+        // Dynamically generate Action Pipelines from config
+        let path = session.req_header().uri.path();
+        // For simplicity, we are using the first realm and its first routing chain.
+        // A real-world scenario would involve matching the request's hostname to a virtual_host
+        // and then finding the associated routing_chain.
 
-        // Modifier Actions:
-        match path {
-            "/fruit/apple" => ctx
-                .action_pipeline
-                .push(GatewayAction::SetUpstreamRequestHeader {
-                    name: "X-Sweet".into(),
-                    value: "pie".into(),
-                }),
-            "/fruit/orange" => ctx
-                .action_pipeline
-                .push(GatewayAction::SetUpstreamRequestHeader {
-                    name: "X-Drink".into(),
-                    value: "juice".into(),
-                }),
-            "/fruit/banana" => {
-                ctx.action_pipeline
-                    .push(GatewayAction::SetDownstreamResponseHeader {
-                        name: "X-Powered-By".into(),
-                        value: "BFF-proxy".into(),
-                    })
+        /// Evaluates a single match expression against the request's hostname and path.
+        fn evaluate_single_expr(expr: &str, hostname: &str, path: &str, request_id: &str) -> bool {
+            match expr {
+                expr if expr.starts_with("request.path.starts_with('") && expr.ends_with("')") => {
+                    let prefix = &expr["request.path.starts_with('".len()..expr.len() - "')".len()];
+                    path.starts_with(prefix)
+                }
+                expr if expr.starts_with("request.path.equals('") && expr.ends_with("')") => {
+                    let exact_path = &expr["request.path.equals('".len()..expr.len() - "')".len()];
+                    path == exact_path
+                }
+                expr if expr.starts_with("hostname.equals('") && expr.ends_with("')") => {
+                    let expected_hostname =
+                        &expr["hostname.equals('".len()..expr.len() - "')".len()];
+                    hostname == expected_hostname
+                }
+                _ => {
+                    warn!("[{}] Unsupported match expression: {}", request_id, expr);
+                    false
+                }
             }
-            _ => {}
         }
 
-        // Composite Actions
-        if path.starts_with("/private/") {
-            ctx.action_pipeline
-                .push(GatewayAction::RequireAuthentication {
-                    protected_backend_addr: "127.0.0.1:8082".into(), // Proxy to this backend if authenticated
-                    oidc_login_redirect_url: "https://auth2.example.com/auth".into(), // OIDC provider's authorization endpoint
-                    oidc_client_id: "my-client-2".into(),
-                    oidc_callback_url: "http://127.0.0.1:8002/auth/callback".into(), // BFF's callback endpoint
-                    oidc_token_endpoint_url: "http://127.0.0.1:8082/api/token".into(), // The OIDC token endpoint
-                    scope_name: "private_scope".into(),
-                });
-        } else if path.starts_with("/protected/") {
-            ctx.action_pipeline
-                .push(GatewayAction::RequireAuthentication {
-                    protected_backend_addr: "127.0.0.1:8083".into(), // Proxy to this backend if authenticated
-                    oidc_login_redirect_url: "https://auth.example.com/auth".into(), // OIDC provider's authorization endpoint
-                    oidc_client_id: "my-client-1".into(),
-                    oidc_callback_url: "http://127.0.0.1:8001/auth/callback".into(), // BFF's callback endpoint
-                    oidc_token_endpoint_url: "http://127.0.0.1:8081/api/token".into(), // The OIDC token endpoint
-                    scope_name: "protected_scope".into(),
-                });
+        let app_config = self.main_config.load();
+        if let Some(realm) = app_config.realms.get(0) {
+            if let Some(chain) = realm.routing_chains.get(0) {
+                info!(
+                    "[{}] Using routing_chain '{}' for request",
+                    ctx.request_id, chain.name
+                );
+                for rule in &chain.rules {
+                    let is_match = if rule.match_expr.contains(" and ") {
+                        // Handle 'and' conditions
+                        let parts: Vec<&str> = rule.match_expr.splitn(2, " and ").collect();
+                        if parts.len() == 2 {
+                            let part1 = parts[0].trim();
+                            let part2 = parts[1].trim();
+
+                            // Evaluate both conditions. For simplicity, we assume one is hostname and one is path.
+                            // A more robust solution would parse them regardless of order.
+                            let match1 = evaluate_single_expr(
+                                part1,
+                                &ctx.upstream_sni_name.clone().expect("").to_string(), // !!!
+                                path,
+                                &ctx.request_id,
+                            );
+                            let match2 = evaluate_single_expr(
+                                part2,
+                                &ctx.upstream_sni_name.clone().expect("").to_string(), // !!!
+                                path,
+                                &ctx.request_id,
+                            );
+
+                            match1 && match2
+                        } else {
+                            warn!(
+                                "[{}] Invalid 'and' expression: {}",
+                                ctx.request_id, rule.match_expr
+                            );
+                            false
+                        }
+                    } else {
+                        // Handle single conditions
+                        evaluate_single_expr(
+                            &rule.match_expr,
+                            &ctx.upstream_sni_name.clone().expect("").to_string(), // !!!
+                            path,
+                            &ctx.request_id,
+                        )
+                    };
+
+                    if is_match {
+                        info!(
+                            "[{}] Matched rule: '{}', applying action",
+                            ctx.request_id, rule.match_expr
+                        );
+                        let action = match &rule.action {
+                            ActionConfig::ReturnStaticText { content, status } => {
+                                GatewayAction::ReturnStaticText {
+                                    content: content.clone().into(),
+                                    status_code: *status,
+                                }
+                            }
+                            ActionConfig::Proxy { upstream } => GatewayAction::ProxyTo {
+                                upstream: upstream.clone().into(),
+                            },
+                            ActionConfig::Redirect { url } => GatewayAction::Redirect {
+                                url: url.clone().into(),
+                            },
+                            ActionConfig::SetUpstreamRequestHeader { name, value } => {
+                                GatewayAction::SetUpstreamRequestHeader {
+                                    name: name.clone().into(),
+                                    value: value.clone().into(),
+                                }
+                            }
+                            ActionConfig::SetDownstreamRequestHeader { name, value } => {
+                                GatewayAction::SetDownstreamResponseHeader {
+                                    name: name.clone().into(),
+                                    value: value.clone().into(),
+                                }
+                            }
+                            ActionConfig::RequireAuthentication {
+                                protected_backend_addr,
+                                oidc_login_redirect_url,
+                                oidc_client_id,
+                                oidc_callback_url,
+                                oidc_token_endpoint_url,
+                                scope_name,
+                            } => GatewayAction::RequireAuthentication {
+                                protected_backend_addr: protected_backend_addr.clone().into(),
+                                oidc_login_redirect_url: oidc_login_redirect_url.clone().into(),
+                                oidc_client_id: oidc_client_id.clone().into(),
+                                oidc_callback_url: oidc_callback_url.clone().into(),
+                                oidc_token_endpoint_url: oidc_token_endpoint_url.clone().into(),
+                                scope_name: scope_name.clone().into(),
+                            },
+                        };
+                        ctx.action_pipeline.push(action);
+                    }
+                }
+            }
         }
+
+        info!(
+            "[{}] Final action pipeline: {:?}",
+            ctx.request_id, ctx.action_pipeline
+        );
 
         //
         // Execute the pipeline for request_filter_and_prepare_upstream_peer.
@@ -342,6 +395,8 @@ impl ProxyHttp for GatewayRouter {
         // !!!!!
         let peer = self
             .upstream_peer_cache
+            .load()
+            .peer_map
             .get(upstream_addr)
             .map(|p| p.value().clone())
             .unwrap_or_else(|| {
@@ -600,6 +655,7 @@ fn main() -> pingora::Result<()> {
 
     let gateway_start_time = Instant::now();
     let app_config = config::load_app_config();
+    let main_config_swapper = Arc::new(ArcSwap::new(app_config.clone()));
 
     // Load initial JWT signing keys and wrap them in ArcSwap for hot-reloading.
     // For simplicity, we'll use the keys from the first realm defined in the config.
@@ -627,27 +683,15 @@ fn main() -> pingora::Result<()> {
         .expect("At least one certificate must be configured to serve as the default.")
         .clone();
 
+    // Create initial upstream peer cache and wrap it in ArcSwap for hot-reloading.
+    let initial_upstreams = UpstreamCache::load_from_config(app_config.clone());
+    let upstream_peer_swapper = Arc::new(ArcSwap::new(Arc::new(initial_upstreams)));
+
     // Register authentication scopes. This initializes the session stores within the actions module.
     actions::register_auth_scope("protected_scope");
     actions::register_auth_scope("private_scope");
     // Add more scopes as needed, e.g., for /admin, /shop, etc.
     // actions::register_auth_scope("admin_scope");
-
-    // Create an upstream peer cache to store pre-configured HttpPeer objects for each backend.
-    let upstream_peer_cache = Arc::new(DashMap::new());
-    upstream_peer_cache.insert(
-        "127.0.0.1:8081".to_string(),
-        Arc::new(HttpPeer::new("127.0.0.1:8081", false, "".to_string())),
-    );
-    upstream_peer_cache.insert(
-        "127.0.0.1:8082".to_string(),
-        Arc::new(HttpPeer::new("127.0.0.1:8082", false, "".to_string())),
-    );
-    upstream_peer_cache.insert(
-        "127.0.0.1:8083".to_string(),
-        Arc::new(HttpPeer::new("127.0.0.1:8083", false, "".to_string())),
-    );
-    // Add more upstreams as needed, e.g., for 127.0.0.1:9001, 127.0.0.1:9002 etc.
 
     let mut my_server = Server::new(Some(opt))?;
 
@@ -670,14 +714,17 @@ fn main() -> pingora::Result<()> {
     let config_reload_service = config::ConfigHotReloadService::new(
         jwt_keys.clone(),
         cert_cache.clone(),
+        upstream_peer_swapper.clone(),
+        main_config_swapper.clone(),
         initial_config_content,
     );
     my_server.add_service(background_service("Config Reloader", config_reload_service));
 
     let gw = GatewayRouter {
-        upstream_peer_cache,
+        upstream_peer_cache: upstream_peer_swapper,
         sni_ex_data_index: sni_ex_data_index.clone(),
         jwt_keys,
+        main_config: main_config_swapper,
         _gateway_start_time: gateway_start_time,
     };
 

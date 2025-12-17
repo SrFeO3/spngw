@@ -1,5 +1,6 @@
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use dashmap::DashMap;
 use log::{info, warn};
 use pingora::prelude::*;
 use pingora::services::background::BackgroundService;
@@ -12,25 +13,65 @@ use std::time::Duration;
 
 pub const CONFIG_PATH: &str = "conf/config.yaml";
 
-// Certificate and its corresponding private key.
+/// Certificate and its corresponding private key.
 pub struct CertAndKey {
     pub cert: pingora::tls::x509::X509,
     pub key: pingora::tls::pkey::PKey<Private>,
 }
 
+/// All possible actions that can be performed when a rule matches.
 #[derive(Debug, Deserialize, Clone)]
-pub struct AppConfig {
-    pub realms: Vec<RealmConfig>,
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ActionConfig {
+    ReturnStaticText {
+        content: String,
+        status: u16,
+    },
+    Proxy {
+        upstream: String,
+    },
+    Redirect {
+        url: String,
+    },
+    SetUpstreamRequestHeader {
+        name: String,
+        value: String,
+    },
+    SetDownstreamRequestHeader {
+        name: String,
+        value: String,
+    },
+    RequireAuthentication {
+        protected_backend_addr: String,
+        oidc_login_redirect_url: String,
+        oidc_client_id: String,
+        oidc_callback_url: String,
+        oidc_token_endpoint_url: String,
+        scope_name: String,
+    },
 }
 
+/// Rule that matches a request and specifies an action to perform.
 #[derive(Debug, Deserialize, Clone)]
-pub struct RealmConfig {
+pub struct RuleConfig {
+    #[serde(rename = "match")]
+    pub match_expr: String,
+    pub action: ActionConfig,
+}
+
+/// Routing rules that are evaluated sequentially.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct RoutingChainConfig {
     pub name: String,
-    #[serde(flatten)]
-    pub jwt_signing_keys: JwtSigningKeysConfig, // Flatten the keys directly into the realm
-    pub virtual_hosts: Vec<VirtualHostConfig>,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    pub rules: Vec<RuleConfig>,
 }
 
+/// Virtual host, which maps a hostname to a specific TLS certificate.
 #[derive(Debug, Deserialize, Clone)]
 pub struct VirtualHostConfig {
     pub hostname: String,
@@ -38,33 +79,30 @@ pub struct VirtualHostConfig {
     pub private_key_pem: String,
 }
 
+/// PEM-encoded public and private keys for JWT signing.
 #[derive(Debug, Deserialize, Clone)]
 pub struct JwtSigningKeysConfig {
     pub public_key_pem: String,
     pub private_key_pem: String,
 }
 
-impl AppConfig {
-    /// Loads application configuration from a YAML file.
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if:
-    /// - The file specified by `path` does not exist or cannot be read.
-    /// - The file content is not valid YAML or does not match the `AppConfig` structure.
-    pub fn load_from_yaml(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let config_str = fs::read_to_string(path)?;
+/// Realm, which groups together a set of virtual hosts and routing rules.
+#[derive(Debug, Deserialize, Clone)]
+pub struct RealmConfig {
+    pub name: String,
+    #[serde(flatten)]
+    pub jwt_signing_keys: JwtSigningKeysConfig, // Flatten the keys directly into the realm
+    pub virtual_hosts: Vec<VirtualHostConfig>,
+    pub routing_chains: Vec<RoutingChainConfig>,
+}
 
-        let config: AppConfig = serde_yaml::from_str(&config_str)?;
-        Ok(config)
-    }
+/// Root of the application's configuration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct AppConfig {
+    pub realms: Vec<RealmConfig>,
 }
 
 /// Application's cryptographic keys.
-///
-/// A single instance of this struct is created at startup, wrapped in an `Arc`,
-/// and shared across all threads. It contains the PEM-encoded key pair used for
-/// signing and validating JWTs (e.g., `DEVICE_CONTEXT`).
 pub struct JwtSigningKeys {
     pub public_key_pem: Vec<u8>,
     pub private_key_pem: Vec<u8>,
@@ -91,16 +129,19 @@ impl JwtSigningKeys {
 pub fn load_app_config() -> Arc<AppConfig> {
     // In a real application, you might use command-line arguments or environment variables
     // to determine which configuration file to load.
-    let config = AppConfig::load_from_yaml(CONFIG_PATH)
-        .unwrap_or_else(|e| panic!("Failed to load configuration from {}: {}", CONFIG_PATH, e));
+    let config_str = fs::read_to_string(CONFIG_PATH)
+        .unwrap_or_else(|e| panic!("Failed to read configuration from {}: {}", CONFIG_PATH, e));
+    let config: AppConfig = serde_yaml::from_str(&config_str)
+        .unwrap_or_else(|e| panic!("Failed to parse configuration from {}: {}", CONFIG_PATH, e));
     Arc::new(config)
 }
 
 /// A background service that periodically checks for configuration updates and applies them.
-///
 pub struct ConfigHotReloadService {
     keys_swapper: Arc<ArcSwap<JwtSigningKeys>>,
     cert_swapper: Arc<ArcSwap<CertificateCache>>,
+    upstream_swapper: Arc<ArcSwap<UpstreamCache>>,
+    main_config_swapper: Arc<ArcSwap<AppConfig>>,
     last_known_content: Mutex<String>,
 }
 
@@ -108,14 +149,24 @@ impl ConfigHotReloadService {
     pub fn new(
         keys_swapper: Arc<ArcSwap<JwtSigningKeys>>,
         cert_swapper: Arc<ArcSwap<CertificateCache>>,
+        upstream_swapper: Arc<ArcSwap<UpstreamCache>>,
+        main_config_swapper: Arc<ArcSwap<AppConfig>>,
         initial_config_content: String,
     ) -> Self {
         ConfigHotReloadService {
             keys_swapper,
             cert_swapper,
+            upstream_swapper,
+            main_config_swapper,
             last_known_content: Mutex::new(initial_config_content),
         }
     }
+}
+
+/// All loaded certificates, which can be reloaded atomically.
+pub struct UpstreamCache {
+    // A map from upstream address string to its HttpPeer object.
+    pub peer_map: DashMap<String, Arc<HttpPeer>>,
 }
 
 /// All loaded certificates, which can be reloaded atomically.
@@ -170,6 +221,71 @@ impl CertificateCache {
         }
         info!("Successfully loaded {} certificates.", cert_map.len());
         Ok(CertificateCache { cert_map })
+    }
+}
+
+impl UpstreamCache {
+    /// Loads upstream peers from the provided application configuration.
+    ///
+    /// This function iterates through all virtual hosts in all realms defined in the
+    /// `AppConfig` and loads their corresponding PEM-encoded certificates and private keys.
+    ///
+    /// # Arguments
+    ///
+    /// * `app_config` - An `Arc<AppConfig>` containing the configuration from which to load certificates.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing a `CertificateCache` instance on success, or an `Error` if
+    /// any certificate or key fails to load.
+    pub fn load_from_config(app_config: Arc<AppConfig>) -> Self {
+        let peer_map = DashMap::new();
+        let mut unique_addrs = HashSet::new();
+
+        // Collect all unique upstream addresses from the configuration
+        for realm in &app_config.realms {
+            for chain in &realm.routing_chains {
+                for rule in &chain.rules {
+                    match &rule.action {
+                        ActionConfig::Proxy { upstream } => {
+                            unique_addrs.insert(upstream.clone());
+                        }
+                        ActionConfig::RequireAuthentication {
+                            protected_backend_addr,
+                            ..
+                        } => {
+                            unique_addrs.insert(protected_backend_addr.clone());
+                        }
+                        _ => {} // Other actions don't have upstreams
+                    }
+                }
+            }
+        }
+
+        // Manually add the default upstream if not already present
+        unique_addrs.insert("http://127.0.0.1:8081".to_string());
+
+        // Log all unique upstream addresses that will be created.
+        info!(
+            "Found unique upstream addresses from config: {:?}",
+            unique_addrs
+        );
+
+        // Create HttpPeer for each unique address
+        for addr_with_scheme in unique_addrs {
+            // HttpPeer::new expects "host:port", so we need to strip the scheme.
+            let addr_no_scheme = addr_with_scheme
+                .strip_prefix("http://")
+                .unwrap_or(&addr_with_scheme);
+            let is_tls = addr_with_scheme.starts_with("https://");
+
+            info!("Creating upstream peer for: {}", addr_with_scheme);
+            let peer = HttpPeer::new(addr_no_scheme, is_tls, "".to_string());
+            peer_map.insert(addr_with_scheme, Arc::new(peer));
+        }
+
+        info!("Successfully created {} upstream peers.", peer_map.len());
+        UpstreamCache { peer_map }
     }
 }
 

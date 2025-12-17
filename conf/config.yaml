@@ -253,3 +253,49 @@ realms:
                 rqFdKccXErb++aV2Ve3GR1jdUqCTiZWcOp20pg+riJshgICKLJlfJNfNxIrUkUcd
                 P23W2zh1jT9kQgc8tdfRqQE=
                 -----END PRIVATE KEY-----
+      routing_chains:
+          - name: fruit-shop-route
+            title: Routing-Chain fruit-shop-route
+            description: Virtual host handling 'fruit' subdomain requests
+            rules:
+                - match: "request.path.equals('/robot.txt')"
+                  action:
+                      type: returnStaticText
+                      content: "User-agent: *\nDisallow: /"
+                      status: 200
+                - match: "hostname.equals('www.sr.example.com') and request.path.starts_with('/static/')"
+                  action:
+                      type: proxy
+                      upstream: "http://127.0.0.1:8081"
+                - match: "hostname.equals('api.sr.example.com') and request.path.starts_with('/static/')"
+                  action:
+                      type: proxy
+                      upstream: "http://127.0.0.1:8082"
+                - match: "request.path.starts_with('/external/')"
+                  action:
+                      type: redirect
+                      url: "https://ext.example.com/hello"
+                - match: "request.path.starts_with('/fruit/apple/')"
+                  action:
+                      type: setUpstreamRequestHeader
+                      name: "X-Sweet"
+                      value: "apple"
+                - match: "hostname.equals('api.sr.example.com') and request.path.starts_with('/fruit/orange/')"
+                  action:
+                      type: setUpstreamRequestHeader
+                      name: "X-Sweet"
+                      value: "juice"
+                - match: "request.path.starts_with('/fruit/orange/')"
+                  action:
+                      type: setDownstreamRequestHeader
+                      name: "X-Powered-By"
+                      value: "BFF-Proxy"
+                - match: "request.path.starts_with('/private/')"
+                  action:
+                      type: requireAuthentication
+                      protected_backend_addr: "127.0.0.1:8082"
+                      oidc_login_redirect_url: "https://auth2.example.com/auth"
+                      oidc_client_id: "my-client-2"
+                      oidc_callback_url: "http://127.0.0.1:8002/auth/callback"
+                      oidc_token_endpoint_url: "http://127.0.0.1:8082/api/token" # OIDC token endpoint
+                      scope_name: "private_scope"
