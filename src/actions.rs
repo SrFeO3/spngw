@@ -56,21 +56,6 @@ pub fn register_auth_scope(scope_name: &str) {
         .get_or_init(DashMap::new)
         .entry(scope_name.to_string())
         .or_insert_with(|| Arc::new(DashMap::new()));
-    info!("Authentication scope '{}' registered.", scope_name);
-}
-
-/// Unregisters an authentication scope and removes its associated session store.
-/// This is intended for use during configuration hot-reloading to remove scopes
-/// that are no longer present in the new configuration.
-pub fn unregister_auth_scope(scope_name: &str) {
-    if let Some(stores) = AUTH_SESSION_STORES.get() {
-        if stores.remove(scope_name).is_some() {
-            info!(
-                "Authentication scope '{}' and its session store have been unregistered.",
-                scope_name
-            );
-        }
-    }
 }
 
 /// Returns a reference to the global authentication session stores map.

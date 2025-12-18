@@ -9,6 +9,8 @@
 //   RUST_LOG=info cargo run
 //
 // TODO:
+// - Consider easy temporary use of first realm
+// - Consider default_cert on main should be configurable instead of hardcoded.
 // - Consider adding a route for requests with no SNI found in the filter
 // - Consider handling cases where no upstream is found in upstream_peer
 // - Implement RequireAuthentication action
@@ -20,21 +22,16 @@
 // - Implement a lock for token refresh to prevent the dog-piling effect
 // - Review the backend SSL implementation using Pingora (currently using boringssl)
 
-use std::collections::HashMap;
-use std::fs;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use boring::ex_data::Index;
 use dashmap::DashMap;
-use log::{error, info, warn};
+use log::{info, warn};
 use pingora::http::ResponseHeader;
 use pingora::prelude::*;
-use pingora::server::ShutdownWatch;
-use pingora::services::background::BackgroundService;
-use pingora::tls::pkey::Private;
 use pingora::tls::ssl::Ssl;
 
 mod actions;
@@ -670,28 +667,31 @@ fn main() -> pingora::Result<()> {
     let jwt_keys_cache_swapper = Arc::new(ArcSwap::new(Arc::new(initial_keys_cache)));
 
     // Load initial certificates and wrap them in ArcSwap for hot-reloading.
-    let initial_certs = CertificateCache::load_from_config(app_config.clone())
-        .expect("Failed to load initial certificates");
-    let cert_cache = Arc::new(ArcSwap::new(Arc::new(initial_certs)));
+    let mut initial_certs = CertificateCache {
+        cert_map: DashMap::new(),
+    };
+    CertificateCache::reload_from_config(&app_config, &mut initial_certs);
+    let cert_cache_swapper = Arc::new(ArcSwap::new(Arc::new(initial_certs)));
 
     // Determine the default certificate. For simplicity, we use the first one found.
-    // !!!!!
-    let default_cert = cert_cache
+    let default_cert = cert_cache_swapper
         .load()
         .cert_map
-        .values()
-        .next()
-        .expect("At least one certificate must be configured to serve as the default.")
-        .clone();
+        .iter() // Use .iter() to get an iterator
+        .next() // Get the first key-value pair
+        .map(|pair| pair.value().clone()) // Extract and clone the value (the Arc<CertAndKey>)
+        .expect("At least one certificate must be configured to serve as the default.");
 
     // Create initial upstream peer cache and wrap it in ArcSwap for hot-reloading.
-    let initial_upstreams = UpstreamCache::load_from_config(app_config.clone());
-    let upstream_peer_swapper = Arc::new(ArcSwap::new(Arc::new(initial_upstreams)));
+    let initial_upstream_cache = UpstreamCache {
+        peer_map: DashMap::new(),
+    };
+    // Perform an initial load.
+    UpstreamCache::reload_from_config(&app_config, &initial_upstream_cache);
+    let upstream_peer_swapper = Arc::new(ArcSwap::new(Arc::new(initial_upstream_cache)));
 
     // --- Initialize and register authentication scopes from config ---
     AuthScopeRegistry::reload_from_config(&app_config);
-    let initial_auth_scope_registry = AuthScopeRegistry::default();
-    let auth_scope_registry_swapper = Arc::new(ArcSwap::new(Arc::new(initial_auth_scope_registry)));
 
     let mut my_server = Server::new(Some(opt))?;
 
@@ -713,10 +713,9 @@ fn main() -> pingora::Result<()> {
     // Create and add the configuration hot reload service.
     let config_reload_service = config::ConfigHotReloadService::new(
         jwt_keys_cache_swapper.clone(),
-        cert_cache.clone(),
+        cert_cache_swapper.clone(),
         upstream_peer_swapper.clone(),
         main_config_swapper.clone(),
-        auth_scope_registry_swapper,
         initial_config_content,
     );
     my_server.add_service(background_service("Config Reloader", config_reload_service));
@@ -732,7 +731,7 @@ fn main() -> pingora::Result<()> {
     let mut http_service = http_proxy_service(&my_server.configuration, gw);
     let selector = SniCertificateSelector {
         sni_ex_data_index: sni_ex_data_index.clone(),
-        cert_cache,
+        cert_cache: cert_cache_swapper.clone(),
         default_cert,
     };
 

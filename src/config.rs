@@ -27,7 +27,10 @@
 ///   It adds new scopes and removes obsolete ones, but crucially, it does **not** touch
 ///   existing, unchanged scopes. This ensures that active user sessions within those
 ///   scopes are preserved across configuration reloads.
-use std::collections::{HashMap, HashSet};
+///
+/// TODO:
+/// - Consider default_upstream on UpstreamCache should be configurable instead of hardcoded.
+use std::collections::HashSet;
 use std::fs;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -44,12 +47,6 @@ use serde::Deserialize;
 use crate::actions;
 
 pub const CONFIG_PATH: &str = "conf/config.yaml";
-
-/// Certificate and its corresponding private key.
-pub struct CertAndKey {
-    pub cert: pingora::tls::x509::X509,
-    pub key: pingora::tls::pkey::PKey<Private>,
-}
 
 /// All possible actions that can be performed when a rule matches.
 #[derive(Debug, Deserialize, Clone)]
@@ -97,9 +94,9 @@ pub struct RuleConfig {
 pub struct RoutingChainConfig {
     pub name: String,
     #[serde(default)]
-    pub title: String,
+    pub _title: String,
     #[serde(default)]
-    pub description: String,
+    pub _description: String,
     pub rules: Vec<RuleConfig>,
 }
 
@@ -113,7 +110,7 @@ pub struct VirtualHostConfig {
 
 /// PEM-encoded public and private keys for JWT signing.
 #[derive(Debug, Deserialize, Clone)]
-pub struct JwtSigningKeysConfig {
+pub struct JwtKeyPairConfig {
     pub public_key_pem: String,
     pub private_key_pem: String,
 }
@@ -123,7 +120,7 @@ pub struct JwtSigningKeysConfig {
 pub struct RealmConfig {
     pub name: String,
     #[serde(flatten)]
-    pub jwt_signing_keys: JwtSigningKeysConfig, // Flatten the keys directly into the realm
+    pub jwt_key_pair: JwtKeyPairConfig, // Flatten the keys directly into the realm
     pub virtual_hosts: Vec<VirtualHostConfig>,
     pub routing_chains: Vec<RoutingChainConfig>,
 }
@@ -134,9 +131,29 @@ pub struct AppConfig {
     pub realms: Vec<RealmConfig>,
 }
 
+// --- Runtime Data Structures ---
+
+/// Certificate and its corresponding private key.
+pub struct CertAndKey {
+    pub cert: pingora::tls::x509::X509,
+    pub key: pingora::tls::pkey::PKey<Private>,
+}
+
+/// All loaded certificates, which can be reloaded atomically.
+pub struct CertificateCache {
+    // A map from SNI hostname to its certificate and key.
+    pub cert_map: DashMap<String, Arc<CertAndKey>>,
+}
+
+/// All loaded certificates, which can be reloaded atomically.
+pub struct UpstreamCache {
+    // A map from upstream address string to its HttpPeer object.
+    pub peer_map: DashMap<String, Arc<HttpPeer>>,
+}
+
 /// Application's cryptographic keys.
 #[derive(Clone)]
-pub struct JwtSigningKeys {
+pub struct JwtKeyPair {
     pub public_key_pem: Vec<u8>,
     pub private_key_pem: Vec<u8>,
 }
@@ -144,29 +161,43 @@ pub struct JwtSigningKeys {
 /// Cache for JWT signing keys, keyed by realm name.
 /// This allows for hot-reloading of keys on a per-realm basis.
 pub struct JwtKeysCache {
-    pub keys_by_realm: DashMap<String, Arc<JwtSigningKeys>>,
+    pub keys_by_realm: DashMap<String, Arc<JwtKeyPair>>,
+}
+
+/// Manages the set of active authentication scopes.
+#[derive(Default)]
+pub struct AuthScopeRegistry {
+    // We only need this struct to exist for type consistency in ArcSwap.
+    // The actual state is managed globally in `actions.rs`.
+    // A `phantom` field could be used if we needed to associate a lifetime.
+    _private: (),
 }
 
 impl JwtKeysCache {
-    /// Performs a differential update of JWT signing keys from the configuration.
+    /// Performs a differential update of JWT key pairs from the configuration.
+    ///
+    /// This function is idempotent. It adds new keys, updates changed keys,
+    /// and removes obsolete keys, without affecting unchanged ones.
     pub fn reload_from_config(app_config: &Arc<AppConfig>, current_cache: &Self) {
         let new_realms: HashSet<String> =
             app_config.realms.iter().map(|r| r.name.clone()).collect();
 
         // Update existing or add new keys
         for realm in &app_config.realms {
-            let new_keys = JwtSigningKeys {
-                public_key_pem: realm.jwt_signing_keys.public_key_pem.as_bytes().to_vec(),
-                private_key_pem: realm.jwt_signing_keys.private_key_pem.as_bytes().to_vec(),
+            let new_keys = JwtKeyPair {
+                public_key_pem: realm.jwt_key_pair.public_key_pem.clone().into_bytes(),
+                private_key_pem: realm.jwt_key_pair.private_key_pem.clone().into_bytes(),
             };
 
             // Check if the key is new or has changed.
             let needs_update = match current_cache.keys_by_realm.get(&realm.name) {
+                // The realm exists. Check if the key material has changed.
                 Some(existing_keys) => {
                     existing_keys.public_key_pem != new_keys.public_key_pem
                         || existing_keys.private_key_pem != new_keys.private_key_pem
                 }
-                None => true, // It's a new realm.
+                // The realm is new and not in the cache, so it needs to be added.
+                None => true,
             };
 
             if needs_update {
@@ -194,6 +225,193 @@ impl JwtKeysCache {
         });
     }
 }
+impl CertificateCache {
+    /// Performs a differential update of TLS certificates from the configuration.
+    ///
+    /// This function is idempotent and performs a differential update on the existing cache.
+    /// It adds new certificates, updates changed ones, and removes obsolete ones.
+    pub fn reload_from_config(app_config: &Arc<AppConfig>, current_cache: &Self) {
+        // 1. Collect all hostnames from the new config for easy lookup.
+        let new_hostnames: HashSet<_> = app_config
+            .realms
+            .iter()
+            .flat_map(|r| r.virtual_hosts.iter().map(|v| v.hostname.clone()))
+            .collect();
+
+        // 2. Iterate through new config to update or add certificates.
+        for realm in &app_config.realms {
+            for vhost in &realm.virtual_hosts {
+                let cert_pem = vhost.certificate_pem.as_bytes();
+                let key_pem = vhost.private_key_pem.as_bytes();
+
+                // Check if the certificate needs updating (either new or changed).
+                let needs_update = match current_cache.cert_map.get(&vhost.hostname) {
+                    // The host exists in the cache. Check if the underlying PEM content has changed.
+                    Some(old_cert) => {
+                        let old_cert_pem = old_cert.cert.to_pem().unwrap_or_default();
+                        let old_key_pem =
+                            old_cert.key.private_key_to_pem_pkcs8().unwrap_or_default();
+
+                        old_cert_pem != cert_pem || old_key_pem != key_pem
+                    }
+                    // The host is not in the cache, so it's new.
+                    None => true,
+                };
+
+                if needs_update {
+                    info!(
+                        "[ConfigReload] Realm '{}': Updating certificate for host '{}'",
+                        realm.name, &vhost.hostname
+                    );
+                    match (
+                        pingora::tls::x509::X509::from_pem(cert_pem),
+                        pingora::tls::pkey::PKey::private_key_from_pem(key_pem),
+                    ) {
+                        (Ok(cert), Ok(key)) => {
+                            let cert_and_key = Arc::new(CertAndKey { cert, key });
+                            current_cache
+                                .cert_map
+                                .insert(vhost.hostname.clone(), cert_and_key);
+                        }
+                        (Err(e), _) => warn!(
+                            "[ConfigReload] Failed to parse new certificate for {}: {}. Skipping update.",
+                            vhost.hostname, e
+                        ),
+                        (_, Err(e)) => warn!(
+                            "[ConfigReload] Failed to parse new private key for {}: {}. Skipping update.",
+                            vhost.hostname, e
+                        ),
+                    }
+                }
+            }
+        }
+
+        // 3. Remove entries that are no longer in the new config.
+        current_cache.cert_map.retain(|hostname, _| {
+            if !new_hostnames.contains(hostname) {
+                info!(
+                    "[ConfigReload] Removing obsolete certificate for host: {}",
+                    hostname
+                );
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
+
+impl UpstreamCache {
+    /// Performs a differential update of upstream peers from the configuration.
+    ///
+    /// This function is idempotent. It adds new upstream peers and removes
+    /// obsolete ones. Note: It does not check for changes in existing peers.
+    pub fn reload_from_config(app_config: &Arc<AppConfig>, current_cache: &Self) {
+        let mut all_required_addrs = HashSet::new();
+
+        // 1. Add new peers that are not in the current cache, on a per-realm basis.
+        for realm in &app_config.realms {
+            let mut realm_addrs = HashSet::new();
+            for chain in &realm.routing_chains {
+                for rule in &chain.rules {
+                    if let Some(addr) = match &rule.action {
+                        ActionConfig::Proxy { upstream } => Some(upstream.clone()),
+                        ActionConfig::RequireAuthentication {
+                            protected_backend_addr,
+                            ..
+                        } => Some(protected_backend_addr.clone()),
+                        _ => None,
+                    } {
+                        realm_addrs.insert(addr);
+                    }
+                }
+            }
+
+            for addr in &realm_addrs {
+                if !current_cache.peer_map.contains_key(addr) {
+                    info!(
+                        "[ConfigReload] Realm '{}': Creating new upstream peer for '{}'",
+                        realm.name, addr
+                    );
+                    let addr_no_scheme = addr.strip_prefix("http://").unwrap_or(addr);
+                    let is_tls = addr.starts_with("https://");
+                    let peer = HttpPeer::new(addr_no_scheme, is_tls, "".to_string());
+                    current_cache.peer_map.insert(addr.clone(), Arc::new(peer));
+                }
+            }
+            all_required_addrs.extend(realm_addrs);
+        }
+
+        // Manually add the default upstream if not already present.
+        let default_upstream = "http://127.0.0.1:8081".to_string();
+        if !current_cache.peer_map.contains_key(&default_upstream) {
+            info!(
+                "[ConfigReload] System: Creating default upstream peer for '{}'",
+                default_upstream
+            );
+            let peer = HttpPeer::new("127.0.0.1:8081", false, "".to_string());
+            current_cache
+                .peer_map
+                .insert(default_upstream.clone(), Arc::new(peer));
+        }
+        all_required_addrs.insert(default_upstream);
+
+        // 2. Remove peers that are no longer in the new configuration.
+        current_cache.peer_map.retain(|addr, _| {
+            if !all_required_addrs.contains(addr) {
+                info!("[ConfigReload] Removing obsolete upstream peer: {}", addr);
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
+impl AuthScopeRegistry {
+    /// Performs a differential update of authentication scopes based on the new config.
+    /// - New scopes in the config are added.
+    /// - Scopes removed from the config are unregistered.
+    /// - Existing, unchanged scopes are not touched, preserving their session stores.
+    pub fn reload_from_config(config: &Arc<AppConfig>) {
+        let mut all_required_scopes = HashSet::new();
+
+        // 1. Register all scopes from the new config, on a per-realm basis.
+        // `register_auth_scope` is idempotent, so it's safe to call for existing scopes.
+        for realm in &config.realms {
+            for chain in &realm.routing_chains {
+                for rule in &chain.rules {
+                    if let ActionConfig::RequireAuthentication {
+                        auth_scope_name, ..
+                    } = &rule.action
+                    {
+                        if all_required_scopes.insert(auth_scope_name.clone()) {
+                            // Only log on the first encounter of a scope.
+                            info!(
+                                "[ConfigReload] Realm '{}': Registering new auth scope if not present: '{}'",
+                                realm.name, auth_scope_name
+                            );
+                        }
+                        actions::register_auth_scope(auth_scope_name);
+                    }
+                }
+            }
+        }
+
+        // 2. Remove scopes that are no longer in the new configuration.
+        let stores = actions::get_auth_session_stores();
+        stores.retain(|scope_name, _| {
+            if !all_required_scopes.contains(scope_name) {
+                info!(
+                    "[ConfigReload] Unregistering obsolete authentication scope: '{}'",
+                    scope_name
+                );
+                false
+            } else {
+                true
+            }
+        });
+    }
+}
 
 pub fn load_app_config() -> Arc<AppConfig> {
     // In a real application, you might use command-line arguments or environment variables
@@ -205,13 +423,14 @@ pub fn load_app_config() -> Arc<AppConfig> {
     Arc::new(config)
 }
 
+// --- Hot Reload Service ---
+
 /// A background service that periodically checks for configuration updates and applies them.
 pub struct ConfigHotReloadService {
     keys_swapper: Arc<ArcSwap<JwtKeysCache>>,
     cert_swapper: Arc<ArcSwap<CertificateCache>>,
     upstream_swapper: Arc<ArcSwap<UpstreamCache>>,
     main_config_swapper: Arc<ArcSwap<AppConfig>>,
-    auth_scope_registry_swapper: Arc<ArcSwap<AuthScopeRegistry>>,
     last_known_content: Mutex<String>,
 }
 
@@ -221,7 +440,6 @@ impl ConfigHotReloadService {
         cert_swapper: Arc<ArcSwap<CertificateCache>>,
         upstream_swapper: Arc<ArcSwap<UpstreamCache>>,
         main_config_swapper: Arc<ArcSwap<AppConfig>>,
-        auth_scope_registry_swapper: Arc<ArcSwap<AuthScopeRegistry>>,
         initial_config_content: String,
     ) -> Self {
         ConfigHotReloadService {
@@ -229,193 +447,8 @@ impl ConfigHotReloadService {
             cert_swapper,
             upstream_swapper,
             main_config_swapper,
-            auth_scope_registry_swapper,
             last_known_content: Mutex::new(initial_config_content),
         }
-    }
-}
-
-/// All loaded certificates, which can be reloaded atomically.
-pub struct UpstreamCache {
-    // A map from upstream address string to its HttpPeer object.
-    pub peer_map: DashMap<String, Arc<HttpPeer>>,
-}
-
-/// All loaded certificates, which can be reloaded atomically.
-pub struct CertificateCache {
-    // A map from SNI hostname to its certificate and key.
-    pub cert_map: HashMap<String, Arc<CertAndKey>>,
-}
-
-impl CertificateCache {
-    /// Loads certificates from the provided application configuration.
-    ///
-    /// This function iterates through all virtual hosts in all realms defined in the
-    /// `AppConfig` and loads their corresponding PEM-encoded certificates and private keys.
-    ///
-    /// # Arguments
-    ///
-    /// * `app_config` - An `Arc<AppConfig>` containing the configuration from which to load certificates.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing a `CertificateCache` instance on success, or an `Error` if
-    /// any certificate or key fails to load.
-    pub fn load_from_config(app_config: Arc<AppConfig>) -> Result<Self> {
-        let mut cert_map = HashMap::new();
-        info!("Loading certificates from configuration...");
-
-        for realm in &app_config.realms {
-            for vhost in &realm.virtual_hosts {
-                info!("Loading certificate for host: {}", &vhost.hostname);
-                let cert = pingora::tls::x509::X509::from_pem(vhost.certificate_pem.as_bytes())
-                    .map_err(|e| {
-                        let mut err = Error::new(ErrorType::InternalError);
-                        err.set_context(format!(
-                            "Failed to load certificate for {}: {}",
-                            vhost.hostname, e
-                        ));
-                        err
-                    })?;
-                let key = pingora::tls::pkey::PKey::<Private>::private_key_from_pem(
-                    vhost.private_key_pem.as_bytes(),
-                )
-                .map_err(|e| {
-                    let mut err = Error::new(ErrorType::InternalError);
-                    err.set_context(format!(
-                        "Failed to load private key for {}: {}",
-                        vhost.hostname, e
-                    ));
-                    err
-                })?;
-                cert_map.insert(vhost.hostname.clone(), Arc::new(CertAndKey { cert, key }));
-            }
-        }
-        info!("Successfully loaded {} certificates.", cert_map.len());
-        Ok(CertificateCache { cert_map })
-    }
-}
-
-/// Manages the set of active authentication scopes.
-#[derive(Default)]
-pub struct AuthScopeRegistry {
-    // We only need this struct to exist for type consistency in ArcSwap.
-    // The actual state is managed globally in `actions.rs`.
-    // A `phantom` field could be used if we needed to associate a lifetime.
-    _private: (),
-}
-
-impl AuthScopeRegistry {
-    /// Performs a differential update of authentication scopes based on the new config.
-    /// - New scopes in the config are added.
-    /// - Scopes removed from the config are unregistered.
-    /// - Existing, unchanged scopes are not touched, preserving their session stores.
-    pub fn reload_from_config(config: &Arc<AppConfig>) {
-        // 1. Collect all scope names from the new configuration into a HashSet.
-        let new_auth_scopes: HashSet<String> = config
-            .realms
-            .iter()
-            .flat_map(|realm| &realm.routing_chains)
-            .flat_map(|chain| &chain.rules)
-            .filter_map(|rule| {
-                if let ActionConfig::RequireAuthentication {
-                    auth_scope_name, ..
-                } = &rule.action
-                {
-                    Some(auth_scope_name.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // 2. Get the set of currently registered scopes.
-        let stores = actions::get_auth_session_stores();
-        let current_auth_scopes: HashSet<String> =
-            stores.iter().map(|entry| entry.key().clone()).collect();
-
-        // 3. Add new scopes.
-        for scope_to_add in new_auth_scopes.difference(&current_auth_scopes) {
-            info!(
-                "[ConfigReload] Registering new authentication scope: '{}'",
-                scope_to_add
-            );
-            actions::register_auth_scope(scope_to_add);
-        }
-
-        // 4. Remove obsolete scopes.
-        for scope_to_remove in current_auth_scopes.difference(&new_auth_scopes) {
-            info!(
-                "[ConfigReload] Unregistering obsolete authentication scope: '{}'",
-                scope_to_remove
-            );
-            actions::unregister_auth_scope(scope_to_remove);
-        }
-    }
-}
-
-impl UpstreamCache {
-    /// Loads upstream peers from the provided application configuration.
-    ///
-    /// This function iterates through all virtual hosts in all realms defined in the
-    /// `AppConfig` and loads their corresponding PEM-encoded certificates and private keys.
-    ///
-    /// # Arguments
-    ///
-    /// * `app_config` - An `Arc<AppConfig>` containing the configuration from which to load certificates.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing a `CertificateCache` instance on success, or an `Error` if
-    /// any certificate or key fails to load.
-    pub fn load_from_config(app_config: Arc<AppConfig>) -> Self {
-        let peer_map = DashMap::new();
-        let mut unique_addrs = HashSet::new();
-
-        // Collect all unique upstream addresses from the configuration
-        for realm in &app_config.realms {
-            for chain in &realm.routing_chains {
-                for rule in &chain.rules {
-                    match &rule.action {
-                        ActionConfig::Proxy { upstream } => {
-                            unique_addrs.insert(upstream.clone());
-                        }
-                        ActionConfig::RequireAuthentication {
-                            protected_backend_addr,
-                            ..
-                        } => {
-                            unique_addrs.insert(protected_backend_addr.clone());
-                        }
-                        _ => {} // Other actions don't have upstreams
-                    }
-                }
-            }
-        }
-
-        // Manually add the default upstream if not already present
-        unique_addrs.insert("http://127.0.0.1:8081".to_string());
-
-        // Log all unique upstream addresses that will be created.
-        info!(
-            "Found unique upstream addresses from config: {:?}",
-            unique_addrs
-        );
-
-        // Create HttpPeer for each unique address
-        for addr_with_scheme in unique_addrs {
-            // HttpPeer::new expects "host:port", so we need to strip the scheme.
-            let addr_no_scheme = addr_with_scheme
-                .strip_prefix("http://")
-                .unwrap_or(&addr_with_scheme);
-            let is_tls = addr_with_scheme.starts_with("https://");
-
-            info!("Creating upstream peer for: {}", addr_with_scheme);
-            let peer = HttpPeer::new(addr_no_scheme, is_tls, "".to_string());
-            peer_map.insert(addr_with_scheme, Arc::new(peer));
-        }
-
-        info!("Successfully created {} upstream peers.", peer_map.len());
-        UpstreamCache { peer_map }
     }
 }
 
@@ -442,88 +475,23 @@ impl ConfigHotReloadService {
         match serde_yaml::from_str::<AppConfig>(current_content) {
             Ok(new_config) => {
                 let new_config_arc = Arc::new(new_config);
+                // Atomically swap the entire application configuration.
+                self.main_config_swapper.store(new_config_arc.clone());
+
                 // JWT Keys Reload
                 let current_keys_cache = self.keys_swapper.load();
                 JwtKeysCache::reload_from_config(&new_config_arc, &current_keys_cache);
 
                 // Upstream Cache Reload
-                let new_upstreams = UpstreamCache::load_from_config(new_config_arc.clone());
-                self.upstream_swapper.store(Arc::new(new_upstreams));
+                let current_upstream_cache = self.upstream_swapper.load();
+                UpstreamCache::reload_from_config(&new_config_arc, &current_upstream_cache);
 
                 // Auth Scopes Reload
                 AuthScopeRegistry::reload_from_config(&new_config_arc);
-                // We swap the cache object itself, even if it's a unit struct, to maintain consistency.
-                self.auth_scope_registry_swapper
-                    .store(Arc::new(AuthScopeRegistry::default()));
 
-                // --- Certificate Cache Differential Reload ---
-                let mut updated_count = 0;
-                let mut removed_count = 0;
-
-                // 1. Clone the current certificate map to create a new, mutable version.
-                let mut new_cert_map = self.cert_swapper.load().cert_map.clone();
-                let old_cert_map = &self.cert_swapper.load().cert_map;
-
-                // 2. Collect all hostnames from the new config for easy lookup.
-                let new_hostnames: HashSet<_> = new_config_arc
-                    .realms
-                    .iter()
-                    .flat_map(|r| r.virtual_hosts.iter().map(|v| v.hostname.clone()))
-                    .collect();
-
-                // 3. Iterate through new config to update or add certificates.
-                for realm in &new_config_arc.realms {
-                    for vhost in &realm.virtual_hosts {
-                        let cert_pem = vhost.certificate_pem.as_bytes();
-                        let key_pem = vhost.private_key_pem.as_bytes();
-
-                        // Check if the certificate needs updating (either new or changed).
-                        if !old_cert_map.get(&vhost.hostname).map_or(false, |old_cert| {
-                            old_cert.cert.to_pem().unwrap() == cert_pem
-                                && old_cert.key.private_key_to_pem_pkcs8().unwrap() == key_pem
-                        }) {
-                            info!("Updating certificate for host: {}", &vhost.hostname);
-                            match (
-                                pingora::tls::x509::X509::from_pem(cert_pem),
-                                pingora::tls::pkey::PKey::private_key_from_pem(key_pem),
-                            ) {
-                                (Ok(cert), Ok(key)) => {
-                                    let cert_and_key = Arc::new(CertAndKey { cert, key });
-                                    new_cert_map.insert(vhost.hostname.clone(), cert_and_key);
-                                    updated_count += 1;
-                                }
-                                (Err(e), _) => warn!(
-                                    "Failed to parse new certificate for {}: {}. Skipping update.",
-                                    vhost.hostname, e
-                                ),
-                                (_, Err(e)) => warn!(
-                                    "Failed to parse new private key for {}: {}. Skipping update.",
-                                    vhost.hostname, e
-                                ),
-                            }
-                        }
-                    }
-                }
-
-                // 4. Remove entries that are no longer in the new config.
-                new_cert_map.retain(|hostname, _| {
-                    if !new_hostnames.contains(hostname) {
-                        info!("Removing certificate for obsolete host: {}", hostname);
-                        removed_count += 1;
-                        false
-                    } else {
-                        true
-                    }
-                });
-
-                // 5. Atomically swap the old cache with the new one.
-                self.cert_swapper.store(Arc::new(CertificateCache {
-                    cert_map: new_cert_map,
-                }));
-                info!(
-                    "Certificate reload complete. Updated: {}, Removed: {}.",
-                    updated_count, removed_count
-                );
+                // Certificate Cache Reload
+                let current_cert_cache = self.cert_swapper.load();
+                CertificateCache::reload_from_config(&new_config_arc, &current_cert_cache);
 
                 // Lock the mutex to safely update the last known content.
                 let mut last_content = self.last_known_content.lock().unwrap();
