@@ -20,6 +20,11 @@
 // - Implement a lock for token refresh to prevent the dog-piling effect
 // - Review the backend SSL implementation using Pingora (currently using boringssl)
 
+use std::collections::HashMap;
+use std::fs;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use boring::ex_data::Index;
@@ -31,16 +36,14 @@ use pingora::server::ShutdownWatch;
 use pingora::services::background::BackgroundService;
 use pingora::tls::pkey::Private;
 use pingora::tls::ssl::Ssl;
-use std::collections::HashMap;
-use std::fs;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 mod actions;
 use actions::{GatewayAction, RouteLogic};
 
 mod config;
-use crate::config::{ActionConfig, AppConfig, CertificateCache, JwtSigningKeys, UpstreamCache};
+use crate::config::{
+    ActionConfig, AppConfig, AuthScopeRegistry, CertificateCache, JwtSigningKeys, UpstreamCache,
+};
 
 /// Core logic and shared state for the proxy service
 ///
@@ -273,14 +276,14 @@ impl ProxyHttp for GatewayRouter {
                                 oidc_client_id,
                                 oidc_callback_url,
                                 oidc_token_endpoint_url,
-                                scope_name,
+                                auth_scope_name,
                             } => GatewayAction::RequireAuthentication {
                                 protected_backend_addr: protected_backend_addr.clone().into(),
                                 oidc_login_redirect_url: oidc_login_redirect_url.clone().into(),
                                 oidc_client_id: oidc_client_id.clone().into(),
                                 oidc_callback_url: oidc_callback_url.clone().into(),
                                 oidc_token_endpoint_url: oidc_token_endpoint_url.clone().into(),
-                                scope_name: scope_name.clone().into(),
+                                auth_scope_name: auth_scope_name.clone().into(),
                             },
                         };
                         ctx.action_pipeline.push(action);
@@ -334,7 +337,7 @@ impl ProxyHttp for GatewayRouter {
                     oidc_client_id,
                     oidc_callback_url,
                     oidc_token_endpoint_url,
-                    scope_name,
+                    auth_scope_name,
                 } => {
                     let logic = actions::RequireAuthenticationRoute {
                         protected_backend_addr,
@@ -342,7 +345,7 @@ impl ProxyHttp for GatewayRouter {
                         oidc_client_id,
                         oidc_callback_url,
                         oidc_token_endpoint_url,
-                        scope_name,
+                        auth_scope_name,
                     };
                     logic
                         .request_filter_and_prepare_upstream_peer(session, ctx)
@@ -454,7 +457,7 @@ impl ProxyHttp for GatewayRouter {
                     oidc_client_id,
                     oidc_callback_url,
                     oidc_token_endpoint_url,
-                    scope_name,
+                    auth_scope_name,
                 } => {
                     let logic = actions::RequireAuthenticationRoute {
                         protected_backend_addr,
@@ -462,7 +465,7 @@ impl ProxyHttp for GatewayRouter {
                         oidc_client_id,
                         oidc_callback_url,
                         oidc_token_endpoint_url,
-                        scope_name,
+                        auth_scope_name,
                     };
                     logic
                         .upstream_request_filter(session, upstream_request, ctx)
@@ -539,7 +542,7 @@ impl ProxyHttp for GatewayRouter {
                     oidc_client_id,
                     oidc_callback_url,
                     oidc_token_endpoint_url,
-                    scope_name,
+                    auth_scope_name,
                 } => {
                     let logic = actions::RequireAuthenticationRoute {
                         protected_backend_addr: protected_backend_addr.clone(),
@@ -547,7 +550,7 @@ impl ProxyHttp for GatewayRouter {
                         oidc_client_id: oidc_client_id.clone(),
                         oidc_callback_url: oidc_callback_url.clone(),
                         oidc_token_endpoint_url: oidc_token_endpoint_url.clone(),
-                        scope_name: scope_name.clone(),
+                        auth_scope_name: auth_scope_name.clone(),
                     };
                     logic.response_filter(session, response, ctx).await
                 }
@@ -687,11 +690,10 @@ fn main() -> pingora::Result<()> {
     let initial_upstreams = UpstreamCache::load_from_config(app_config.clone());
     let upstream_peer_swapper = Arc::new(ArcSwap::new(Arc::new(initial_upstreams)));
 
-    // Register authentication scopes. This initializes the session stores within the actions module.
-    actions::register_auth_scope("protected_scope");
-    actions::register_auth_scope("private_scope");
-    // Add more scopes as needed, e.g., for /admin, /shop, etc.
-    // actions::register_auth_scope("admin_scope");
+    // --- Initialize and register authentication scopes from config ---
+    AuthScopeRegistry::reload_from_config(&app_config);
+    let initial_auth_scope_registry = AuthScopeRegistry::default();
+    let auth_scope_registry_swapper = Arc::new(ArcSwap::new(Arc::new(initial_auth_scope_registry)));
 
     let mut my_server = Server::new(Some(opt))?;
 
@@ -716,6 +718,7 @@ fn main() -> pingora::Result<()> {
         cert_cache.clone(),
         upstream_peer_swapper.clone(),
         main_config_swapper.clone(),
+        auth_scope_registry_swapper,
         initial_config_content,
     );
     my_server.add_service(background_service("Config Reloader", config_reload_service));

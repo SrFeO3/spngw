@@ -1,3 +1,27 @@
+/// # Configuration Management
+///
+/// This module is responsible for defining, loading, and managing the application's
+/// configuration. It includes data structures that map directly to the `config.yaml`
+/// file, logic for hot-reloading configurations, and caches for frequently accessed
+/// configuration-derived data like upstreams and TLS certificates.
+///
+/// ## Key Components:
+///
+/// - **`AppConfig` and related structs**: These are `serde`-deserializable structures
+///   that represent the hierarchy of the `config.yaml` file.
+///
+/// - **`ConfigHotReloadService`**: A background service that monitors `config.yaml` for
+///   changes and applies them to the running application without downtime. It uses
+///   `ArcSwap` to atomically update shared configuration data.
+///
+/// - **Caches and Registries (`UpstreamCache`, `CertificateCache`, `AuthScopeRegistry`)**:
+///   These structs hold processed, ready-to-use data derived from the main configuration.
+///   They are designed to be hot-reloaded and are managed by the `ConfigHotReloadService`.
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -6,10 +30,8 @@ use pingora::prelude::*;
 use pingora::services::background::BackgroundService;
 use pingora::tls::pkey::Private;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+
+use crate::actions;
 
 pub const CONFIG_PATH: &str = "conf/config.yaml";
 
@@ -47,7 +69,7 @@ pub enum ActionConfig {
         oidc_client_id: String,
         oidc_callback_url: String,
         oidc_token_endpoint_url: String,
-        scope_name: String,
+        auth_scope_name: String,
     },
 }
 
@@ -142,6 +164,7 @@ pub struct ConfigHotReloadService {
     cert_swapper: Arc<ArcSwap<CertificateCache>>,
     upstream_swapper: Arc<ArcSwap<UpstreamCache>>,
     main_config_swapper: Arc<ArcSwap<AppConfig>>,
+    auth_scope_registry_swapper: Arc<ArcSwap<AuthScopeRegistry>>,
     last_known_content: Mutex<String>,
 }
 
@@ -151,6 +174,7 @@ impl ConfigHotReloadService {
         cert_swapper: Arc<ArcSwap<CertificateCache>>,
         upstream_swapper: Arc<ArcSwap<UpstreamCache>>,
         main_config_swapper: Arc<ArcSwap<AppConfig>>,
+        auth_scope_registry_swapper: Arc<ArcSwap<AuthScopeRegistry>>,
         initial_config_content: String,
     ) -> Self {
         ConfigHotReloadService {
@@ -158,6 +182,7 @@ impl ConfigHotReloadService {
             cert_swapper,
             upstream_swapper,
             main_config_swapper,
+            auth_scope_registry_swapper,
             last_known_content: Mutex::new(initial_config_content),
         }
     }
@@ -221,6 +246,64 @@ impl CertificateCache {
         }
         info!("Successfully loaded {} certificates.", cert_map.len());
         Ok(CertificateCache { cert_map })
+    }
+}
+
+/// Manages the set of active authentication scopes.
+#[derive(Default)]
+pub struct AuthScopeRegistry {
+    // We only need this struct to exist for type consistency in ArcSwap.
+    // The actual state is managed globally in `actions.rs`.
+    // A `phantom` field could be used if we needed to associate a lifetime.
+    _private: (),
+}
+
+impl AuthScopeRegistry {
+    /// Performs a differential update of authentication scopes based on the new config.
+    /// - New scopes in the config are added.
+    /// - Scopes removed from the config are unregistered.
+    /// - Existing, unchanged scopes are not touched, preserving their session stores.
+    pub fn reload_from_config(config: &Arc<AppConfig>) {
+        // 1. Collect all scope names from the new configuration into a HashSet.
+        let new_auth_scopes: HashSet<String> = config
+            .realms
+            .iter()
+            .flat_map(|realm| &realm.routing_chains)
+            .flat_map(|chain| &chain.rules)
+            .filter_map(|rule| {
+                if let ActionConfig::RequireAuthentication {
+                    auth_scope_name, ..
+                } = &rule.action
+                {
+                    Some(auth_scope_name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // 2. Get the set of currently registered scopes.
+        let stores = actions::get_auth_session_stores();
+        let current_auth_scopes: HashSet<String> =
+            stores.iter().map(|entry| entry.key().clone()).collect();
+
+        // 3. Add new scopes.
+        for scope_to_add in new_auth_scopes.difference(&current_auth_scopes) {
+            info!(
+                "[ConfigReload] Registering new authentication scope: '{}'",
+                scope_to_add
+            );
+            actions::register_auth_scope(scope_to_add);
+        }
+
+        // 4. Remove obsolete scopes.
+        for scope_to_remove in current_auth_scopes.difference(&new_auth_scopes) {
+            info!(
+                "[ConfigReload] Unregistering obsolete authentication scope: '{}'",
+                scope_to_remove
+            );
+            actions::unregister_auth_scope(scope_to_remove);
+        }
     }
 }
 
@@ -320,6 +403,16 @@ impl ConfigHotReloadService {
                         .expect("Config must have at least one realm"),
                 );
                 self.keys_swapper.store(Arc::new(new_keys));
+
+                // Upstream Cache Reload
+                let new_upstreams = UpstreamCache::load_from_config(new_config_arc.clone());
+                self.upstream_swapper.store(Arc::new(new_upstreams));
+
+                // Auth Scopes Reload
+                AuthScopeRegistry::reload_from_config(&new_config_arc);
+                // We swap the cache object itself, even if it's a unit struct, to maintain consistency.
+                self.auth_scope_registry_swapper
+                    .store(Arc::new(AuthScopeRegistry::default()));
 
                 // --- Certificate Cache Differential Reload ---
                 let mut updated_count = 0;

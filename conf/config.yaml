@@ -298,4 +298,4 @@ realms:
                       oidc_client_id: "my-client-2"
                       oidc_callback_url: "http://127.0.0.1:8002/auth/callback"
                       oidc_token_endpoint_url: "http://127.0.0.1:8082/api/token" # OIDC token endpoint
-                      scope_name: "private_scope"
+                      auth_scope_name: "private_scope"

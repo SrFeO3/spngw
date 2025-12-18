@@ -25,7 +25,8 @@
 /// These are complex, multi-step workflows encapsulated into a single action.
 /// - `RequireAuthentication`: An action for paths that require OIDC authentication. It manages
 ///   the redirect-based login flow. (Note: Callback handling is not yet implemented).
-use crate::GatewayCtx;
+use std::borrow::Cow;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -38,9 +39,8 @@ use pingora::http::ResponseHeader;
 use pingora::prelude::*;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-use std::sync::Arc;
-use std::sync::OnceLock;
+
+use crate::GatewayCtx;
 
 /// A type alias for a session store, which is a thread-safe map from session IDs to ApplicationSession objects.
 pub type SessionStore = Arc<DashMap<String, Arc<ApplicationSession>>>;
@@ -57,6 +57,26 @@ pub fn register_auth_scope(scope_name: &str) {
         .entry(scope_name.to_string())
         .or_insert_with(|| Arc::new(DashMap::new()));
     info!("Authentication scope '{}' registered.", scope_name);
+}
+
+/// Unregisters an authentication scope and removes its associated session store.
+/// This is intended for use during configuration hot-reloading to remove scopes
+/// that are no longer present in the new configuration.
+pub fn unregister_auth_scope(scope_name: &str) {
+    if let Some(stores) = AUTH_SESSION_STORES.get() {
+        if stores.remove(scope_name).is_some() {
+            info!(
+                "Authentication scope '{}' and its session store have been unregistered.",
+                scope_name
+            );
+        }
+    }
+}
+
+/// Returns a reference to the global authentication session stores map.
+/// Initializes it if it hasn't been already.
+pub fn get_auth_session_stores() -> &'static DashMap<String, SessionStore> {
+    AUTH_SESSION_STORES.get_or_init(DashMap::new)
 }
 
 /// ApplicationSession object, as it's a core data model for the gateway.
@@ -113,7 +133,7 @@ pub enum GatewayAction {
         oidc_client_id: Cow<'static, str>,
         oidc_callback_url: Cow<'static, str>,
         oidc_token_endpoint_url: Cow<'static, str>,
-        scope_name: Cow<'static, str>,
+        auth_scope_name: Cow<'static, str>,
     },
 }
 
@@ -177,7 +197,7 @@ pub struct RequireAuthenticationRoute {
     pub oidc_client_id: Cow<'static, str>,
     pub oidc_callback_url: Cow<'static, str>,
     pub oidc_token_endpoint_url: Cow<'static, str>,
-    pub scope_name: Cow<'static, str>,
+    pub auth_scope_name: Cow<'static, str>,
 }
 
 // Implement the `RouteLogic` trait for each route struct.
@@ -500,7 +520,7 @@ impl RouteLogic for SetDownstreamResponseHeaderRoute {
 /// * `oidc_client_id` - The client ID registered with the OIDC provider.
 /// * `oidc_callback_url` - The callback URL on this BFF that the OIDC provider will redirect to.
 /// * `oidc_token_endpoint_url` - The token endpoint of the OIDC provider.
-/// * `scope_name` - A unique name for this authentication scope, used to isolate session cookies.
+/// * `auth_scope_name` - A unique name for this authentication scope, used to isolate session cookies.
 #[async_trait]
 impl RouteLogic for RequireAuthenticationRoute {
     fn name(&self) -> &'static str {
