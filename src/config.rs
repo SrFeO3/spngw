@@ -367,6 +367,7 @@ impl UpstreamCache {
         });
     }
 }
+
 impl AuthScopeRegistry {
     /// Performs a differential update of authentication scopes based on the new config.
     /// - New scopes in the config are added.
@@ -384,26 +385,31 @@ impl AuthScopeRegistry {
                         auth_scope_name, ..
                     } = &rule.action
                     {
-                        if all_required_scopes.insert(auth_scope_name.clone()) {
+                        if all_required_scopes.insert((realm.name.clone(), auth_scope_name.clone()))
+                        {
                             // Only log on the first encounter of a scope.
                             info!(
                                 "[ConfigReload] Realm '{}': Registering new auth scope if not present: '{}'",
                                 realm.name, auth_scope_name
                             );
                         }
-                        actions::register_auth_scope(auth_scope_name);
+                        actions::register_auth_scope(&realm.name, auth_scope_name);
                     }
                 }
             }
         }
 
         // 2. Remove scopes that are no longer in the new configuration.
-        let stores = actions::get_auth_session_stores();
-        stores.retain(|scope_name, _| {
-            if !all_required_scopes.contains(scope_name) {
+        let stores = actions::get_all_auth_session_stores();
+        stores.retain(|realm_scope_key, _| {
+            // Note: This is a simple check. It doesn't handle renaming gracefully.
+            if !all_required_scopes
+                .iter()
+                .any(|(r, s)| format!("{}_{}", r, s) == *realm_scope_key)
+            {
                 info!(
                     "[ConfigReload] Unregistering obsolete authentication scope: '{}'",
-                    scope_name
+                    realm_scope_key
                 );
                 false
             } else {

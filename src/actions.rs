@@ -48,19 +48,33 @@ pub type SessionStore = Arc<DashMap<String, Arc<ApplicationSession>>>;
 /// A global, thread-safe registry for authentication session stores, keyed by scope name.
 static AUTH_SESSION_STORES: OnceLock<DashMap<String, SessionStore>> = OnceLock::new();
 
+/// Generates a unique key for the session store from a realm and scope name.
+fn create_realm_scope_key(realm_name: &str, scope_name: &str) -> String {
+    format!("{}_{}", realm_name, scope_name)
+}
+
 /// Registers a new authentication scope and initializes its session store.
 /// This function should be called at application startup for each required scope.
 /// It's idempotent; if a scope is already registered, it does nothing.
-pub fn register_auth_scope(scope_name: &str) {
+pub fn register_auth_scope(realm_name: &str, scope_name: &str) {
+    let key = create_realm_scope_key(realm_name, scope_name);
     AUTH_SESSION_STORES
         .get_or_init(DashMap::new)
-        .entry(scope_name.to_string())
+        .entry(key)
         .or_insert_with(|| Arc::new(DashMap::new()));
 }
 
-/// Returns a reference to the global authentication session stores map.
-/// Initializes it if it hasn't been already.
-pub fn get_auth_session_stores() -> &'static DashMap<String, SessionStore> {
+/// Retrieves the specific session store for a given realm and scope.
+pub fn get_auth_session_store(realm_name: &str, scope_name: &str) -> Option<SessionStore> {
+    let key = create_realm_scope_key(realm_name, scope_name);
+    AUTH_SESSION_STORES
+        .get_or_init(DashMap::new)
+        .get(&key)
+        .map(|store| store.value().clone())
+}
+
+/// Returns a reference to the entire map of session stores for internal cleanup operations.
+pub(crate) fn get_all_auth_session_stores() -> &'static DashMap<String, SessionStore> {
     AUTH_SESSION_STORES.get_or_init(DashMap::new)
 }
 

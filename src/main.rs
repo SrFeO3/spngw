@@ -65,17 +65,21 @@ struct GatewayRouter {
 /// (e.g., `request_filter`, `upstream_peer`). Its lifetime is tied to a single
 /// request-response cycle.
 struct GatewayCtx {
+    // The name of the realm processing this request.
+    realm_name: String,
+    app_config: Option<Arc<AppConfig>>,
+    realm_index: Option<usize>,
     request_id: String,
     request_start_time: Instant,
     // JWT signing keys for the current request, passed from the GatewayRouter.
     jwt_keys: Arc<JwtKeysCache>,
-    upstream_sni_name: Option<String>,
+    front_sni_name: Option<String>,
     // Pipeline of routes to be applied to the request
     action_pipeline: Vec<GatewayAction>,
     // The default upstream address for the request, can be overridden by an action.
-    pub default_upstream_addr: Option<String>,
+    default_upstream_addr: Option<String>,
     // The upstream address set by an action, which overrides the default.
-    pub override_upstream_addr: Option<String>,
+    override_upstream_addr: Option<String>,
 
     // --- State for GatewayActions ---
     // These fields store state that is shared across the lifecycle of a single request.
@@ -88,11 +92,11 @@ struct GatewayCtx {
     // action type appears at most once in the pipeline.
 
     // Set by IssueDeviceCookie action
-    pub action_state_new_dev_cookie: Option<String>,
+    action_state_new_dev_cookie: Option<String>,
     // Set by RequireAuthentication action when a new session is created
-    pub action_state_new_app_session_cookie: Option<(String, String)>, // (value, scope_name)
+    action_state_new_app_session_cookie: Option<(String, String)>, // (value, scope_name)
     // Set by RequireAuthentication action
-    pub action_state_app_session: Option<actions::ApplicationSession>,
+    action_state_app_session: Option<actions::ApplicationSession>,
 }
 
 #[async_trait]
@@ -101,13 +105,16 @@ impl ProxyHttp for GatewayRouter {
 
     fn new_ctx(&self) -> Self::CTX {
         GatewayCtx {
+            realm_name: String::new(),
+            app_config: None,
+            realm_index: None,
             request_id: format!("req-{}", rand::random::<u32>()),
             request_start_time: Instant::now(),
             // Load the current value from the ArcSwap.
             // .load() returns a Guard, which dereferences to an Arc<JwtSigningKeys>.
             // We clone the Arc so that the context owns it for the lifetime of the request.
             jwt_keys: self.jwt_keys_cache.load().clone(),
-            upstream_sni_name: None,
+            front_sni_name: None,
             action_pipeline: Vec::new(),
             default_upstream_addr: None,
             override_upstream_addr: None,
@@ -133,7 +140,7 @@ impl ProxyHttp for GatewayRouter {
             .get_ssl()
             .and_then(|ssl| ssl.ex_data(self.sni_ex_data_index));
         let sni: Option<String> = sni_opt.and_then(|s| s.as_deref().map(String::from));
-        let upstream_sni_name = match sni.as_deref() {
+        let front_sni_name = match sni.as_deref() {
             Some(sni_name) => {
                 info!("[{}] SNI found: {}", ctx.request_id, sni_name);
                 sni_name.to_string()
@@ -143,7 +150,19 @@ impl ProxyHttp for GatewayRouter {
                 "bad sni".to_string() // !!!!!
             }
         };
-        ctx.upstream_sni_name = Some(upstream_sni_name);
+        ctx.front_sni_name = Some(front_sni_name);
+
+        // Determine Realm for this request.
+        // TODO: Implement proper realms selection
+        let app_config = self.main_config.load();
+        ctx.app_config = Some(app_config.clone());
+        // For now, we fall back to the first realm in the configuration as a default.
+        if let Some((index, realm)) = app_config.realms.iter().enumerate().next() {
+            ctx.realm_name = realm.name.clone();
+            ctx.realm_index = Some(index);
+        } else {
+            warn!("[{}] No realm found", ctx.request_id);
+        }
 
         //
         // Set the action pipeline actions for this request.
@@ -189,9 +208,9 @@ impl ProxyHttp for GatewayRouter {
             false
         }
 
-        let app_config = self.main_config.load();
-        if let Some(realm) = app_config.realms.get(0) {
-            if let Some(chain) = realm.routing_chains.get(0) {
+        if let (Some(app_config), Some(realm_index)) = (&ctx.app_config, ctx.realm_index) {
+            let realm_config = &app_config.realms[realm_index];
+            if let Some(chain) = realm_config.routing_chains.get(0) {
                 info!(
                     "[{}] Using routing_chain '{}' for request",
                     ctx.request_id, chain.name
@@ -208,13 +227,13 @@ impl ProxyHttp for GatewayRouter {
                             // A more robust solution would parse them regardless of order.
                             let match1 = evaluate_single_expr(
                                 part1,
-                                &ctx.upstream_sni_name.clone().expect("").to_string(), // !!!
+                                &ctx.front_sni_name.clone().expect("").to_string(), // !!!
                                 path,
                                 &ctx.request_id,
                             );
                             let match2 = evaluate_single_expr(
                                 part2,
-                                &ctx.upstream_sni_name.clone().expect("").to_string(), // !!!
+                                &ctx.front_sni_name.clone().expect("").to_string(), // !!!
                                 path,
                                 &ctx.request_id,
                             );
@@ -231,7 +250,7 @@ impl ProxyHttp for GatewayRouter {
                         // Handle single conditions
                         evaluate_single_expr(
                             &rule.match_expr,
-                            &ctx.upstream_sni_name.clone().expect("").to_string(), // !!!
+                            &ctx.front_sni_name.clone().expect("").to_string(), // !!!
                             path,
                             &ctx.request_id,
                         )
