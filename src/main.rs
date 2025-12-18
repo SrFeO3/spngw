@@ -280,7 +280,7 @@ impl ProxyHttp for GatewayRouter {
                                     value: value.clone().into(),
                                 }
                             }
-                            ActionConfig::SetDownstreamRequestHeader { name, value } => {
+                            ActionConfig::SetDownstreamResponseHeader { name, value } => {
                                 GatewayAction::SetDownstreamResponseHeader {
                                     name: name.clone().into(),
                                     value: value.clone().into(),

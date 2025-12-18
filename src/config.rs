@@ -66,7 +66,7 @@ pub enum ActionConfig {
         name: String,
         value: String,
     },
-    SetDownstreamRequestHeader {
+    SetDownstreamResponseHeader {
         name: String,
         value: String,
     },
