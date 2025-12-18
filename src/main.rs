@@ -165,25 +165,28 @@ impl ProxyHttp for GatewayRouter {
 
         /// Evaluates a single match expression against the request's hostname and path.
         fn evaluate_single_expr(expr: &str, hostname: &str, path: &str, request_id: &str) -> bool {
-            match expr {
-                expr if expr.starts_with("request.path.starts_with('") && expr.ends_with("')") => {
-                    let prefix = &expr["request.path.starts_with('".len()..expr.len() - "')".len()];
-                    path.starts_with(prefix)
-                }
-                expr if expr.starts_with("request.path.equals('") && expr.ends_with("')") => {
-                    let exact_path = &expr["request.path.equals('".len()..expr.len() - "')".len()];
-                    path == exact_path
-                }
-                expr if expr.starts_with("hostname.equals('") && expr.ends_with("')") => {
-                    let expected_hostname =
-                        &expr["hostname.equals('".len()..expr.len() - "')".len()];
-                    hostname == expected_hostname
-                }
-                _ => {
-                    warn!("[{}] Unsupported match expression: {}", request_id, expr);
-                    false
+            if let (Some(start_paren), Some(end_paren)) = (expr.find("('"), expr.rfind("')")) {
+                if start_paren < end_paren {
+                    let key = &expr[..start_paren];
+                    let value = &expr[start_paren + 2..end_paren];
+
+                    return match key {
+                        "request.path.starts_with" => path.starts_with(value),
+                        "request.path.ends_with" => path.ends_with(value),
+                        "request.path.equals" => path == value,
+                        "hostname.starts_with" => hostname.starts_with(value),
+                        "hostname.ends_with" => hostname.ends_with(value),
+                        "hostname.equals" => hostname == value,
+                        _ => false,
+                    };
                 }
             }
+
+            warn!(
+                "[{}] Unsupported or malformed match expression: {}",
+                request_id, expr
+            );
+            false
         }
 
         let app_config = self.main_config.load();
@@ -392,21 +395,19 @@ impl ProxyHttp for GatewayRouter {
         );
 
         // Retrieve the pre-configured HttpPeer from the cache.
-        // !!!!!
-        let peer = self
-            .upstream_peer_cache
+        self.upstream_peer_cache
             .load()
             .peer_map
             .get(upstream_addr)
-            .map(|p| p.value().clone())
-            .unwrap_or_else(|| {
-                panic!(
+            .map(|peer| Box::new(peer.as_ref().clone()))
+            .ok_or_else(|| {
+                warn!(
                     "[{}] Upstream peer not found in cache for address: {}",
                     ctx.request_id, upstream_addr
-                )
-            });
-
-        Ok(Box::new((*peer).clone()))
+                );
+                let mut err = Error::new(pingora::ErrorType::HTTPStatus(502));
+                err
+            })
     }
 
     async fn upstream_request_filter(
