@@ -405,8 +405,7 @@ impl ProxyHttp for GatewayRouter {
                     "[{}] Upstream peer not found in cache for address: {}",
                     ctx.request_id, upstream_addr
                 );
-                let mut err = Error::new(pingora::ErrorType::HTTPStatus(502));
-                err
+                Error::new(pingora::ErrorType::HTTPStatus(502))
             })
     }
 
