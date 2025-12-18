@@ -342,8 +342,22 @@ impl RouteLogic for IssueDeviceCookieRoute {
 
         // Attempt to validate the cookie if it exists.
         let is_cookie_valid = if let Some(token) = dev_cookie_value {
-            let decoding_key = DecodingKey::from_rsa_pem(&ctx.jwt_keys.public_key_pem)
+            // For simplicity, we still use the first realm's key.
+            // A real implementation would select the key based on the request's realm.
+            let key = match ctx.jwt_keys.keys_by_realm.iter().next() {
+                Some(entry) => entry.value().clone(),
+                None => {
+                    warn!(
+                        "[{}] [{}] No JWT keys found in cache.",
+                        ctx.request_id,
+                        self.name()
+                    );
+                    return Ok(false); // Cannot validate, treat as invalid.
+                }
+            };
+            let decoding_key = DecodingKey::from_rsa_pem(&key.public_key_pem)
                 .expect("Failed to create decoding key from PEM");
+
             let validation = Validation::new(jsonwebtoken::Algorithm::RS256);
 
             match decode::<DeviceContext>(&token, &decoding_key, &validation) {
@@ -394,7 +408,20 @@ impl RouteLogic for IssueDeviceCookieRoute {
                 iat: now_ts,
                 exp: now_ts + (60 * 60 * 24 * 365), // 1 year expiration
             };
-            let encoding_key = EncodingKey::from_rsa_pem(&ctx.jwt_keys.private_key_pem)
+            // For simplicity, we still use the first realm's key for signing.
+            let key = match ctx.jwt_keys.keys_by_realm.iter().next() {
+                Some(entry) => entry.value().clone(),
+                None => {
+                    warn!(
+                        "[{}] [{}] No JWT keys found in cache for signing.",
+                        ctx.request_id,
+                        self.name()
+                    );
+                    let err = Error::new(ErrorType::InternalError);
+                    return Err(err);
+                }
+            };
+            let encoding_key = EncodingKey::from_rsa_pem(&key.private_key_pem)
                 .expect("Failed to create encoding key from PEM");
             let token = encode(
                 &Header::new(jsonwebtoken::Algorithm::RS256),

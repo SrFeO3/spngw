@@ -1,22 +1,32 @@
 /// # Configuration Management
 ///
 /// This module is responsible for defining, loading, and managing the application's
-/// configuration. It includes data structures that map directly to the `config.yaml`
-/// file, logic for hot-reloading configurations, and caches for frequently accessed
-/// configuration-derived data like upstreams and TLS certificates.
+/// configuration. It includes data structures that map directly to the `config.yaml` file,
+/// and logic for hot-reloading configurations without service interruption.
 ///
 /// ## Key Components:
 ///
 /// - **`AppConfig` and related structs**: These are `serde`-deserializable structures
 ///   that represent the hierarchy of the `config.yaml` file.
 ///
-/// - **`ConfigHotReloadService`**: A background service that monitors `config.yaml` for
-///   changes and applies them to the running application without downtime. It uses
-///   `ArcSwap` to atomically update shared configuration data.
+/// - **`ConfigHotReloadService`**: A background service that monitors `config.yaml` for changes
+///   and applies them to the running application without downtime. It uses `ArcSwap` to
+///   atomically update shared configuration data.
 ///
-/// - **Caches and Registries (`UpstreamCache`, `CertificateCache`, `AuthScopeRegistry`)**:
-///   These structs hold processed, ready-to-use data derived from the main configuration.
+/// - **Caches and Registries (`UpstreamCache`, `CertificateCache`, `AuthScopeRegistry`, `JwtKeysCache`)**:
+///   These components hold processed, ready-to-use data derived from the main configuration.
 ///   They are designed to be hot-reloaded and are managed by the `ConfigHotReloadService`.
+///
+/// ## Hot-Reloading and Idempotency
+///
+/// The hot-reloading mechanism is designed to be idempotent and minimally disruptive:
+/// - **JWT Keys, Certificates, and Upstreams**: When the configuration changes, only the
+///   items that have been added, modified, or removed are updated. Unchanged items are
+///   left as-is.
+/// - **Authentication Scopes**: The `AuthScopeRegistry` performs a differential update.
+///   It adds new scopes and removes obsolete ones, but crucially, it does **not** touch
+///   existing, unchanged scopes. This ensures that active user sessions within those
+///   scopes are preserved across configuration reloads.
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::{Arc, Mutex};
@@ -125,26 +135,63 @@ pub struct AppConfig {
 }
 
 /// Application's cryptographic keys.
+#[derive(Clone)]
 pub struct JwtSigningKeys {
     pub public_key_pem: Vec<u8>,
     pub private_key_pem: Vec<u8>,
 }
 
-impl JwtSigningKeys {
-    /// Creates `JwtSigningKeys` from a given `RealmConfig`.
-    pub fn from_realm_config(realm_config: &RealmConfig) -> Self {
-        JwtSigningKeys {
-            public_key_pem: realm_config
-                .jwt_signing_keys
-                .public_key_pem
-                .as_bytes()
-                .to_vec(),
-            private_key_pem: realm_config
-                .jwt_signing_keys
-                .private_key_pem
-                .as_bytes()
-                .to_vec(),
+/// Cache for JWT signing keys, keyed by realm name.
+/// This allows for hot-reloading of keys on a per-realm basis.
+pub struct JwtKeysCache {
+    pub keys_by_realm: DashMap<String, Arc<JwtSigningKeys>>,
+}
+
+impl JwtKeysCache {
+    /// Performs a differential update of JWT signing keys from the configuration.
+    pub fn reload_from_config(app_config: &Arc<AppConfig>, current_cache: &Self) {
+        let new_realms: HashSet<String> =
+            app_config.realms.iter().map(|r| r.name.clone()).collect();
+
+        // Update existing or add new keys
+        for realm in &app_config.realms {
+            let new_keys = JwtSigningKeys {
+                public_key_pem: realm.jwt_signing_keys.public_key_pem.as_bytes().to_vec(),
+                private_key_pem: realm.jwt_signing_keys.private_key_pem.as_bytes().to_vec(),
+            };
+
+            // Check if the key is new or has changed.
+            let needs_update = match current_cache.keys_by_realm.get(&realm.name) {
+                Some(existing_keys) => {
+                    existing_keys.public_key_pem != new_keys.public_key_pem
+                        || existing_keys.private_key_pem != new_keys.private_key_pem
+                }
+                None => true, // It's a new realm.
+            };
+
+            if needs_update {
+                info!(
+                    "[ConfigReload] Updating JWT keys for realm: '{}'",
+                    realm.name
+                );
+                current_cache
+                    .keys_by_realm
+                    .insert(realm.name.clone(), Arc::new(new_keys));
+            }
         }
+
+        // Remove keys for realms that no longer exist
+        current_cache.keys_by_realm.retain(|realm_name, _| {
+            if !new_realms.contains(realm_name) {
+                info!(
+                    "[ConfigReload] Removing JWT keys for obsolete realm: '{}'",
+                    realm_name
+                );
+                false
+            } else {
+                true
+            }
+        });
     }
 }
 
@@ -160,7 +207,7 @@ pub fn load_app_config() -> Arc<AppConfig> {
 
 /// A background service that periodically checks for configuration updates and applies them.
 pub struct ConfigHotReloadService {
-    keys_swapper: Arc<ArcSwap<JwtSigningKeys>>,
+    keys_swapper: Arc<ArcSwap<JwtKeysCache>>,
     cert_swapper: Arc<ArcSwap<CertificateCache>>,
     upstream_swapper: Arc<ArcSwap<UpstreamCache>>,
     main_config_swapper: Arc<ArcSwap<AppConfig>>,
@@ -170,7 +217,7 @@ pub struct ConfigHotReloadService {
 
 impl ConfigHotReloadService {
     pub fn new(
-        keys_swapper: Arc<ArcSwap<JwtSigningKeys>>,
+        keys_swapper: Arc<ArcSwap<JwtKeysCache>>,
         cert_swapper: Arc<ArcSwap<CertificateCache>>,
         upstream_swapper: Arc<ArcSwap<UpstreamCache>>,
         main_config_swapper: Arc<ArcSwap<AppConfig>>,
@@ -396,13 +443,8 @@ impl ConfigHotReloadService {
             Ok(new_config) => {
                 let new_config_arc = Arc::new(new_config);
                 // JWT Keys Reload
-                let new_keys = JwtSigningKeys::from_realm_config(
-                    new_config_arc
-                        .realms
-                        .get(0)
-                        .expect("Config must have at least one realm"),
-                );
-                self.keys_swapper.store(Arc::new(new_keys));
+                let current_keys_cache = self.keys_swapper.load();
+                JwtKeysCache::reload_from_config(&new_config_arc, &current_keys_cache);
 
                 // Upstream Cache Reload
                 let new_upstreams = UpstreamCache::load_from_config(new_config_arc.clone());

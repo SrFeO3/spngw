@@ -42,7 +42,7 @@ use actions::{GatewayAction, RouteLogic};
 
 mod config;
 use crate::config::{
-    ActionConfig, AppConfig, AuthScopeRegistry, CertificateCache, JwtSigningKeys, UpstreamCache,
+    ActionConfig, AppConfig, AuthScopeRegistry, CertificateCache, JwtKeysCache, UpstreamCache,
 };
 
 /// Core logic and shared state for the proxy service
@@ -56,7 +56,7 @@ use crate::config::{
 struct GatewayRouter {
     upstream_peer_cache: Arc<ArcSwap<UpstreamCache>>,
     sni_ex_data_index: Index<Ssl, Option<String>>,
-    jwt_keys: Arc<ArcSwap<JwtSigningKeys>>,
+    jwt_keys_cache: Arc<ArcSwap<JwtKeysCache>>,
     main_config: Arc<ArcSwap<AppConfig>>,
     _gateway_start_time: Instant,
 }
@@ -71,7 +71,7 @@ struct GatewayCtx {
     request_id: String,
     request_start_time: Instant,
     // JWT signing keys for the current request, passed from the GatewayRouter.
-    jwt_keys: Arc<JwtSigningKeys>,
+    jwt_keys: Arc<JwtKeysCache>,
     upstream_sni_name: Option<String>,
     // Pipeline of routes to be applied to the request
     action_pipeline: Vec<GatewayAction>,
@@ -109,7 +109,7 @@ impl ProxyHttp for GatewayRouter {
             // Load the current value from the ArcSwap.
             // .load() returns a Guard, which dereferences to an Arc<JwtSigningKeys>.
             // We clone the Arc so that the context owns it for the lifetime of the request.
-            jwt_keys: self.jwt_keys.load().clone(),
+            jwt_keys: self.jwt_keys_cache.load().clone(),
             upstream_sni_name: None,
             action_pipeline: Vec::new(),
             default_upstream_addr: None,
@@ -662,14 +662,12 @@ fn main() -> pingora::Result<()> {
 
     // Load initial JWT signing keys and wrap them in ArcSwap for hot-reloading.
     // For simplicity, we'll use the keys from the first realm defined in the config.
-    // A more advanced implementation might select a realm based on the request's hostname.
-    let initial_keys = config::JwtSigningKeys::from_realm_config(
-        app_config
-            .realms
-            .get(0)
-            .expect("Configuration must contain at least one realm."),
-    );
-    let jwt_keys = Arc::new(ArcSwap::new(Arc::new(initial_keys)));
+    let initial_keys_cache = JwtKeysCache {
+        keys_by_realm: dashmap::DashMap::new(),
+    };
+    // Perform an initial load.
+    JwtKeysCache::reload_from_config(&app_config, &initial_keys_cache);
+    let jwt_keys_cache_swapper = Arc::new(ArcSwap::new(Arc::new(initial_keys_cache)));
 
     // Load initial certificates and wrap them in ArcSwap for hot-reloading.
     let initial_certs = CertificateCache::load_from_config(app_config.clone())
@@ -714,7 +712,7 @@ fn main() -> pingora::Result<()> {
 
     // Create and add the configuration hot reload service.
     let config_reload_service = config::ConfigHotReloadService::new(
-        jwt_keys.clone(),
+        jwt_keys_cache_swapper.clone(),
         cert_cache.clone(),
         upstream_peer_swapper.clone(),
         main_config_swapper.clone(),
@@ -726,7 +724,7 @@ fn main() -> pingora::Result<()> {
     let gw = GatewayRouter {
         upstream_peer_cache: upstream_peer_swapper,
         sni_ex_data_index: sni_ex_data_index.clone(),
-        jwt_keys,
+        jwt_keys_cache: jwt_keys_cache_swapper,
         main_config: main_config_swapper,
         _gateway_start_time: gateway_start_time,
     };
