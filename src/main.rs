@@ -13,8 +13,6 @@
 // - Consider default_cert on main should be configurable instead of hardcoded.
 // - Consider adding a route for requests with no SNI found in the filter
 // - Consider handling cases where no upstream is found in upstream_peer
-// - Implement RequireAuthentication action
-// - Implement the proxy rule action pipeline
 // - Consider default TLS cert
 // - Implement application sessions and background session cleaner
 // - Implement operational settings to be configured externally

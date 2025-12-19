@@ -1,6 +1,6 @@
 [package]
 name = "spngw"
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 
 [dependencies]
@@ -16,6 +16,10 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 log = "0.4"
 pingora = { version = "0.6", features = [ "lb", "boringssl" ] }
 rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1"
 serde_yaml = "0.9"
+sha2 = "0.10"
 tokio = { version = "1", features = ["sync", "time"] }
+url = "2.5"

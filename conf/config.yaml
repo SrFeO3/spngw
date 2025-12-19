@@ -263,14 +263,26 @@ realms:
                       type: returnStaticText
                       content: "User-agent: *\nDisallow: /"
                       status: 200
-                - match: "hostname.equals('www.sr.example.com') and request.path.starts_with('/static/')"
+                - match: "hostname.equals('www.sr.example.com')"
                   action:
                       type: proxy
-                      upstream: "http://127.0.0.1:8081"
-                - match: "hostname.equals('api.sr.example.com') and request.path.starts_with('/static/')"
+                      upstream: "http://192.168.10.132:8080"
+                - match: "hostname.equals('auth.sr.example.com')"
                   action:
                       type: proxy
-                      upstream: "http://127.0.0.1:8082"
+                      upstream: "http://192.168.10.132:8082"
+                - match: "request.path.starts_with('/api/')"
+                  action:
+                      type: proxy
+                      upstream: "http://192.168.10.132:5001"
+                - match: "request.path.starts_with('/fruit/orange/')"
+                  action:
+                      type: proxy
+                      upstream: "http://192.168.10.132:5000"
+                - match: "hostname.equals('sirius.sr.example.com') and request.path.starts_with('/images/')"
+                  action:
+                      type: proxy
+                      upstream: "http://192.168.10.132:8080"
                 - match: "request.path.starts_with('/external/')"
                   action:
                       type: redirect
@@ -290,12 +302,12 @@ realms:
                       type: setDownstreamResponseHeader
                       name: "X-Powered-By"
                       value: "BFF-Proxy"
-                - match: "request.path.starts_with('/private/')"
+                - match: "hostname.equals('www.sr.example.com') and request.path.starts_with('/shop/')"
                   action:
                       type: requireAuthentication
-                      protected_backend_addr: "http://127.0.0.1:8082"
-                      oidc_login_redirect_url: "https://auth2.example.com/auth"
-                      oidc_client_id: "my-client-2"
-                      oidc_callback_url: "http://127.0.0.1:8002/auth/callback"
-                      oidc_token_endpoint_url: "http://127.0.0.1:8082/api/token" # OIDC token endpoint
+                      protected_backend_addr: "http://192.168.10.132:8080"
+                      oidc_login_redirect_url: "https://auth.sr.example.com:8000/authorize"
+                      oidc_client_id: "fruit-shop"
+                      oidc_callback_url: "https://www.sr.example.com:8000/shop/"
+                      oidc_token_endpoint_url: "http://192.168.10.132:8082/api/token" # OIDC token endpoint
                       auth_scope_name: "private_scope"

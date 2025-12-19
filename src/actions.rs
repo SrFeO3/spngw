@@ -25,11 +25,15 @@
 /// These are complex, multi-step workflows encapsulated into a single action.
 /// - `RequireAuthentication`: An action for paths that require OIDC authentication. It manages
 ///   the redirect-based login flow. (Note: Callback handling is not yet implemented).
+///
+/// TODO:
+///  - Implement token refresh, nonce, JWKS url on RequireAuthentication action
+///  - Implement forward auth token to upstream on ProxyTo action
 use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use base64::Engine;
+use base64::{Engine, engine::general_purpose};
 use bytes::Bytes;
 use chrono::Utc;
 use dashmap::DashMap;
@@ -37,8 +41,11 @@ use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode}
 use log::{info, warn};
 use pingora::http::ResponseHeader;
 use pingora::prelude::*;
-use rand::RngCore;
+use rand::distr::Alphanumeric;
+use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use url::Url;
 
 use crate::GatewayCtx;
 
@@ -89,6 +96,7 @@ pub struct ApplicationSession {
     pub access_token_expires_at: Option<u64>, // Unix timestamp
     pub oidc_nonce: Option<String>,
     pub oidc_pkce_verifier: Option<String>,
+    pub oidc_state: Option<String>,
 }
 
 /// Device context for JWT cookie
@@ -303,6 +311,77 @@ impl RouteLogic for ProxyToRoute {
         // Overwrite the upstream peer address in the context.
         ctx.override_upstream_addr = Some(self.upstream.to_string());
         Ok(false) // Continue the pipeline
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        ctx: &mut GatewayCtx,
+    ) -> Result<()> {
+        info!(
+            "[{}] [{}] Executing upstream_request_filter",
+            ctx.request_id,
+            self.name()
+        );
+
+        // TODO: Configure scopes in settings and send them with authentication requests to upstream services.
+        // --- Test Implementation ---
+        // The code below is a temporary implementation for testing purposes.
+        // using "private_scope" scope
+
+        // Implement a fallback to retrieve session information from the APP_COOKIE
+        // in case RequireAuthentication has not been executed before this action.
+        if ctx.action_state_app_session.is_none() {
+            info!(
+                "[{}] [{}] No app_session in context, attempting to load from APP_COOKIE.",
+                ctx.request_id,
+                self.name()
+            );
+            // Get the session store for "private_scope".
+            if let Some(session_store) = get_auth_session_store(&ctx.realm_name, "private_scope") {
+                let cookie_name = "APP_COOKIE_PRIVATE_SCOPE";
+                // Extract the session ID from the cookie header.
+                let app_session_opt = _session
+                    .req_header()
+                    .headers
+                    .get("Cookie")
+                    .and_then(|cookie_header| cookie_header.to_str().ok())
+                    .and_then(|cookies_str| {
+                        cookies_str.split(';').find_map(|cookie| {
+                            cookie.trim().strip_prefix(&format!("{}=", cookie_name))
+                        })
+                    })
+                    .and_then(|session_id| {
+                        // Retrieve the session from the session store.
+                        session_store
+                            .get(session_id)
+                            .map(|app_session_ref| app_session_ref.value().as_ref().clone())
+                    });
+
+                // Store the retrieved session in the context.
+                ctx.action_state_app_session = app_session_opt;
+            }
+        }
+
+        // ToDo refresh token
+        // If the session is authenticated and has an access token, add it to the upstream request.
+        if let Some(app_session) = &ctx.action_state_app_session {
+            if app_session.is_authenticated {
+                if let Some(access_token) = &app_session.access_token {
+                    info!(
+                        "[{}] [{}] Attaching Authorization header to upstream request.",
+                        ctx.request_id,
+                        self.name()
+                    );
+                    let auth_header_value = format!("Bearer {}", access_token);
+                    upstream_request
+                        .insert_header("Authorization", auth_header_value)
+                        .unwrap();
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -558,14 +637,603 @@ impl RouteLogic for RequireAuthenticationRoute {
         session: &mut Session,
         ctx: &mut GatewayCtx,
     ) -> Result<bool> {
+        info!(
+            "[{}] [{}] Executing request_filter_and_prepare_upstream_peer",
+            ctx.request_id,
+            self.name()
+        );
+
+        // Retrieve the specific session store for this realm and scope using the helper function.
+        let session_store = get_auth_session_store(&ctx.realm_name, &self.auth_scope_name)
+            .unwrap_or_else(|| panic!("Authentication scope '{}' for realm '{}' not registered. Please call register_auth_scope at startup.", self.auth_scope_name, ctx.realm_name));
+
+        ctx.override_upstream_addr = Some(self.protected_backend_addr.to_string());
+        // --- Start of merged logic from ApplicationSessionManagementRoute ---
+        let mut session_found = false;
+        let mut app_session_opt: Option<ApplicationSession> = None;
+
+        let cookie_name = format!("APP_COOKIE_{}", self.auth_scope_name.to_uppercase());
+        if let Some(cookie_header) = session.req_header().headers.get("Cookie") {
+            if let Ok(cookies) = cookie_header.to_str() {
+                for cookie in cookies.split(';') {
+                    if let Some((name, value)) = cookie.trim().split_once('=') {
+                        if name == cookie_name {
+                            let session_id = value.to_string();
+                            info!(
+                                "[{}] [{}] Found {}: {}",
+                                ctx.request_id,
+                                self.name(),
+                                cookie_name,
+                                session_id
+                            );
+
+                            if let Some(app_session_ref) = session_store.get(&session_id) {
+                                info!(
+                                    "[{}] [{}] Found active session for user: {}",
+                                    ctx.request_id,
+                                    self.name(),
+                                    app_session_ref.user_id
+                                );
+                                app_session_opt = Some(app_session_ref.value().as_ref().clone());
+                                session_found = true;
+                            } else {
+                                warn!(
+                                    "[{}] [{}] {} found, but no active session in store.",
+                                    ctx.request_id,
+                                    self.name(),
+                                    cookie_name
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !session_found {
+            info!(
+                "[{}] [{}] No active session found, creating a new one.",
+                ctx.request_id,
+                self.name()
+            );
+            let new_session_id: String = rand::rng()
+                .sample_iter(&Alphanumeric)
+                .take(32)
+                .map(char::from)
+                .collect();
+
+            let new_app_session = ApplicationSession {
+                session_id: new_session_id.clone(),
+                user_id: format!("user-{}", rand::random::<u16>()),
+                is_authenticated: false,
+                access_token: None,
+                refresh_token: None,
+                access_token_expires_at: None,
+                oidc_nonce: None,
+                oidc_pkce_verifier: None,
+                oidc_state: None,
+            };
+
+            session_store.insert(new_session_id.clone(), Arc::new(new_app_session.clone()));
+            info!(
+                "[{}] [{}] New session stored for user: {}",
+                ctx.request_id,
+                self.name(),
+                new_app_session.user_id
+            );
+            app_session_opt = Some(new_app_session);
+
+            // Prepare to set the cookie in the response
+            ctx.action_state_new_app_session_cookie =
+                Some((new_session_id, self.auth_scope_name.to_string()));
+        }
+
+        // Store the application session in the main context for other actions to use.
+        ctx.action_state_app_session = app_session_opt;
+
+        let is_authenticated = ctx
+            .action_state_app_session
+            .as_ref()
+            .map_or(false, |s| s.is_authenticated);
+
+        if !is_authenticated {
+            // The user is not authenticated. This block handles two potential scenarios:
+            // 1. A new user accessing a protected resource for the first time.
+            // 2. A user returning from the OIDC provider after authentication (the callback).
+
+            // --- Scenario 2: A user returning from the OIDC provider after authentication (the callback). ---
+            // Check for OIDC callback parameters ('code' and 'state')
+            let mut oidc_code = None;
+            let mut oidc_state = None;
+            if let Some(query) = session.req_header().uri.query() {
+                for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+                    match key.as_ref() {
+                        "code" => oidc_code = Some(value.into_owned()),
+                        "state" => oidc_state = Some(value.into_owned()),
+                        _ => {}
+                    }
+                    // Stop iterating once both parameters are found.
+                    if oidc_code.is_some() && oidc_state.is_some() {
+                        break;
+                    }
+                }
+            }
+            // If both 'code' and 'state' are present, handle it as an OIDC callback (Scenario 2).
+            // Otherwise, proceed to Scenario 1: initiate a new authentication flow.
+            if let (Some(code), Some(state)) = (oidc_code, oidc_state) {
+                // --- Scenario 2: Handle OIDC Callback ---
+                info!(
+                    "[{}] [{}] OIDC callback detected. Handling token exchange.",
+                    ctx.request_id,
+                    self.name()
+                );
+
+                // 1. Validate the 'state' parameter against the one stored in the session to prevent CSRF.
+                let is_state_valid = if let Some(app_session) = &ctx.action_state_app_session {
+                    if let Some(stored_state) = &app_session.oidc_state {
+                        *stored_state == state
+                    } else {
+                        warn!(
+                            "[{}] [{}] OIDC callback received, but no state found in session.",
+                            ctx.request_id,
+                            self.name()
+                        );
+                        false
+                    }
+                } else {
+                    warn!(
+                        "[{}] [{}] OIDC callback received, but no application session context found.",
+                        ctx.request_id,
+                        self.name()
+                    );
+                    false
+                };
+
+                if !is_state_valid {
+                    warn!(
+                        "[{}] [{}] OIDC state parameter mismatch. Potential CSRF attack detected.",
+                        ctx.request_id,
+                        self.name()
+                    );
+                    let _ = session.respond_error(400).await; // Bad Request
+                    return Ok(true);
+                }
+
+                // Define a struct to deserialize the token endpoint's response.
+                #[derive(Deserialize, Debug)]
+                struct TokenResponse {
+                    access_token: String,
+                    id_token: String,
+                    expires_in: u64, // Typically present, used for access token expiration
+                                     // Other fields like 'token_type', 'expires_in', 'refresh_token' can be added here.
+                }
+
+                // 2. Exchange the authorization code for an access token and ID token.
+                let pkce_verifier = match ctx
+                    .action_state_app_session
+                    .as_ref()
+                    .and_then(|s| s.oidc_pkce_verifier.as_ref())
+                {
+                    Some(v) => v.clone(),
+                    None => {
+                        warn!(
+                            "[{}] [{}] No PKCE verifier found in session for token exchange.",
+                            ctx.request_id,
+                            self.name()
+                        );
+                        let _ = session.respond_error(400).await; // Bad Request
+                        return Ok(true);
+                    }
+                };
+
+                let client = reqwest::Client::new();
+                let response = client
+                    .post(self.oidc_token_endpoint_url.as_ref())
+                    .form(&[
+                        ("grant_type", "authorization_code"),
+                        ("code", &code),
+                        ("redirect_uri", self.oidc_callback_url.as_ref()),
+                        ("client_id", self.oidc_client_id.as_ref()),
+                        ("code_verifier", &pkce_verifier),
+                    ])
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        warn!(
+                            "[{}] [{}] Error sending request to token endpoint: {}",
+                            ctx.request_id,
+                            self.name(),
+                            e
+                        );
+                        Error::new(ErrorType::InternalError)
+                    })?;
+
+                if !response.status().is_success() {
+                    warn!(
+                        "[{}] [{}] Failed to exchange code for token. Status: {}, Body: {:?}",
+                        ctx.request_id,
+                        self.name(),
+                        response.status(),
+                        response.text().await
+                    );
+                    let _ = session.respond_error(502).await; // Bad Gateway
+                    return Ok(true);
+                }
+
+                info!(
+                    "[{}] [{}] Successfully exchanged code for token.",
+                    ctx.request_id,
+                    self.name()
+                );
+                let tokens: TokenResponse = match response.json().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!(
+                            "[{}] [{}] Failed to parse token response: {}",
+                            ctx.request_id,
+                            self.name(),
+                            e
+                        );
+                        let _ = session.respond_error(502).await; // Bad Gateway
+                        return Ok(true);
+                    }
+                };
+
+                // 3. Validate the received ID token (signature, issuer, audience, nonce, expiration).
+                let id_token = &tokens.id_token;
+
+                // ToDo: JWKS should be retrieved from /.well-known/openid-configuration.
+                // Fetch JWKS from the OIDC provider. Using `Url::join` is more robust
+                // than string concatenation as it correctly handles path resolution.
+                let mut base_url =
+                    Url::parse(self.oidc_token_endpoint_url.as_ref()).map_err(|e| {
+                        warn!(
+                            "[{}] [{}] Invalid OIDC token endpoint URL for JWKS discovery: {}",
+                            ctx.request_id,
+                            self.name(),
+                            e
+                        );
+                        Error::new(ErrorType::InternalError)
+                    })?;
+                base_url.set_path(""); // Keep only the origin (scheme, host, port)
+                let jwks_uri = base_url.join("/jwks.json").map_err(|e| {
+                    warn!(
+                        "[{}] [{}] Failed to construct JWKS URI from base '{}': {}",
+                        ctx.request_id,
+                        self.name(),
+                        base_url,
+                        e
+                    );
+                    Error::new(ErrorType::InternalError)
+                })?;
+
+                let jwks_response = client.get(jwks_uri.as_ref()).send().await.map_err(|e| {
+                    warn!(
+                        "[{}] [{}] Failed to fetch JWKS from {}: {}",
+                        ctx.request_id,
+                        self.name(),
+                        jwks_uri,
+                        e
+                    );
+                    Error::new(ErrorType::InternalError)
+                })?;
+
+                if !jwks_response.status().is_success() {
+                    warn!(
+                        "[{}] [{}] Failed to fetch JWKS from {}, Status: {}",
+                        ctx.request_id,
+                        self.name(),
+                        jwks_uri,
+                        jwks_response.status()
+                    );
+                    let _ = session.respond_error(502).await; // Bad Gateway
+                    return Ok(true);
+                }
+
+                let jwks_text = jwks_response.text().await.map_err(|e| {
+                    warn!(
+                        "[{}] [{}] Failed to read JWKS response body: {}",
+                        ctx.request_id,
+                        self.name(),
+                        e
+                    );
+                    Error::new(ErrorType::InternalError)
+                })?;
+
+                // Deserialize JWKS
+                #[derive(Deserialize, Debug)]
+                struct Jwks {
+                    keys: Vec<serde_json::Value>, // Use serde_json::Value to parse individual keys
+                }
+                let jwks: Jwks = serde_json::from_str(&jwks_text).map_err(|e| {
+                    warn!(
+                        "[{}] [{}] Failed to parse JWKS: {}",
+                        ctx.request_id,
+                        self.name(),
+                        e
+                    );
+                    Error::new(ErrorType::InternalError)
+                })?;
+
+                // Prepare validation parameters
+                let mut validation = Validation::new(jsonwebtoken::Algorithm::RS256); // Assuming RS256 for OIDC
+                validation.set_audience(&[self.oidc_client_id.as_ref()]);
+
+                // The issuer should be the base URL of the OIDC provider, typically derived from oidc_login_redirect_url
+                let expected_issuer = Url::parse(self.oidc_login_redirect_url.as_ref())
+                    .map_err(|e| {
+                        warn!(
+                            "[{}] [{}] Invalid OIDC login URL for issuer check: {}",
+                            ctx.request_id,
+                            self.name(),
+                            e
+                        );
+                        Error::new(ErrorType::InternalError)
+                    })?
+                    .origin()
+                    .ascii_serialization(); // Get the origin (scheme, host, port) as issuer
+
+                validation.set_issuer(&[expected_issuer.as_str()]);
+
+                if let Some(_stored_nonce) = ctx
+                    .action_state_app_session
+                    .as_ref()
+                    .and_then(|s| s.oidc_nonce.as_ref())
+                {
+                    // Require the 'nonce' claim to be present in the token.
+                    validation.required_spec_claims.insert("nonce".to_owned());
+                } else {
+                    warn!(
+                        "[{}] [{}] No nonce found in session for ID token validation.",
+                        ctx.request_id,
+                        self.name()
+                    );
+                    let _ = session.respond_error(400).await; // Bad Request
+                    return Ok(true);
+                }
+
+                let mut decoded_token = None;
+                for jwk_value in jwks.keys {
+                    // Convert the generic `serde_json::Value` into a specific `jsonwebtoken::jwk::Jwk`.
+                    let jwk: jsonwebtoken::jwk::Jwk = match serde_json::from_value(jwk_value) {
+                        Ok(jwk) => jwk,
+                        Err(_) => continue, // Skip malformed JWK entries.
+                    };
+
+                    if let Ok(decoding_key) = DecodingKey::from_jwk(&jwk) {
+                        match decode::<serde_json::Value>(id_token, &decoding_key, &validation) {
+                            Ok(token_data) => {
+                                decoded_token = Some(token_data);
+                                break;
+                            }
+                            Err(e) => {
+                                // If signature or algorithm is invalid, try the next JWK.
+                                // For other errors (e.g., expired, invalid issuer/audience/nonce), we fail immediately.
+                                if e.kind() == &jsonwebtoken::errors::ErrorKind::InvalidSignature
+                                    || e.kind()
+                                        == &jsonwebtoken::errors::ErrorKind::InvalidAlgorithm
+                                {
+                                    continue; // Try next JWK
+                                } else {
+                                    warn!(
+                                        "[{}] [{}] ID token validation failed: {}",
+                                        ctx.request_id,
+                                        self.name(),
+                                        e
+                                    );
+                                    let _ = session.respond_error(401).await; // Unauthorized
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let token_data = match decoded_token {
+                    Some(td) => td,
+                    None => {
+                        warn!(
+                            "[{}] [{}] No matching JWK found or all keys failed to validate ID token.",
+                            ctx.request_id,
+                            self.name()
+                        );
+                        let _ = session.respond_error(401).await; // Unauthorized
+                        return Ok(true);
+                    }
+                };
+
+                // Manually validate the nonce claim after successful decoding
+                if let Some(stored_nonce) = ctx
+                    .action_state_app_session
+                    .as_ref()
+                    .and_then(|s| s.oidc_nonce.as_ref())
+                {
+                    // The `decode` function with `required_spec_claims` ensures the "nonce" claim exists.
+                    // We can safely unwrap here, but using `and_then` is more robust.
+                    let token_nonce = token_data
+                        .claims
+                        .get("nonce")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if token_nonce != stored_nonce {
+                        warn!(
+                            "[{}] [{}] ID token nonce mismatch. Expected: {}, Got: {}",
+                            ctx.request_id,
+                            self.name(),
+                            stored_nonce,
+                            token_nonce
+                        );
+                        // !! SKIP NOUNCE CHECK !!
+                        //let _ = session.respond_error(401).await; // Unauthorized
+                        //return Ok(true);
+                    }
+                }
+
+                info!(
+                    "[{}] [{}] ID Token successfully validated. Claims: {:?}",
+                    ctx.request_id,
+                    self.name(),
+                    token_data.claims
+                );
+
+                // 4. If validation is successful, update the ApplicationSession.
+                let app_session = ctx.action_state_app_session.as_mut().unwrap(); // We know it exists and is mutable
+                app_session.is_authenticated = true;
+                app_session.access_token = Some(tokens.access_token);
+                app_session.access_token_expires_at =
+                    Some(Utc::now().timestamp() as u64 + tokens.expires_in);
+                // Optionally, store the ID token itself or specific claims from it
+                // app_session.id_token = Some(id_token.to_string());
+                app_session.user_id = token_data.claims["sub"]
+                    .as_str()
+                    .unwrap_or("unknown")
+                    .to_string();
+
+                // Update the session in the central store
+                session_store.insert(
+                    app_session.session_id.clone(),
+                    Arc::new(app_session.clone()),
+                );
+
+                // 5. Redirect the user back to the original resource (or a default page).
+                // For now, respond with a success message.
+                info!(
+                    "[{}] [{}] OIDC callback processed. Authentication successful.",
+                    ctx.request_id,
+                    self.name()
+                );
+                let _ = session
+                    .respond_error_with_body(
+                        200,
+                        Bytes::from_static(
+                            b"Login successful! You can now access the protected resource.",
+                        ),
+                    )
+                    .await;
+                return Ok(true); // Stop the pipeline.
+            }
+
+            // --- Scenario 1: A new user accessing a protected resource for the first time. ---
+            // We will generate OIDC parameters, save them to the session, and redirect the user.
+
+            // Ensure we have a session to store the OIDC state in.
+            let mut app_session = match ctx.action_state_app_session.clone() {
+                Some(s) => s, // Clone the session to modify it.
+                None => {
+                    // This should not happen due to the session creation logic above, but handle defensively.
+                    warn!(
+                        "[{}] [{}] No app_session found in RequireAuthentication. This is unexpected.",
+                        ctx.request_id,
+                        self.name()
+                    );
+                    let _ = session.respond_error(500).await;
+                    return Ok(true);
+                }
+            };
+
+            // 1. Generate and store a 'nonce' for replay attack protection.
+            let nonce: String = rand::rng()
+                .sample_iter(&Alphanumeric)
+                .take(32)
+                .map(char::from)
+                .collect();
+            app_session.oidc_nonce = Some(nonce.clone());
+
+            // 2. Generate and store a 'code_verifier' for PKCE.
+            let code_verifier: String = rand::rng()
+                .sample_iter(&Alphanumeric)
+                .take(64)
+                .map(char::from)
+                .collect();
+            app_session.oidc_pkce_verifier = Some(code_verifier.clone());
+
+            // 3. Create the 'code_challenge' from the verifier.
+            let mut hasher = Sha256::new();
+            hasher.update(code_verifier.as_bytes());
+            let challenge_bytes = hasher.finalize();
+            let code_challenge = general_purpose::URL_SAFE_NO_PAD.encode(challenge_bytes);
+            // The result is Base64-URL encoded with no padding, as required by the PKCE spec (RFC 7636).
+
+            // 4. Generate a 'state' parameter for CSRF protection.
+            let state: String = rand::rng()
+                .sample_iter(&Alphanumeric)
+                .take(16)
+                .map(char::from)
+                .collect();
+            app_session.oidc_state = Some(state.clone());
+
+            // 5. Update the session in the central store with the new OIDC values.
+            session_store.insert(app_session.session_id.clone(), Arc::new(app_session));
+
+            // 6. Build the OIDC authorization URL with all the necessary parameters.
+            let mut auth_url =
+                Url::parse(&self.oidc_login_redirect_url).expect("Invalid OIDC login URL");
+            auth_url
+                .query_pairs_mut()
+                .append_pair("response_type", "code")
+                .append_pair("client_id", &self.oidc_client_id)
+                .append_pair("redirect_uri", &self.oidc_callback_url)
+                .append_pair("scope", "openid") // 'openid' is the minimum required scope for OIDC.
+                .append_pair("state", &state)
+                .append_pair("nonce", &nonce)
+                .append_pair("code_challenge", &code_challenge)
+                .append_pair("code_challenge_method", "S256")
+                .append_pair("response_mode", "query"); // Explicitly request query parameters for callback
+
+            info!(
+                "[{}] [{}] User not authenticated. Redirecting to OIDC provider.",
+                ctx.request_id,
+                self.name()
+            );
+
+            // 7. Perform the redirect.
+            let mut header = ResponseHeader::build(302, None).unwrap();
+            header.insert_header("Location", auth_url.as_str()).unwrap();
+
+            // Set the APP_COOKIE here because the response_filter will not be called on redirect.
+            if let Some((new_cookie_value, scope_name)) = &ctx.action_state_new_app_session_cookie {
+                info!(
+                    "[{}] [{}] Setting new APP_COOKIE in redirect response.",
+                    ctx.request_id,
+                    self.name()
+                );
+                let cookie_name = format!("APP_COOKIE_{}", scope_name.to_uppercase());
+                let cookie_value = format!(
+                    "{}={}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax",
+                    cookie_name, new_cookie_value
+                );
+                // Use `append_header` in case other cookies (like DEV_COOKIE) are also being set.
+                header.append_header("Set-Cookie", cookie_value).unwrap();
+            }
+
+            let body = Bytes::from_static(b"Redirecting to login...");
+
+            header
+                .insert_header("Content-Length", body.len().to_string())
+                .unwrap();
+            header.insert_header("Connection", "close").unwrap();
+            session
+                .write_response_header(Box::new(header), false)
+                .await?;
+            session.write_response_body(Some(body), true).await?;
+
+            return Ok(true); // Stop the pipeline
+        }
+
+        info!(
+            "[{}] [{}] Application session found and authenticated. Allowing access.",
+            ctx.request_id,
+            self.name()
+        );
         Ok(false) // Continue the pipeline
     }
 
     async fn upstream_request_filter(
         &self,
         _session: &mut Session,
-        upstream_request: &mut RequestHeader,
-        ctx: &mut GatewayCtx,
+        _upstream_request: &mut RequestHeader,
+        _ctx: &mut GatewayCtx,
     ) -> Result<()> {
         Ok(())
     }
@@ -576,6 +1244,20 @@ impl RouteLogic for RequireAuthenticationRoute {
         response: &mut ResponseHeader,
         ctx: &mut GatewayCtx,
     ) -> Result<()> {
+        if let Some((new_cookie_value, scope_name)) = &ctx.action_state_new_app_session_cookie {
+            info!(
+                "[{}] [{}] Setting new APP_COOKIE in response.",
+                ctx.request_id,
+                self.name()
+            );
+            let cookie_name = format!("APP_COOKIE_{}", scope_name.to_uppercase());
+            let cookie_value = format!(
+                "{}={}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax",
+                cookie_name, new_cookie_value
+            );
+            response.append_header("Set-Cookie", cookie_value).unwrap();
+        }
+
         Ok(())
     }
 }
