@@ -208,6 +208,156 @@ pub struct RequireAuthenticationRoute {
     pub auth_scope_name: Cow<'static, str>,
 }
 
+// Helper function to inject the Authorization header into the upstream request.
+// It ensures the access token is fresh by refreshing it if necessary.
+// Returns `true` if the token is valid (or if no session exists), and `false` if the token refresh failed.
+// This logic is shared between ProxyToRoute and RequireAuthenticationRoute.
+async fn inject_authorization_header_and_token_refresh(
+    ctx: &mut GatewayCtx,
+    upstream_request: &mut RequestHeader,
+    action_name: &str,
+    fallback_auth_scope_name: Option<&str>,
+) -> bool {
+    let mut is_token_valid = true;
+    if let Some(app_session) = &mut ctx.action_state_app_session {
+        let mut session_needs_update = false;
+        if app_session.is_authenticated {
+            let now = Utc::now().timestamp() as u64;
+            // Check if expired or expiring within 60 seconds
+            if let Some(expires_at) = app_session.access_token_expires_at {
+                info!(
+                    "[{}] [{}] Access token check: expires_at={}, now={}, remaining={}s",
+                    ctx.request_id,
+                    action_name,
+                    expires_at,
+                    now,
+                    expires_at.saturating_sub(now)
+                );
+                if now >= expires_at.saturating_sub(60) {
+                    info!(
+                        "[{}] [{}] Access token expired or expiring soon. Attempting refresh.",
+                        ctx.request_id, action_name
+                    );
+
+                    if let (Some(refresh_token), Some(endpoint), Some(client_id)) = (
+                        &app_session.refresh_token,
+                        &app_session.oidc_token_endpoint,
+                        &app_session.oidc_client_id,
+                    ) {
+                        let client = reqwest::Client::new();
+                        #[derive(Deserialize)]
+                        struct RefreshResponse {
+                            access_token: String,
+                            expires_in: u64,
+                            refresh_token: Option<String>,
+                        }
+
+                        let params = [
+                            ("grant_type", "refresh_token"),
+                            ("refresh_token", refresh_token),
+                            ("client_id", client_id),
+                        ];
+
+                        match client.post(endpoint).form(&params).send().await {
+                            Ok(resp) => {
+                                if resp.status().is_success() {
+                                    if let Ok(tokens) = resp.json::<RefreshResponse>().await {
+                                        info!(
+                                            "[{}] [{}] Token refresh successful.",
+                                            ctx.request_id, action_name
+                                        );
+                                        app_session.access_token = Some(tokens.access_token);
+                                        app_session.access_token_expires_at =
+                                            Some(now + tokens.expires_in);
+                                        if let Some(new_rt) = tokens.refresh_token {
+                                            app_session.refresh_token = Some(new_rt);
+                                        }
+                                        session_needs_update = true;
+                                    }
+                                } else {
+                                    warn!(
+                                        "[{}] [{}] Token refresh failed. Status: {}",
+                                        ctx.request_id,
+                                        action_name,
+                                        resp.status()
+                                    );
+                                    // If refresh fails (e.g. refresh token expired or revoked),
+                                    // revert the session to unauthenticated state to guide the user to the re-login flow on next access.
+                                    app_session.is_authenticated = false;
+                                    session_needs_update = true;
+                                    is_token_valid = false;
+                                }
+                            }
+                            Err(e) => warn!(
+                                "[{}] [{}] Token refresh request failed: {}",
+                                ctx.request_id, action_name, e
+                            ),
+                        }
+                    } else {
+                        let missing = [
+                            ("refresh_token", &app_session.refresh_token),
+                            ("oidc_token_endpoint", &app_session.oidc_token_endpoint),
+                            ("oidc_client_id", &app_session.oidc_client_id),
+                        ]
+                        .iter()
+                        .filter_map(|(k, v)| v.is_none().then_some(*k))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                        warn!(
+                            "[{}] [{}] Cannot refresh token: missing fields: {}",
+                            ctx.request_id, action_name, missing
+                        );
+                    }
+                }
+            }
+        }
+
+        // Inject the Authorization header, checking and updating the access token to ensure it is fresh.
+        if app_session.is_authenticated {
+            if let Some(access_token) = &app_session.access_token {
+                info!(
+                    "[{}] [{}] Attaching Authorization header to upstream request.",
+                    ctx.request_id, action_name
+                );
+                let auth_header_value = format!("Bearer {}", access_token);
+                // Remove existing Authorization header to avoid duplication/conflict
+                upstream_request.remove_header("Authorization");
+                upstream_request
+                    .insert_header("Authorization", auth_header_value)
+                    .unwrap();
+            }
+        }
+
+        // Save updated session to store if refresh occurred
+        if session_needs_update {
+            // Determine scope name to find the store. Prefer the one in session, fallback to route config.
+            let scope_to_use = app_session
+                .scope_name
+                .as_deref()
+                .or(fallback_auth_scope_name);
+
+            if let Some(scope) = scope_to_use {
+                if let Some(store) = get_auth_session_store(&ctx.realm_name, scope) {
+                    store.insert(
+                        app_session.session_id.clone(),
+                        Arc::new(app_session.clone()),
+                    );
+                    info!(
+                        "[{}] [{}] Updated session in store after refresh.",
+                        ctx.request_id, action_name
+                    );
+                }
+            } else {
+                warn!(
+                    "[{}] [{}] Could not save refreshed session: scope name unknown.",
+                    ctx.request_id, action_name
+                );
+            }
+        }
+    }
+    is_token_valid
+}
+
 // Implement the `RouteLogic` trait for each route struct.
 
 /// Terminates the request and responds with a static text body and status code.
@@ -363,141 +513,13 @@ impl RouteLogic for ProxyToRoute {
             }
         }
 
-        // Check for token expiration and refresh if necessary
-        let mut session_needs_update = false;
-        if let Some(app_session) = &mut ctx.action_state_app_session {
-            if app_session.is_authenticated {
-                let now = Utc::now().timestamp() as u64;
-                // Check if expired or expiring within 60 seconds
-                if let Some(expires_at) = app_session.access_token_expires_at {
-                    info!(
-                        "[{}] [{}] Access token check: expires_at={}, now={}, remaining={}s",
-                        ctx.request_id,
-                        self.name(),
-                        expires_at,
-                        now,
-                        expires_at.saturating_sub(now)
-                    );
-                    if now >= expires_at.saturating_sub(60) {
-                        info!(
-                            "[{}] [{}] Access token expired or expiring soon. Attempting refresh.",
-                            ctx.request_id,
-                            self.name()
-                        );
-
-                        if let (Some(refresh_token), Some(endpoint), Some(client_id)) = (
-                            &app_session.refresh_token,
-                            &app_session.oidc_token_endpoint,
-                            &app_session.oidc_client_id,
-                        ) {
-                            let client = reqwest::Client::new();
-                            #[derive(Deserialize)]
-                            struct RefreshResponse {
-                                access_token: String,
-                                expires_in: u64,
-                                refresh_token: Option<String>,
-                            }
-
-                            let params = [
-                                ("grant_type", "refresh_token"),
-                                ("refresh_token", refresh_token),
-                                ("client_id", client_id),
-                            ];
-
-                            match client.post(endpoint).form(&params).send().await {
-                                Ok(resp) => {
-                                    if resp.status().is_success() {
-                                        if let Ok(tokens) = resp.json::<RefreshResponse>().await {
-                                            info!(
-                                                "[{}] [{}] Token refresh successful.",
-                                                ctx.request_id,
-                                                self.name()
-                                            );
-                                            app_session.access_token = Some(tokens.access_token);
-                                            app_session.access_token_expires_at =
-                                                Some(now + tokens.expires_in);
-                                            if let Some(new_rt) = tokens.refresh_token {
-                                                app_session.refresh_token = Some(new_rt);
-                                            }
-                                            session_needs_update = true;
-                                        }
-                                    } else {
-                                        warn!(
-                                            "[{}] [{}] Token refresh failed. Status: {}",
-                                            ctx.request_id,
-                                            self.name(),
-                                            resp.status()
-                                        );
-                                        app_session.is_authenticated = false;
-                                        session_needs_update = true;
-                                    }
-                                }
-                                Err(e) => warn!(
-                                    "[{}] [{}] Token refresh request failed: {}",
-                                    ctx.request_id,
-                                    self.name(),
-                                    e
-                                ),
-                            }
-                        } else {
-                            warn!(
-                                "[{}] [{}] Cannot refresh token: missing refresh_token or OIDC config in session.",
-                                ctx.request_id,
-                                self.name()
-                            );
-                        }
-                    }
-                }
-            }
-
-            // If the session is authenticated and has an access token, add it to the upstream request.
-            if app_session.is_authenticated {
-                if let Some(access_token) = &app_session.access_token {
-                    info!(
-                        "[{}] [{}] Attaching Authorization header to upstream request.",
-                        ctx.request_id,
-                        self.name()
-                    );
-                    let auth_header_value = format!("Bearer {}", access_token);
-                    // Remove existing Authorization header to avoid duplication/conflict
-                    upstream_request.remove_header("Authorization");
-                    upstream_request
-                        .insert_header("Authorization", auth_header_value)
-                        .unwrap();
-                }
-            }
-        }
-
-        // Save updated session to store if refresh occurred
-        if session_needs_update {
-            if let Some(app_session) = &ctx.action_state_app_session {
-                // Determine scope name to find the store. Prefer the one in session, fallback to route config.
-                let scope_to_use = app_session
-                    .scope_name
-                    .as_deref()
-                    .or(self.auth_scope_name.as_deref());
-
-                if let Some(scope) = scope_to_use {
-                    if let Some(store) = get_auth_session_store(&ctx.realm_name, scope) {
-                        store.insert(
-                            app_session.session_id.clone(),
-                            Arc::new(app_session.clone()),
-                        );
-                        info!(
-                            "[{}] [{}] Updated session in store after refresh.",
-                            ctx.request_id,
-                            self.name()
-                        );
-                    }
-                } else {
-                    warn!(
-                        "[{}] [{}] Could not save refreshed session: scope name unknown.",
-                        ctx.request_id,
-                        self.name()
-                    );
-                }
-            }
-        }
+        let _ = inject_authorization_header_and_token_refresh(
+            ctx,
+            upstream_request,
+            self.name(),
+            self.auth_scope_name.as_deref(),
+        )
+        .await;
 
         Ok(())
     }
@@ -1001,7 +1023,12 @@ impl RouteLogic for RequireAuthenticationRoute {
                     }
                 };
 
-                info!("[{}] [{}] Token response content: {:?}", ctx.request_id, self.name(), tokens);
+                info!(
+                    "[{}] [{}] Token response content: {:?}",
+                    ctx.request_id,
+                    self.name(),
+                    tokens
+                );
 
                 // 3. Validate the received ID token (signature, issuer, audience, nonce, expiration).
                 let id_token = &tokens.id_token;
@@ -1355,10 +1382,46 @@ impl RouteLogic for RequireAuthenticationRoute {
 
     async fn upstream_request_filter(
         &self,
-        _session: &mut Session,
-        _upstream_request: &mut RequestHeader,
-        _ctx: &mut GatewayCtx,
+        session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        ctx: &mut GatewayCtx,
     ) -> Result<()> {
+        // Inject the Authorization header, checking and updating the access token to ensure it is fresh.
+        let is_token_valid = inject_authorization_header_and_token_refresh(
+            ctx,
+            upstream_request,
+            self.name(),
+            Some(&self.auth_scope_name),
+        )
+        .await;
+
+        if !is_token_valid {
+            warn!(
+                "[{}] [{}] Token refresh failed. Redirecting to self to trigger re-login flow.",
+                ctx.request_id,
+                self.name()
+            );
+            // Respond with a 302 redirect to the current URL.
+            // This forces the client to reload, which will hit the `request_filter` with an unauthenticated session,
+            // triggering the standard OIDC login flow.
+            let self_path = session
+                .req_header()
+                .uri
+                .path_and_query()
+                .map(|p| p.as_str())
+                .unwrap_or("/");
+            let mut header = ResponseHeader::build(302, None).unwrap();
+            header.insert_header("Location", self_path).unwrap();
+            header.insert_header("Content-Length", "0").unwrap();
+            header.insert_header("Connection", "close").unwrap();
+            session
+                .write_response_header(Box::new(header), false)
+                .await?;
+            return Err(Error::new(ErrorType::Custom(
+                "Token refresh failed, redirected to self".into(),
+            )));
+        }
+
         Ok(())
     }
 
