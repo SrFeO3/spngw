@@ -370,6 +370,14 @@ impl RouteLogic for ProxyToRoute {
                 let now = Utc::now().timestamp() as u64;
                 // Check if expired or expiring within 60 seconds
                 if let Some(expires_at) = app_session.access_token_expires_at {
+                    info!(
+                        "[{}] [{}] Access token check: expires_at={}, now={}, remaining={}s",
+                        ctx.request_id,
+                        self.name(),
+                        expires_at,
+                        now,
+                        expires_at.saturating_sub(now)
+                    );
                     if now >= expires_at.saturating_sub(60) {
                         info!(
                             "[{}] [{}] Access token expired or expiring soon. Attempting refresh.",
@@ -420,6 +428,8 @@ impl RouteLogic for ProxyToRoute {
                                             self.name(),
                                             resp.status()
                                         );
+                                        app_session.is_authenticated = false;
+                                        session_needs_update = true;
                                     }
                                 }
                                 Err(e) => warn!(
@@ -990,6 +1000,8 @@ impl RouteLogic for RequireAuthenticationRoute {
                         return Ok(true);
                     }
                 };
+
+                info!("[{}] [{}] Token response content: {:?}", ctx.request_id, self.name(), tokens);
 
                 // 3. Validate the received ID token (signature, issuer, audience, nonce, expiration).
                 let id_token = &tokens.id_token;
