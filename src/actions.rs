@@ -1248,20 +1248,22 @@ impl RouteLogic for RequireAuthenticationRoute {
                 );
 
                 // 5. Redirect the user back to the original resource (or a default page).
-                // For now, respond with a success message.
-                info!(
-                    "[{}] [{}] OIDC callback processed. Authentication successful.",
-                    ctx.request_id,
-                    self.name()
-                );
-                let _ = session
-                    .respond_error_with_body(
-                        200,
-                        Bytes::from_static(
-                            b"Login successful! You can now access the protected resource.",
-                        ),
-                    )
-                    .await;
+                // Since we don't track the original URL yet, redirect to the parent path.
+                let current_path = session.req_header().uri.path();
+                let redirect_path = if let Some(last_slash) = current_path.rfind('/') {
+                    &current_path[..=last_slash]
+                } else {
+                    "/"
+                }.to_string();
+                info!("[{}] [{}] OIDC callback processed. Authentication successful. Redirecting to {}.", ctx.request_id, self.name(), redirect_path);
+
+                let body = Bytes::from_static(b"Login successful. Redirecting...");
+                let mut header = ResponseHeader::build(302, None).unwrap();
+                header.insert_header("Location", redirect_path).unwrap();
+                header.insert_header("Content-Length", body.len().to_string()).unwrap();
+                header.insert_header("Connection", "close").unwrap();
+                session.write_response_header(Box::new(header), false).await?;
+                session.write_response_body(Some(body), true).await?;
                 return Ok(true); // Stop the pipeline.
             }
 
