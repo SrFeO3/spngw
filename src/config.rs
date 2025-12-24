@@ -71,7 +71,7 @@ pub enum ActionConfig {
         value: String,
     },
     RequireAuthentication {
-        protected_backend_addr: String,
+        protected_upstream: String,
         oidc_login_redirect_url: String,
         oidc_client_id: String,
         oidc_callback_url: String,
@@ -317,9 +317,8 @@ impl UpstreamCache {
                     if let Some(addr) = match &rule.action {
                         ActionConfig::Proxy { upstream } => Some(upstream.clone()),
                         ActionConfig::RequireAuthentication {
-                            protected_backend_addr,
-                            ..
-                        } => Some(protected_backend_addr.clone()),
+                            protected_upstream, ..
+                        } => Some(protected_upstream.clone()),
                         _ => None,
                     } {
                         realm_addrs.insert(addr);

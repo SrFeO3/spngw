@@ -305,7 +305,7 @@ realms:
                 - match: "hostname.equals('www.sr.example.com') and request.path.starts_with('/shop/')"
                   action:
                       type: requireAuthentication
-                      protected_backend_addr: "http://192.168.10.132:8080"
+                      protected_upstream: "http://192.168.10.132:8080"
                       oidc_login_redirect_url: "https://auth.sr.example.com:8000/authorize"
                       oidc_client_id: "fruit-shop"
                       oidc_callback_url: "https://www.sr.example.com:8000/shop/"

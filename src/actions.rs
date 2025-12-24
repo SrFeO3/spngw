@@ -135,7 +135,7 @@ pub enum GatewayAction {
     },
     // --- Composite Actions: Complex workflows composed of multiple steps. ---
     RequireAuthentication {
-        protected_backend_addr: Cow<'static, str>,
+        protected_upstream: Cow<'static, str>,
         oidc_login_redirect_url: Cow<'static, str>,
         oidc_client_id: Cow<'static, str>,
         oidc_callback_url: Cow<'static, str>,
@@ -199,7 +199,7 @@ pub struct SetDownstreamResponseHeaderRoute {
     pub value: Cow<'static, str>,
 }
 pub struct RequireAuthenticationRoute {
-    pub protected_backend_addr: Cow<'static, str>,
+    pub protected_upstream: Cow<'static, str>,
     pub oidc_login_redirect_url: Cow<'static, str>,
     pub oidc_client_id: Cow<'static, str>,
     pub oidc_callback_url: Cow<'static, str>,
@@ -620,7 +620,7 @@ impl RouteLogic for SetDownstreamResponseHeaderRoute {
 /// Manages the application session and OIDC authentication flow for a protected backend.
 ///
 /// # Arguments
-/// * `protected_backend_addr` - The upstream address of the service protected by this authentication.
+/// * `protected_upstream` - The upstream address of the service protected by this authentication.
 /// * `oidc_login_redirect_url` - The authorization endpoint of the OIDC provider.
 /// * `oidc_client_id` - The client ID registered with the OIDC provider.
 /// * `oidc_callback_url` - The callback URL on this BFF that the OIDC provider will redirect to.
@@ -647,7 +647,7 @@ impl RouteLogic for RequireAuthenticationRoute {
         let session_store = get_auth_session_store(&ctx.realm_name, &self.auth_scope_name)
             .unwrap_or_else(|| panic!("Authentication scope '{}' for realm '{}' not registered. Please call register_auth_scope at startup.", self.auth_scope_name, ctx.realm_name));
 
-        ctx.override_upstream_addr = Some(self.protected_backend_addr.to_string());
+        ctx.override_upstream_addr = Some(self.protected_upstream.to_string());
         // --- Start of merged logic from ApplicationSessionManagementRoute ---
         let mut session_found = false;
         let mut app_session_opt: Option<ApplicationSession> = None;

@@ -285,14 +285,14 @@ impl ProxyHttp for GatewayRouter {
                                 }
                             }
                             ActionConfig::RequireAuthentication {
-                                protected_backend_addr,
+                                protected_upstream,
                                 oidc_login_redirect_url,
                                 oidc_client_id,
                                 oidc_callback_url,
                                 oidc_token_endpoint_url,
                                 auth_scope_name,
                             } => GatewayAction::RequireAuthentication {
-                                protected_backend_addr: protected_backend_addr.clone().into(),
+                                protected_upstream: protected_upstream.clone().into(),
                                 oidc_login_redirect_url: oidc_login_redirect_url.clone().into(),
                                 oidc_client_id: oidc_client_id.clone().into(),
                                 oidc_callback_url: oidc_callback_url.clone().into(),
@@ -346,7 +346,7 @@ impl ProxyHttp for GatewayRouter {
                         .await
                 }
                 GatewayAction::RequireAuthentication {
-                    protected_backend_addr,
+                    protected_upstream,
                     oidc_login_redirect_url,
                     oidc_client_id,
                     oidc_callback_url,
@@ -354,7 +354,7 @@ impl ProxyHttp for GatewayRouter {
                     auth_scope_name,
                 } => {
                     let logic = actions::RequireAuthenticationRoute {
-                        protected_backend_addr,
+                        protected_upstream,
                         oidc_login_redirect_url,
                         oidc_client_id,
                         oidc_callback_url,
@@ -466,7 +466,7 @@ impl ProxyHttp for GatewayRouter {
                         .await
                 }
                 GatewayAction::RequireAuthentication {
-                    protected_backend_addr,
+                    protected_upstream,
                     oidc_login_redirect_url,
                     oidc_client_id,
                     oidc_callback_url,
@@ -474,7 +474,7 @@ impl ProxyHttp for GatewayRouter {
                     auth_scope_name,
                 } => {
                     let logic = actions::RequireAuthenticationRoute {
-                        protected_backend_addr,
+                        protected_upstream,
                         oidc_login_redirect_url,
                         oidc_client_id,
                         oidc_callback_url,
@@ -551,7 +551,7 @@ impl ProxyHttp for GatewayRouter {
                     logic.response_filter(session, response, ctx).await
                 }
                 GatewayAction::RequireAuthentication {
-                    protected_backend_addr,
+                    protected_upstream,
                     oidc_login_redirect_url,
                     oidc_client_id,
                     oidc_callback_url,
@@ -559,7 +559,7 @@ impl ProxyHttp for GatewayRouter {
                     auth_scope_name,
                 } => {
                     let logic = actions::RequireAuthenticationRoute {
-                        protected_backend_addr: protected_backend_addr.clone(),
+                        protected_upstream: protected_upstream.clone(),
                         oidc_login_redirect_url: oidc_login_redirect_url.clone(),
                         oidc_client_id: oidc_client_id.clone(),
                         oidc_callback_url: oidc_callback_url.clone(),
