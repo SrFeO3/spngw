@@ -25,10 +25,6 @@
 /// These are complex, multi-step workflows encapsulated into a single action.
 /// - `RequireAuthentication`: An action for paths that require OIDC authentication. It manages
 ///   the redirect-based login flow. (Note: Callback handling is not yet implemented).
-///
-/// TODO:
-///  - Implement token refresh, nonce, JWKS url on RequireAuthentication action
-///  - Implement forward auth token to upstream on ProxyTo action
 use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 
@@ -97,6 +93,9 @@ pub struct ApplicationSession {
     pub oidc_nonce: Option<String>,
     pub oidc_pkce_verifier: Option<String>,
     pub oidc_state: Option<String>,
+    pub oidc_token_endpoint: Option<String>,
+    pub oidc_client_id: Option<String>,
+    pub scope_name: Option<String>,
 }
 
 /// Device context for JWT cookie
@@ -364,9 +363,84 @@ impl RouteLogic for ProxyToRoute {
             }
         }
 
-        // ToDo refresh token
-        // If the session is authenticated and has an access token, add it to the upstream request.
-        if let Some(app_session) = &ctx.action_state_app_session {
+        // Check for token expiration and refresh if necessary
+        let mut session_needs_update = false;
+        if let Some(app_session) = &mut ctx.action_state_app_session {
+            if app_session.is_authenticated {
+                let now = Utc::now().timestamp() as u64;
+                // Check if expired or expiring within 60 seconds
+                if let Some(expires_at) = app_session.access_token_expires_at {
+                    if now >= expires_at.saturating_sub(60) {
+                        info!(
+                            "[{}] [{}] Access token expired or expiring soon. Attempting refresh.",
+                            ctx.request_id,
+                            self.name()
+                        );
+
+                        if let (Some(refresh_token), Some(endpoint), Some(client_id)) = (
+                            &app_session.refresh_token,
+                            &app_session.oidc_token_endpoint,
+                            &app_session.oidc_client_id,
+                        ) {
+                            let client = reqwest::Client::new();
+                            #[derive(Deserialize)]
+                            struct RefreshResponse {
+                                access_token: String,
+                                expires_in: u64,
+                                refresh_token: Option<String>,
+                            }
+
+                            let params = [
+                                ("grant_type", "refresh_token"),
+                                ("refresh_token", refresh_token),
+                                ("client_id", client_id),
+                            ];
+
+                            match client.post(endpoint).form(&params).send().await {
+                                Ok(resp) => {
+                                    if resp.status().is_success() {
+                                        if let Ok(tokens) = resp.json::<RefreshResponse>().await {
+                                            info!(
+                                                "[{}] [{}] Token refresh successful.",
+                                                ctx.request_id,
+                                                self.name()
+                                            );
+                                            app_session.access_token = Some(tokens.access_token);
+                                            app_session.access_token_expires_at =
+                                                Some(now + tokens.expires_in);
+                                            if let Some(new_rt) = tokens.refresh_token {
+                                                app_session.refresh_token = Some(new_rt);
+                                            }
+                                            session_needs_update = true;
+                                        }
+                                    } else {
+                                        warn!(
+                                            "[{}] [{}] Token refresh failed. Status: {}",
+                                            ctx.request_id,
+                                            self.name(),
+                                            resp.status()
+                                        );
+                                    }
+                                }
+                                Err(e) => warn!(
+                                    "[{}] [{}] Token refresh request failed: {}",
+                                    ctx.request_id,
+                                    self.name(),
+                                    e
+                                ),
+                            }
+                        } else {
+                            warn!(
+                                "[{}] [{}] Cannot refresh token: missing refresh_token or OIDC config in session.",
+                                ctx.request_id,
+                                self.name()
+                            );
+                        }
+                    }
+                }
+            }
+
+            // If the session is authenticated and has an access token, add it to the upstream request.
             if app_session.is_authenticated {
                 if let Some(access_token) = &app_session.access_token {
                     info!(
@@ -375,12 +449,46 @@ impl RouteLogic for ProxyToRoute {
                         self.name()
                     );
                     let auth_header_value = format!("Bearer {}", access_token);
+                    // Remove existing Authorization header to avoid duplication/conflict
+                    upstream_request.remove_header("Authorization");
                     upstream_request
                         .insert_header("Authorization", auth_header_value)
                         .unwrap();
                 }
             }
         }
+
+        // Save updated session to store if refresh occurred
+        if session_needs_update {
+            if let Some(app_session) = &ctx.action_state_app_session {
+                // Determine scope name to find the store. Prefer the one in session, fallback to route config.
+                let scope_to_use = app_session
+                    .scope_name
+                    .as_deref()
+                    .or(self.auth_scope_name.as_deref());
+
+                if let Some(scope) = scope_to_use {
+                    if let Some(store) = get_auth_session_store(&ctx.realm_name, scope) {
+                        store.insert(
+                            app_session.session_id.clone(),
+                            Arc::new(app_session.clone()),
+                        );
+                        info!(
+                            "[{}] [{}] Updated session in store after refresh.",
+                            ctx.request_id,
+                            self.name()
+                        );
+                    }
+                } else {
+                    warn!(
+                        "[{}] [{}] Could not save refreshed session: scope name unknown.",
+                        ctx.request_id,
+                        self.name()
+                    );
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -713,6 +821,9 @@ impl RouteLogic for RequireAuthenticationRoute {
                 oidc_nonce: None,
                 oidc_pkce_verifier: None,
                 oidc_state: None,
+                oidc_token_endpoint: Some(self.oidc_token_endpoint_url.to_string()),
+                oidc_client_id: Some(self.oidc_client_id.to_string()),
+                scope_name: Some(self.auth_scope_name.to_string()),
             };
 
             session_store.insert(new_session_id.clone(), Arc::new(new_app_session.clone()));
@@ -805,8 +916,8 @@ impl RouteLogic for RequireAuthenticationRoute {
                 struct TokenResponse {
                     access_token: String,
                     id_token: String,
-                    expires_in: u64, // Typically present, used for access token expiration
-                                     // Other fields like 'token_type', 'expires_in', 'refresh_token' can be added here.
+                    expires_in: u64,
+                    refresh_token: Option<String>,
                 }
 
                 // 2. Exchange the authorization code for an access token and ID token.
@@ -1083,6 +1194,7 @@ impl RouteLogic for RequireAuthenticationRoute {
                 app_session.access_token = Some(tokens.access_token);
                 app_session.access_token_expires_at =
                     Some(Utc::now().timestamp() as u64 + tokens.expires_in);
+                app_session.refresh_token = tokens.refresh_token;
                 // Optionally, store the ID token itself or specific claims from it
                 // app_session.id_token = Some(id_token.to_string());
                 app_session.user_id = token_data.claims["sub"]
