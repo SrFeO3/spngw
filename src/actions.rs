@@ -86,6 +86,7 @@ pub(crate) fn get_all_auth_session_stores() -> &'static DashMap<String, SessionS
 pub struct ApplicationSession {
     pub session_id: String,
     pub user_id: String,
+    pub username: String,
     pub is_authenticated: bool,
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
@@ -844,6 +845,7 @@ impl RouteLogic for RequireAuthenticationRoute {
             let new_app_session = ApplicationSession {
                 session_id: new_session_id.clone(),
                 user_id: format!("user-{}", rand::random::<u16>()),
+                username: "Guest".to_string(),
                 is_authenticated: false,
                 access_token: None,
                 refresh_token: None,
@@ -1233,11 +1235,14 @@ impl RouteLogic for RequireAuthenticationRoute {
                 app_session.access_token_expires_at =
                     Some(Utc::now().timestamp() as u64 + tokens.expires_in);
                 app_session.refresh_token = tokens.refresh_token;
-                // Optionally, store the ID token itself or specific claims from it
-                // app_session.id_token = Some(id_token.to_string());
                 app_session.user_id = token_data.claims["sub"]
                     .as_str()
                     .unwrap_or("unknown")
+                    .to_string();
+                app_session.username = token_data.claims.get("name")
+                    .or_else(|| token_data.claims.get("preferred_username"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Unknown")
                     .to_string();
 
                 // Update the session in the central store
@@ -1376,6 +1381,22 @@ impl RouteLogic for RequireAuthenticationRoute {
             ctx.request_id,
             self.name()
         );
+
+        // Scenario 3: Return user info for /api/me
+        if session.req_header().uri.path().ends_with("/api/me") {
+            info!("[{}] [{}] Intercepting /api/me request.", ctx.request_id, self.name());
+            let username = ctx.action_state_app_session.as_ref().map(|s| s.username.as_str()).unwrap_or("Unknown");
+            let body_content = serde_json::json!({ "name": username }).to_string();
+            let body = Bytes::from(body_content);
+
+            let mut header = ResponseHeader::build(200, None).unwrap();
+            header.insert_header("Content-Type", "application/json").unwrap();
+            header.insert_header("Content-Length", body.len().to_string()).unwrap();
+            session.write_response_header(Box::new(header), false).await?;
+            session.write_response_body(Some(body), true).await?;
+            return Ok(true);
+        }
+
         Ok(false) // Continue the pipeline
     }
 
