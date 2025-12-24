@@ -123,6 +123,7 @@ pub enum GatewayAction {
     // --- Modifier Actions: Actions that can be combined with a terminal action and each other. ---
     ProxyTo {
         upstream: Cow<'static, str>,
+        auth_scope_name: Option<Cow<'static, str>>,
     },
     IssueDeviceCookie,
     SetUpstreamRequestHeader {
@@ -188,6 +189,7 @@ pub struct RedirectRoute {
 }
 pub struct ProxyToRoute {
     pub upstream: Cow<'static, str>,
+    pub auth_scope_name: Option<Cow<'static, str>>,
 }
 pub struct IssueDeviceCookieRoute;
 pub struct SetUpstreamRequestHeaderRoute {
@@ -325,42 +327,40 @@ impl RouteLogic for ProxyToRoute {
             self.name()
         );
 
-        // TODO: Configure scopes in settings and send them with authentication requests to upstream services.
-        // --- Test Implementation ---
-        // The code below is a temporary implementation for testing purposes.
-        // using "private_scope" scope
-
-        // Implement a fallback to retrieve session information from the APP_COOKIE
+        // Retrieve session information from the APP_COOKIE
         // in case RequireAuthentication has not been executed before this action.
         if ctx.action_state_app_session.is_none() {
-            info!(
-                "[{}] [{}] No app_session in context, attempting to load from APP_COOKIE.",
-                ctx.request_id,
-                self.name()
-            );
-            // Get the session store for "private_scope".
-            if let Some(session_store) = get_auth_session_store(&ctx.realm_name, "private_scope") {
-                let cookie_name = "APP_COOKIE_PRIVATE_SCOPE";
-                // Extract the session ID from the cookie header.
-                let app_session_opt = _session
-                    .req_header()
-                    .headers
-                    .get("Cookie")
-                    .and_then(|cookie_header| cookie_header.to_str().ok())
-                    .and_then(|cookies_str| {
-                        cookies_str.split(';').find_map(|cookie| {
-                            cookie.trim().strip_prefix(&format!("{}=", cookie_name))
+            if let Some(scope_name) = &self.auth_scope_name {
+                info!(
+                    "[{}] [{}] No app_session in context, attempting to load from APP_COOKIE for scope: {}",
+                    ctx.request_id,
+                    self.name(),
+                    scope_name
+                );
+                // Get the session store for the specified scope.
+                if let Some(session_store) = get_auth_session_store(&ctx.realm_name, scope_name) {
+                    let cookie_name = format!("APP_COOKIE_{}", scope_name.to_uppercase());
+                    // Extract the session ID from the cookie header.
+                    let app_session_opt = _session
+                        .req_header()
+                        .headers
+                        .get("Cookie")
+                        .and_then(|cookie_header| cookie_header.to_str().ok())
+                        .and_then(|cookies_str| {
+                            cookies_str.split(';').find_map(|cookie| {
+                                cookie.trim().strip_prefix(&format!("{}=", cookie_name))
+                            })
                         })
-                    })
-                    .and_then(|session_id| {
-                        // Retrieve the session from the session store.
-                        session_store
-                            .get(session_id)
-                            .map(|app_session_ref| app_session_ref.value().as_ref().clone())
-                    });
+                        .and_then(|session_id| {
+                            // Retrieve the session from the session store.
+                            session_store
+                                .get(session_id)
+                                .map(|app_session_ref| app_session_ref.value().as_ref().clone())
+                        });
 
-                // Store the retrieved session in the context.
-                ctx.action_state_app_session = app_session_opt;
+                    // Store the retrieved session in the context.
+                    ctx.action_state_app_session = app_session_opt;
+                }
             }
         }
 

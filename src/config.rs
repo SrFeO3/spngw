@@ -58,6 +58,7 @@ pub enum ActionConfig {
     },
     Proxy {
         upstream: String,
+        auth_scope_name: Option<String>,
     },
     Redirect {
         url: String,
@@ -315,7 +316,7 @@ impl UpstreamCache {
             for chain in &realm.routing_chains {
                 for rule in &chain.rules {
                     if let Some(addr) = match &rule.action {
-                        ActionConfig::Proxy { upstream } => Some(upstream.clone()),
+                        ActionConfig::Proxy { upstream, .. } => Some(upstream.clone()),
                         ActionConfig::RequireAuthentication {
                             protected_upstream, ..
                         } => Some(protected_upstream.clone()),

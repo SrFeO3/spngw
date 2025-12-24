@@ -266,8 +266,12 @@ impl ProxyHttp for GatewayRouter {
                                     status_code: *status,
                                 }
                             }
-                            ActionConfig::Proxy { upstream } => GatewayAction::ProxyTo {
+                            ActionConfig::Proxy {
+                                upstream,
+                                auth_scope_name,
+                            } => GatewayAction::ProxyTo {
                                 upstream: upstream.clone().into(),
+                                auth_scope_name: auth_scope_name.clone().map(|s| s.into()),
                             },
                             ActionConfig::Redirect { url } => GatewayAction::Redirect {
                                 url: url.clone().into(),
@@ -371,8 +375,14 @@ impl ProxyHttp for GatewayRouter {
                         .request_filter_and_prepare_upstream_peer(session, ctx)
                         .await
                 }
-                GatewayAction::ProxyTo { upstream } => {
-                    let logic = actions::ProxyToRoute { upstream };
+                GatewayAction::ProxyTo {
+                    upstream,
+                    auth_scope_name,
+                } => {
+                    let logic = actions::ProxyToRoute {
+                        upstream,
+                        auth_scope_name,
+                    };
                     logic
                         .request_filter_and_prepare_upstream_peer(session, ctx)
                         .await
@@ -496,8 +506,14 @@ impl ProxyHttp for GatewayRouter {
                         .upstream_request_filter(session, upstream_request, ctx)
                         .await
                 }
-                GatewayAction::ProxyTo { upstream } => {
-                    let logic = actions::ProxyToRoute { upstream };
+                GatewayAction::ProxyTo {
+                    upstream,
+                    auth_scope_name,
+                } => {
+                    let logic = actions::ProxyToRoute {
+                        upstream,
+                        auth_scope_name,
+                    };
                     logic
                         .upstream_request_filter(session, upstream_request, ctx)
                         .await
@@ -577,9 +593,13 @@ impl ProxyHttp for GatewayRouter {
                     let logic = actions::RedirectRoute { url: url.clone() };
                     logic.response_filter(session, response, ctx).await
                 }
-                GatewayAction::ProxyTo { upstream } => {
+                GatewayAction::ProxyTo {
+                    upstream,
+                    auth_scope_name,
+                } => {
                     let logic = actions::ProxyToRoute {
                         upstream: upstream.clone(),
+                        auth_scope_name: auth_scope_name.clone(),
                     };
                     logic.response_filter(session, response, ctx).await
                 }
