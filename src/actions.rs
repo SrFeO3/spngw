@@ -1298,7 +1298,7 @@ impl RouteLogic for RequireAuthenticationRoute {
                 .append_pair("response_type", "code")
                 .append_pair("client_id", &self.oidc_client_id)
                 .append_pair("redirect_uri", &self.oidc_callback_url)
-                .append_pair("scope", "openid") // 'openid' is the minimum required scope for OIDC.
+                .append_pair("scope", "openid offline_access") // 'openid' is the minimum required scope for OIDC.
                 .append_pair("state", &state)
                 .append_pair("nonce", &nonce)
                 .append_pair("code_challenge", &code_challenge)
