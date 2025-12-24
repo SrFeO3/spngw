@@ -95,7 +95,8 @@ pub struct ApplicationSession {
     pub oidc_state: Option<String>,
     pub oidc_token_endpoint: Option<String>,
     pub oidc_client_id: Option<String>,
-    pub scope_name: Option<String>,
+    pub auth_scope_name: Option<String>,
+    pub auth_original_destination: Option<String>,
 }
 
 /// Device context for JWT cookie
@@ -331,10 +332,7 @@ async fn inject_authorization_header_and_token_refresh(
         // Save updated session to store if refresh occurred
         if session_needs_update {
             // Determine scope name to find the store. Prefer the one in session, fallback to route config.
-            let scope_to_use = app_session
-                .scope_name
-                .as_deref()
-                .or(fallback_auth_scope_name);
+            let scope_to_use = app_session.auth_scope_name.as_deref().or(fallback_auth_scope_name);
 
             if let Some(scope) = scope_to_use {
                 if let Some(store) = get_auth_session_store(&ctx.realm_name, scope) {
@@ -855,7 +853,8 @@ impl RouteLogic for RequireAuthenticationRoute {
                 oidc_state: None,
                 oidc_token_endpoint: Some(self.oidc_token_endpoint_url.to_string()),
                 oidc_client_id: Some(self.oidc_client_id.to_string()),
-                scope_name: Some(self.auth_scope_name.to_string()),
+                auth_scope_name: Some(self.auth_scope_name.to_string()),
+                auth_original_destination: None,
             };
 
             session_store.insert(new_session_id.clone(), Arc::new(new_app_session.clone()));
@@ -1248,13 +1247,8 @@ impl RouteLogic for RequireAuthenticationRoute {
                 );
 
                 // 5. Redirect the user back to the original resource (or a default page).
-                // Since we don't track the original URL yet, redirect to the parent path.
-                let current_path = session.req_header().uri.path();
-                let redirect_path = if let Some(last_slash) = current_path.rfind('/') {
-                    &current_path[..=last_slash]
-                } else {
-                    "/"
-                }.to_string();
+                // Retrieve the original destination from the session, or default to "/".
+                let redirect_path = app_session.auth_original_destination.take().unwrap_or_else(|| "/".to_string());
                 info!("[{}] [{}] OIDC callback processed. Authentication successful. Redirecting to {}.", ctx.request_id, self.name(), redirect_path);
 
                 let body = Bytes::from_static(b"Login successful. Redirecting...");
@@ -1316,10 +1310,13 @@ impl RouteLogic for RequireAuthenticationRoute {
                 .collect();
             app_session.oidc_state = Some(state.clone());
 
-            // 5. Update the session in the central store with the new OIDC values.
+            // 5. Save the original request URL to the session so we can redirect back later.
+            app_session.auth_original_destination = Some(session.req_header().uri.to_string());
+
+            // 6. Update the session in the central store with the new OIDC values.
             session_store.insert(app_session.session_id.clone(), Arc::new(app_session));
 
-            // 6. Build the OIDC authorization URL with all the necessary parameters.
+            // 7. Build the OIDC authorization URL with all the necessary parameters.
             let mut auth_url =
                 Url::parse(&self.oidc_login_redirect_url).expect("Invalid OIDC login URL");
             auth_url
@@ -1340,7 +1337,7 @@ impl RouteLogic for RequireAuthenticationRoute {
                 self.name()
             );
 
-            // 7. Perform the redirect.
+            // 8. Perform the redirect.
             let mut header = ResponseHeader::build(302, None).unwrap();
             header.insert_header("Location", auth_url.as_str()).unwrap();
 

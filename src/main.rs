@@ -124,7 +124,7 @@ impl ProxyHttp for GatewayRouter {
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
         info!(
-            "[{}] New request received for path: {}",
+            "********** [{}] New request received for path: {}",
             ctx.request_id,
             session.req_header().uri.path()
         );
@@ -613,7 +613,7 @@ impl ProxyHttp for GatewayRouter {
             .response_written()
             .map_or(0, |resp| resp.status.as_u16());
         info!(
-            "[{}] Request finished for {} {} from {:?} with status {} in {:?}",
+            "********** [{}] Request finished for {} {} from {:?} with status {} in {:?}",
             ctx.request_id,
             session.req_header().method,
             session.req_header().uri,
