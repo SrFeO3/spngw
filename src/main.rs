@@ -625,6 +625,53 @@ impl ProxyHttp for GatewayRouter {
 }
 
 //
+// A dedicated router for handling HTTP traffic and redirecting to HTTPS.
+//
+struct HttpRedirectRouter;
+
+#[async_trait]
+impl ProxyHttp for HttpRedirectRouter {
+    type CTX = ();
+
+    fn new_ctx(&self) -> Self::CTX {}
+
+    async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+        let host = session
+            .get_header("Host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("localhost");
+        let path = session
+            .req_header()
+            .uri
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or("/");
+        // Remove port from host if present, as we are redirecting to a specific HTTPS port
+        let host_name = host.split(':').next().unwrap_or(host);
+        let location = format!("https://{}:8443{}", host_name, path);
+
+        info!("Plaintext HTTP request. Redirecting to {}", location);
+        let mut resp = ResponseHeader::build(301, None)?;
+        resp.insert_header("Location", location)?;
+        resp.insert_header("Connection", "Close")?;
+        resp.insert_header("Content-Length", "0")?;
+        session.write_response_header(Box::new(resp), true).await?;
+        Ok(true) // Stop processing and close the session
+    }
+
+    async fn upstream_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Box<HttpPeer>> {
+        Err(Error::explain(
+            ErrorType::InternalError,
+            "Should not be reached",
+        ))
+    }
+}
+
+//
 // L4 for get SNI string on TLS handshake
 //
 struct SniCertificateSelector {
@@ -765,7 +812,7 @@ fn main() -> pingora::Result<()> {
         _gateway_start_time: gateway_start_time,
     };
 
-    let mut http_service = http_proxy_service(&my_server.configuration, gw);
+    let mut gateway_service = http_proxy_service(&my_server.configuration, gw);
     let selector = SniCertificateSelector {
         sni_ex_data_index: sni_ex_data_index.clone(),
         cert_cache: cert_cache_swapper.clone(),
@@ -776,13 +823,23 @@ fn main() -> pingora::Result<()> {
     let tls_settings_tcp =
         pingora::listeners::tls::TlsSettings::with_callbacks(Box::new(selector))?;
 
-    let listen_addr = "0.0.0.0:8000";
-    http_service.add_tls_with_settings(listen_addr, None, tls_settings_tcp);
-    my_server.add_service(http_service);
-
+    let gateway_listen_addr = "0.0.0.0:8443";
+    gateway_service.add_tls_with_settings(gateway_listen_addr, None, tls_settings_tcp);
+    my_server.add_service(gateway_service);
     info!(
         "Gateway server starting on {}. Preparation took {:?}",
-        listen_addr,
+        gateway_listen_addr,
+        gateway_start_time.elapsed()
+    );
+
+    // Create a separate service for HTTP redirects
+    let redirect_service_listen_addr = "0.0.0.0:8000";
+    let mut redirect_service = http_proxy_service(&my_server.configuration, HttpRedirectRouter);
+    redirect_service.add_tcp(redirect_service_listen_addr);
+    my_server.add_service(redirect_service);
+    info!(
+        "Redirect server starting on {}. Preparation took {:?}",
+        redirect_service_listen_addr,
         gateway_start_time.elapsed()
     );
 
