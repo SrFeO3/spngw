@@ -9,6 +9,7 @@
 //   RUST_LOG=info cargo run
 //
 // TODO:
+// - Add functionality to HttpRedirectRouter to drop requests for unrelated hostnames.
 // - Consider easy temporary use of first realm
 // - Consider default_cert on main should be configurable instead of hardcoded.
 // - Consider adding a route for requests with no SNI found in the filter
@@ -26,6 +27,7 @@ use std::time::Instant;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use boring::ex_data::Index;
+use bytes::Bytes;
 use dashmap::DashMap;
 use log::{info, warn};
 use pingora::http::ResponseHeader;
@@ -144,8 +146,17 @@ impl ProxyHttp for GatewayRouter {
                 sni_name.to_string()
             }
             None => {
-                info!("[{}] No SNI found. Using no-SNI upstream.", ctx.request_id);
-                "bad sni".to_string() // !!!!!
+                warn!("[{}] No SNI found. Using no-SNI upstream.", ctx.request_id);
+                let body = "SNI is required.";
+                let mut resp = ResponseHeader::build(400, None)?;
+                resp.insert_header("Content-Type", "text/plain")?;
+                resp.insert_header("Content-Length", body.len().to_string())?;
+                resp.insert_header("Connection", "Close")?;
+                session.write_response_header(Box::new(resp), false).await?;
+                session
+                    .write_response_body(Some(Bytes::from(body)), true)
+                    .await?;
+                return Ok(true);
             }
         };
         ctx.front_sni_name = Some(front_sni_name);
@@ -160,6 +171,16 @@ impl ProxyHttp for GatewayRouter {
             ctx.realm_index = Some(index);
         } else {
             warn!("[{}] No realm found", ctx.request_id);
+            let body = "SNI not registered.";
+            let mut resp = ResponseHeader::build(400, None)?;
+            resp.insert_header("Content-Type", "text/plain")?;
+            resp.insert_header("Content-Length", body.len().to_string())?;
+            resp.insert_header("Connection", "Close")?;
+            session.write_response_header(Box::new(resp), false).await?;
+            session
+                .write_response_body(Some(Bytes::from(body)), true)
+                .await?;
+            return Ok(true);
         }
 
         //
