@@ -45,6 +45,8 @@ use url::Url;
 
 use crate::GatewayCtx;
 
+pub const HSTS_HEADER_VALUE: &str = "max-age=31536000; includeSubDomains; preload";
+
 /// A type alias for a session store, which is a thread-safe map from session IDs to ApplicationSession objects.
 pub type SessionStore = Arc<DashMap<String, Arc<ApplicationSession>>>;
 
@@ -333,7 +335,10 @@ async fn inject_authorization_header_and_token_refresh(
         // Save updated session to store if refresh occurred
         if session_needs_update {
             // Determine scope name to find the store. Prefer the one in session, fallback to route config.
-            let scope_to_use = app_session.auth_scope_name.as_deref().or(fallback_auth_scope_name);
+            let scope_to_use = app_session
+                .auth_scope_name
+                .as_deref()
+                .or(fallback_auth_scope_name);
 
             if let Some(scope) = scope_to_use {
                 if let Some(store) = get_auth_session_store(&ctx.realm_name, scope) {
@@ -419,14 +424,13 @@ impl RouteLogic for RedirectRoute {
         // Create a 302 Found response header.
         let mut header = ResponseHeader::build(302, None).unwrap();
         header.insert_header("Location", &*self.url).unwrap();
-        // Add Content-Length for the body.
         header
             .insert_header("Content-Length", body.len().to_string())
             .unwrap();
-        // Signal that the connection should be closed as it's a one-off redirect.
+        header
+            .insert_header("Strict-Transport-Security", HSTS_HEADER_VALUE)
+            .unwrap();
         header.insert_header("Connection", "close").unwrap();
-
-        // Send the response header and body, then close the stream.
         session
             .write_response_header(Box::new(header), false)
             .await?;
@@ -1239,7 +1243,9 @@ impl RouteLogic for RequireAuthenticationRoute {
                     .as_str()
                     .unwrap_or("unknown")
                     .to_string();
-                app_session.username = token_data.claims.get("name")
+                app_session.username = token_data
+                    .claims
+                    .get("name")
                     .or_else(|| token_data.claims.get("preferred_username"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("Unknown")
@@ -1253,15 +1259,30 @@ impl RouteLogic for RequireAuthenticationRoute {
 
                 // 5. Redirect the user back to the original resource (or a default page).
                 // Retrieve the original destination from the session, or default to "/".
-                let redirect_path = app_session.auth_original_destination.take().unwrap_or_else(|| "/".to_string());
-                info!("[{}] [{}] OIDC callback processed. Authentication successful. Redirecting to {}.", ctx.request_id, self.name(), redirect_path);
+                let redirect_path = app_session
+                    .auth_original_destination
+                    .take()
+                    .unwrap_or_else(|| "/".to_string());
+                info!(
+                    "[{}] [{}] OIDC callback processed. Authentication successful. Redirecting to {}.",
+                    ctx.request_id,
+                    self.name(),
+                    redirect_path
+                );
 
                 let body = Bytes::from_static(b"Login successful. Redirecting...");
                 let mut header = ResponseHeader::build(302, None).unwrap();
                 header.insert_header("Location", redirect_path).unwrap();
-                header.insert_header("Content-Length", body.len().to_string()).unwrap();
+                header
+                    .insert_header("Content-Length", body.len().to_string())
+                    .unwrap();
                 header.insert_header("Connection", "close").unwrap();
-                session.write_response_header(Box::new(header), false).await?;
+                header
+                    .insert_header("Strict-Transport-Security", HSTS_HEADER_VALUE)
+                    .unwrap();
+                session
+                    .write_response_header(Box::new(header), false)
+                    .await?;
                 session.write_response_body(Some(body), true).await?;
                 return Ok(true); // Stop the pipeline.
             }
@@ -1367,6 +1388,9 @@ impl RouteLogic for RequireAuthenticationRoute {
             header
                 .insert_header("Content-Length", body.len().to_string())
                 .unwrap();
+            header
+                .insert_header("Strict-Transport-Security", HSTS_HEADER_VALUE)
+                .unwrap();
             header.insert_header("Connection", "close").unwrap();
             session
                 .write_response_header(Box::new(header), false)
@@ -1384,15 +1408,32 @@ impl RouteLogic for RequireAuthenticationRoute {
 
         // Scenario 3: Return user info for /api/me
         if session.req_header().uri.path().ends_with("/api/me") {
-            info!("[{}] [{}] Intercepting /api/me request.", ctx.request_id, self.name());
-            let username = ctx.action_state_app_session.as_ref().map(|s| s.username.as_str()).unwrap_or("Unknown");
+            info!(
+                "[{}] [{}] Intercepting /api/me request.",
+                ctx.request_id,
+                self.name()
+            );
+            let username = ctx
+                .action_state_app_session
+                .as_ref()
+                .map(|s| s.username.as_str())
+                .unwrap_or("Unknown");
             let body_content = serde_json::json!({ "name": username }).to_string();
             let body = Bytes::from(body_content);
 
             let mut header = ResponseHeader::build(200, None).unwrap();
-            header.insert_header("Content-Type", "application/json").unwrap();
-            header.insert_header("Content-Length", body.len().to_string()).unwrap();
-            session.write_response_header(Box::new(header), false).await?;
+            header
+                .insert_header("Content-Type", "application/json")
+                .unwrap();
+            header
+                .insert_header("Content-Length", body.len().to_string())
+                .unwrap();
+            header
+                .insert_header("Strict-Transport-Security", HSTS_HEADER_VALUE)
+                .unwrap();
+            session
+                .write_response_header(Box::new(header), false)
+                .await?;
             session.write_response_body(Some(body), true).await?;
             return Ok(true);
         }
@@ -1433,6 +1474,9 @@ impl RouteLogic for RequireAuthenticationRoute {
             let mut header = ResponseHeader::build(302, None).unwrap();
             header.insert_header("Location", self_path).unwrap();
             header.insert_header("Content-Length", "0").unwrap();
+            header
+                .insert_header("Strict-Transport-Security", HSTS_HEADER_VALUE)
+                .unwrap();
             header.insert_header("Connection", "close").unwrap();
             session
                 .write_response_header(Box::new(header), false)

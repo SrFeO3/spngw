@@ -10,6 +10,7 @@
 //
 // TODO:
 // - Add functionality to HttpRedirectRouter to drop requests for unrelated hostnames.
+// - Support TLS on port 7080
 // - Consider easy temporary use of first realm
 // - Consider default_cert on main should be configurable instead of hardcoded.
 // - Consider adding a route for requests with no SNI found in the filter
@@ -551,6 +552,11 @@ impl ProxyHttp for GatewayRouter {
         response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        // Add HSTS header to all responses
+        response
+            .insert_header("Strict-Transport-Security", actions::HSTS_HEADER_VALUE)
+            .unwrap();
+
         // Dispatch to the response filter logic.
         // Loop through the pipeline in reverse order to apply response filters.
         // This follows the common middleware pattern (LIFO - Last-In, First-Out),
@@ -669,7 +675,7 @@ impl ProxyHttp for HttpRedirectRouter {
             .unwrap_or("/");
         // Remove port from host if present, as we are redirecting to a specific HTTPS port
         let host_name = host.split(':').next().unwrap_or(host);
-        let location = format!("https://{}:8443{}", host_name, path);
+        let location = format!("https://{}:8000{}", host_name, path);
 
         info!("Plaintext HTTP request. Redirecting to {}", location);
         let mut resp = ResponseHeader::build(301, None)?;
@@ -844,7 +850,7 @@ fn main() -> pingora::Result<()> {
     let tls_settings_tcp =
         pingora::listeners::tls::TlsSettings::with_callbacks(Box::new(selector))?;
 
-    let gateway_listen_addr = "0.0.0.0:8443";
+    let gateway_listen_addr = "0.0.0.0:8000";
     gateway_service.add_tls_with_settings(gateway_listen_addr, None, tls_settings_tcp);
     my_server.add_service(gateway_service);
     info!(
@@ -854,7 +860,7 @@ fn main() -> pingora::Result<()> {
     );
 
     // Create a separate service for HTTP redirects
-    let redirect_service_listen_addr = "0.0.0.0:8000";
+    let redirect_service_listen_addr = "0.0.0.0:7080";
     let mut redirect_service = http_proxy_service(&my_server.configuration, HttpRedirectRouter);
     redirect_service.add_tcp(redirect_service_listen_addr);
     my_server.add_service(redirect_service);
