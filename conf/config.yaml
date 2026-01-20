@@ -306,9 +306,9 @@ realms:
                 - match: "hostname.equals('www.sr.example.com') and request.path.starts_with('/shop/')"
                   action:
                       type: requireAuthentication
-                      protected_upstream: "http://127.0.0.1:8080"
-                      oidc_login_redirect_url: "https://auth.sr.example.com:8000/authorize"
-                      oidc_client_id: "fruit-shop"
-                      oidc_callback_url: "https://www.sr.example.com:8000/shop/"
-                      oidc_token_endpoint_url: "http://127.0.0.1:8082/api/token" # OIDC token endpoint
-                      auth_scope_name: "shop_scope"
+                      authScopeName: "shop_scope"
+                      protectedUpstream: "http://127.0.0.1:8080"
+                      oidcAuthorizationEndpoint: "https://auth.sr.example.com:8000/authorize"
+                      oidcClientId: "fruit-shop"
+                      oidcRedirectUrl: "https://www.sr.example.com:8000/shop/"
+                      oidcTokenEndpoint: "http://127.0.0.1:8082/api/token" # OIDC token endpoint

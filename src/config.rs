@@ -50,7 +50,7 @@ pub const CONFIG_PATH: &str = "conf/config.yaml";
 
 /// All possible actions that can be performed when a rule matches.
 #[derive(Debug, Deserialize, Clone)]
-#[serde(tag = "type", rename_all = "camelCase")]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ActionConfig {
     ReturnStaticText {
         content: String,
@@ -73,10 +73,10 @@ pub enum ActionConfig {
     },
     RequireAuthentication {
         protected_upstream: String,
-        oidc_login_redirect_url: String,
+        oidc_authorization_endpoint: String,
         oidc_client_id: String,
-        oidc_callback_url: String,
-        oidc_token_endpoint_url: String,
+        oidc_redirect_url: String,
+        oidc_token_endpoint: String,
         auth_scope_name: String,
     },
 }

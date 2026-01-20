@@ -140,10 +140,10 @@ pub enum GatewayAction {
     // --- Composite Actions: Complex workflows composed of multiple steps. ---
     RequireAuthentication {
         protected_upstream: Cow<'static, str>,
-        oidc_login_redirect_url: Cow<'static, str>,
+        oidc_authorization_endpoint: Cow<'static, str>,
         oidc_client_id: Cow<'static, str>,
-        oidc_callback_url: Cow<'static, str>,
-        oidc_token_endpoint_url: Cow<'static, str>,
+        oidc_redirect_url: Cow<'static, str>,
+        oidc_token_endpoint: Cow<'static, str>,
         auth_scope_name: Cow<'static, str>,
     },
 }
@@ -205,10 +205,10 @@ pub struct SetDownstreamResponseHeaderRoute {
 }
 pub struct RequireAuthenticationRoute {
     pub protected_upstream: Cow<'static, str>,
-    pub oidc_login_redirect_url: Cow<'static, str>,
+    pub oidc_authorization_endpoint: Cow<'static, str>,
     pub oidc_client_id: Cow<'static, str>,
-    pub oidc_callback_url: Cow<'static, str>,
-    pub oidc_token_endpoint_url: Cow<'static, str>,
+    pub oidc_redirect_url: Cow<'static, str>,
+    pub oidc_token_endpoint: Cow<'static, str>,
     pub auth_scope_name: Cow<'static, str>,
 }
 
@@ -764,10 +764,10 @@ impl RouteLogic for SetDownstreamResponseHeaderRoute {
 ///
 /// # Arguments
 /// * `protected_upstream` - The upstream address of the service protected by this authentication.
-/// * `oidc_login_redirect_url` - The authorization endpoint of the OIDC provider.
+/// * `oidc_authorization_endpoint` - The authorization endpoint of the OIDC provider.
 /// * `oidc_client_id` - The client ID registered with the OIDC provider.
-/// * `oidc_callback_url` - The callback URL on this BFF that the OIDC provider will redirect to.
-/// * `oidc_token_endpoint_url` - The token endpoint of the OIDC provider.
+/// * `oidc_redirect_url` - The callback URL on this BFF that the OIDC provider will redirect to.
+/// * `oidc_token_endpoint` - The token endpoint of the OIDC provider.
 /// * `auth_scope_name` - A unique name for this authentication scope, used to isolate session cookies.
 #[async_trait]
 impl RouteLogic for RequireAuthenticationRoute {
@@ -857,7 +857,7 @@ impl RouteLogic for RequireAuthenticationRoute {
                 oidc_nonce: None,
                 oidc_pkce_verifier: None,
                 oidc_state: None,
-                oidc_token_endpoint: Some(self.oidc_token_endpoint_url.to_string()),
+                oidc_token_endpoint: Some(self.oidc_token_endpoint.to_string()),
                 oidc_client_id: Some(self.oidc_client_id.to_string()),
                 auth_scope_name: Some(self.auth_scope_name.to_string()),
                 auth_original_destination: None,
@@ -977,11 +977,11 @@ impl RouteLogic for RequireAuthenticationRoute {
 
                 let client = reqwest::Client::new();
                 let response = client
-                    .post(self.oidc_token_endpoint_url.as_ref())
+                    .post(self.oidc_token_endpoint.as_ref())
                     .form(&[
                         ("grant_type", "authorization_code"),
                         ("code", &code),
-                        ("redirect_uri", self.oidc_callback_url.as_ref()),
+                        ("redirect_uri", self.oidc_redirect_url.as_ref()),
                         ("client_id", self.oidc_client_id.as_ref()),
                         ("code_verifier", &pkce_verifier),
                     ])
@@ -1042,7 +1042,7 @@ impl RouteLogic for RequireAuthenticationRoute {
                 // Fetch JWKS from the OIDC provider. Using `Url::join` is more robust
                 // than string concatenation as it correctly handles path resolution.
                 let mut base_url =
-                    Url::parse(self.oidc_token_endpoint_url.as_ref()).map_err(|e| {
+                    Url::parse(self.oidc_token_endpoint.as_ref()).map_err(|e| {
                         warn!(
                             "[{}] [{}] Invalid OIDC token endpoint URL for JWKS discovery: {}",
                             ctx.request_id,
@@ -1115,8 +1115,8 @@ impl RouteLogic for RequireAuthenticationRoute {
                 let mut validation = Validation::new(jsonwebtoken::Algorithm::RS256); // Assuming RS256 for OIDC
                 validation.set_audience(&[self.oidc_client_id.as_ref()]);
 
-                // The issuer should be the base URL of the OIDC provider, typically derived from oidc_login_redirect_url
-                let expected_issuer = Url::parse(self.oidc_login_redirect_url.as_ref())
+                // The issuer should be the base URL of the OIDC provider, typically derived from oidc_authorization_endpoint
+                let expected_issuer = Url::parse(self.oidc_authorization_endpoint.as_ref())
                     .map_err(|e| {
                         warn!(
                             "[{}] [{}] Invalid OIDC login URL for issuer check: {}",
@@ -1344,12 +1344,12 @@ impl RouteLogic for RequireAuthenticationRoute {
 
             // 7. Build the OIDC authorization URL with all the necessary parameters.
             let mut auth_url =
-                Url::parse(&self.oidc_login_redirect_url).expect("Invalid OIDC login URL");
+                Url::parse(&self.oidc_authorization_endpoint).expect("Invalid OIDC login URL");
             auth_url
                 .query_pairs_mut()
                 .append_pair("response_type", "code")
                 .append_pair("client_id", &self.oidc_client_id)
-                .append_pair("redirect_uri", &self.oidc_callback_url)
+                .append_pair("redirect_uri", &self.oidc_redirect_url)
                 .append_pair("scope", "openid offline_access") // 'openid' is the minimum required scope for OIDC.
                 .append_pair("state", &state)
                 .append_pair("nonce", &nonce)

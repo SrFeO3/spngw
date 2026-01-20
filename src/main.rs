@@ -312,17 +312,17 @@ impl ProxyHttp for GatewayRouter {
                             }
                             ActionConfig::RequireAuthentication {
                                 protected_upstream,
-                                oidc_login_redirect_url,
+                                oidc_authorization_endpoint,
                                 oidc_client_id,
-                                oidc_callback_url,
-                                oidc_token_endpoint_url,
+                                oidc_redirect_url,
+                                oidc_token_endpoint,
                                 auth_scope_name,
                             } => GatewayAction::RequireAuthentication {
                                 protected_upstream: protected_upstream.clone().into(),
-                                oidc_login_redirect_url: oidc_login_redirect_url.clone().into(),
+                                oidc_authorization_endpoint: oidc_authorization_endpoint.clone().into(),
                                 oidc_client_id: oidc_client_id.clone().into(),
-                                oidc_callback_url: oidc_callback_url.clone().into(),
-                                oidc_token_endpoint_url: oidc_token_endpoint_url.clone().into(),
+                                oidc_redirect_url: oidc_redirect_url.clone().into(),
+                                oidc_token_endpoint: oidc_token_endpoint.clone().into(),
                                 auth_scope_name: auth_scope_name.clone().into(),
                             },
                         };
@@ -373,18 +373,18 @@ impl ProxyHttp for GatewayRouter {
                 }
                 GatewayAction::RequireAuthentication {
                     protected_upstream,
-                    oidc_login_redirect_url,
+                    oidc_authorization_endpoint,
                     oidc_client_id,
-                    oidc_callback_url,
-                    oidc_token_endpoint_url,
+                    oidc_redirect_url,
+                    oidc_token_endpoint,
                     auth_scope_name,
                 } => {
                     let logic = actions::RequireAuthenticationRoute {
                         protected_upstream,
-                        oidc_login_redirect_url,
+                        oidc_authorization_endpoint,
                         oidc_client_id,
-                        oidc_callback_url,
-                        oidc_token_endpoint_url,
+                        oidc_redirect_url,
+                        oidc_token_endpoint,
                         auth_scope_name,
                     };
                     logic
@@ -499,18 +499,18 @@ impl ProxyHttp for GatewayRouter {
                 }
                 GatewayAction::RequireAuthentication {
                     protected_upstream,
-                    oidc_login_redirect_url,
+                    oidc_authorization_endpoint,
                     oidc_client_id,
-                    oidc_callback_url,
-                    oidc_token_endpoint_url,
+                    oidc_redirect_url,
+                    oidc_token_endpoint,
                     auth_scope_name,
                 } => {
                     let logic = actions::RequireAuthenticationRoute {
                         protected_upstream,
-                        oidc_login_redirect_url,
+                        oidc_authorization_endpoint,
                         oidc_client_id,
-                        oidc_callback_url,
-                        oidc_token_endpoint_url,
+                        oidc_redirect_url,
+                        oidc_token_endpoint,
                         auth_scope_name,
                     };
                     logic
@@ -595,18 +595,18 @@ impl ProxyHttp for GatewayRouter {
                 }
                 GatewayAction::RequireAuthentication {
                     protected_upstream,
-                    oidc_login_redirect_url,
+                    oidc_authorization_endpoint,
                     oidc_client_id,
-                    oidc_callback_url,
-                    oidc_token_endpoint_url,
+                    oidc_redirect_url,
+                    oidc_token_endpoint,
                     auth_scope_name,
                 } => {
                     let logic = actions::RequireAuthenticationRoute {
                         protected_upstream: protected_upstream.clone(),
-                        oidc_login_redirect_url: oidc_login_redirect_url.clone(),
+                        oidc_authorization_endpoint: oidc_authorization_endpoint.clone(),
                         oidc_client_id: oidc_client_id.clone(),
-                        oidc_callback_url: oidc_callback_url.clone(),
-                        oidc_token_endpoint_url: oidc_token_endpoint_url.clone(),
+                        oidc_redirect_url: oidc_redirect_url.clone(),
+                        oidc_token_endpoint: oidc_token_endpoint.clone(),
                         auth_scope_name: auth_scope_name.clone(),
                     };
                     logic.response_filter(session, response, ctx).await
