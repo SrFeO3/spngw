@@ -275,7 +275,7 @@ realms:
                   action:
                       type: proxy
                       upstream: "http://127.0.0.1:5001"
-                      auth_scope_name: "shop_scope"
+                      authScopeName: "shop_scope"
                 - match: "request.path.starts_with('/fruit/orange/')"
                   action:
                       type: proxy
@@ -308,7 +308,7 @@ realms:
                       type: requireAuthentication
                       authScopeName: "shop_scope"
                       protectedUpstream: "http://127.0.0.1:8080"
-                      oidcAuthorizationEndpoint: "https://auth.sr.example.com:8000/authorize"
                       oidcClientId: "fruit-shop"
                       oidcRedirectUrl: "https://www.sr.example.com:8000/shop/"
-                      oidcTokenEndpoint: "http://127.0.0.1:8082/api/token" # OIDC token endpoint
+                      oidcAuthorizationEndpoint: "https://auth.sr.example.com:8000/authorize"
+                      oidcTokenEndpoint: "http://127.0.0.1:8082/api/token"
