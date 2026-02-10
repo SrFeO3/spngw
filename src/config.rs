@@ -464,7 +464,7 @@ impl BackgroundService for ConfigHotReloadService {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         loop {
             interval.tick().await;
-            if let Ok(current_content) = fs::read_to_string(CONFIG_PATH) {
+            if let Ok(current_content) = tokio::fs::read_to_string(CONFIG_PATH).await {
                 // Lock the mutex to safely read the last known content.
                 let last_content = self.last_known_content.lock().unwrap().clone();
                 if current_content != last_content {
