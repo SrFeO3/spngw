@@ -1,6 +1,6 @@
 realms:
     - name: production_realm
-      public_key_pem: |
+      deviceIdVerificationKey: |
           -----BEGIN PUBLIC KEY-----
           MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA96yON3DXHHS7DMfe4h1W
           VSyRJI/mkrKNgDmIboIGYYNcBALMblC3IRgE9gEpaGJ1Ll+At5yl4UF90iru+4Kr
@@ -10,7 +10,7 @@ realms:
           rbnHFMU8bkmTF3WizL+6ZPKPU28+WrYxH4EIEhToyIhktCb9DSKUSiIGa6+KvpfN
           ywIDAQAB
           -----END PUBLIC KEY-----
-      private_key_pem: |
+      deviceIdSigningKey: |
           -----BEGIN PRIVATE KEY-----
           MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQD3rI43cNccdLsM
           x97iHVZVLJEkj+aSso2AOYhuggZhg1wEAsxuULchGAT2ASloYnUuX4C3nKXhQX3S
@@ -39,9 +39,9 @@ realms:
           CvsxaZWlMj4yZoVCx7ZqrFx17AThlxCpi7rFoFZbkk+M9+RX6U8d8r39qyfqjJFp
           0kaUPHgv1Qgvn5SYcebU+AQ4
           -----END PRIVATE KEY-----
-      virtual_hosts:
+      virtualHosts:
           - hostname: "sirius.sr.example.com"
-            certificate_pem: |
+            certificate: |
                 -----BEGIN CERTIFICATE-----
                 MIIDvjCCAqagAwIBAgIUO7HKCuR7Wrj43+g6aGsRU9uTTLAwDQYJKoZIhvcNAQEL
                 BQAwYTELMAkGA1UEBhMCSlAxDjAMBgNVBAgMBVRva3lvMQ0wCwYDVQQHDARVZW5v
@@ -65,7 +65,7 @@ realms:
                 rAVyOWWPxmbPQiYLHp9o4QLsNGCpSOLkaA/RFgyIyK/LT8WNPv7qhEhVUHYKEqmv
                 xzM=
                 -----END CERTIFICATE-----
-            private_key_pem: |
+            key: |
                 -----BEGIN PRIVATE KEY-----
                 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCViPFTS/8rClBl
                 V/tlPRdkFbgusYL7hLTvcfupMPgCSTZwCGBlijqcY3dwxJJato6nFEm1PSXrkZV5
@@ -95,7 +95,7 @@ realms:
                 NFYcow6EFowIZP+BuVpJb40=
                 -----END PRIVATE KEY-----
           - hostname: "auth.sr.example.com"
-            certificate_pem: |
+            certificate: |
                 -----BEGIN CERTIFICATE-----
                 MIIDujCCAqKgAwIBAgIUO7HKCuR7Wrj43+g6aGsRU9uTTLEwDQYJKoZIhvcNAQEL
                 BQAwYTELMAkGA1UEBhMCSlAxDjAMBgNVBAgMBVRva3lvMQ0wCwYDVQQHDARVZW5v
@@ -118,7 +118,7 @@ realms:
                 0fdOkzS4+4dko4aY9+lnR8Bxfk5gaC9QUNoaaakulRs2gfG8wOVdbi7IFN+tnEsI
                 NE8DDMYZkWLbSjTkDBtlBSI0TFCHQIWgO9q/zqUjV4IfS63bh/rDXoMEEmEfiw==
                 -----END CERTIFICATE-----
-            private_key_pem: |
+            key: |
                 -----BEGIN PRIVATE KEY-----
                 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDT6js3zwjn0B6B
                 l9T27JBqlDhZLicXYNIOzCFVqQNPzGPxrh9/1nmw/i8eQOfNHZaw8uOQvAMyxspQ
@@ -148,7 +148,7 @@ realms:
                 I+d1Ozoe3IW+UBl2SbG724Q=
                 -----END PRIVATE KEY-----
           - hostname: "api.sr.example.com"
-            certificate_pem: |
+            certificate: |
                 -----BEGIN CERTIFICATE-----
                 MIIDuDCCAqCgAwIBAgIUO7HKCuR7Wrj43+g6aGsRU9uTTLIwDQYJKoZIhvcNAQEL
                 BQAwYTELMAkGA1UEBhMCSlAxDjAMBgNVBAgMBVRva3lvMQ0wCwYDVQQHDARVZW5v
@@ -171,7 +171,7 @@ realms:
                 /ancLxKLspsPX8QWWgDe0K85/fMmEm1MjQ0i7JYeoI3ERw91/FiGzvxJ8JZxOcmk
                 5ILrtiy6mFHGRSbtDNVzyZL7OlBJFyvONI5LMH6WSLcpu92x9hO5cE7fjVw=
                 -----END CERTIFICATE-----
-            private_key_pem: |
+            key: |
                 -----BEGIN PRIVATE KEY-----
                 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC3vzSpC42gmmyg
                 5utzqpBcnd7s1Wc5j+eC8IY8cClIb0jMm4q6AlTKh1bth21raN664BOpJqqAzMsn
@@ -201,7 +201,7 @@ realms:
                 5arOI55ZdwMpzAnvSVctMOc=
                 -----END PRIVATE KEY-----
           - hostname: "www.sr.example.com"
-            certificate_pem: |
+            certificate: |
                 -----BEGIN CERTIFICATE-----
                 MIIDuDCCAqCgAwIBAgIUO7HKCuR7Wrj43+g6aGsRU9uTTLMwDQYJKoZIhvcNAQEL
                 BQAwYTELMAkGA1UEBhMCSlAxDjAMBgNVBAgMBVRva3lvMQ0wCwYDVQQHDARVZW5v
@@ -224,7 +224,7 @@ realms:
                 jAhF8WRufKyeTTF4Tpg+K/calABwshQe2FNC/vesMXDWyzmrq097JL5HjpOMG2f5
                 DarPIz3nQOx1Ri0bhYR9ypJ5KciZIrqLqq/ND4e3Au9BzE2ZsyRQ+M3wm3o=
                 -----END CERTIFICATE-----
-            private_key_pem: |
+            key: |
                 -----BEGIN PRIVATE KEY-----
                 MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDVD16ATS5quPRv
                 wJ96SNdrdWhFgvnkodcetzjW19kaH+udu9J8YPzWWlb5uWfpmCFFJqLzU+k0aXo/
@@ -253,7 +253,7 @@ realms:
                 rqFdKccXErb++aV2Ve3GR1jdUqCTiZWcOp20pg+riJshgICKLJlfJNfNxIrUkUcd
                 P23W2zh1jT9kQgc8tdfRqQE=
                 -----END PRIVATE KEY-----
-      routing_chains:
+      routingChains:
           - name: fruit-shop-route
             title: Routing-Chain fruit-shop-route
             description: Virtual host handling 'fruit' subdomain requests

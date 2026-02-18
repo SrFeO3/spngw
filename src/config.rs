@@ -103,21 +103,27 @@ pub struct RoutingChainConfig {
 
 /// Virtual host, which maps a hostname to a specific TLS certificate.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct VirtualHostConfig {
     pub hostname: String,
+    #[serde(rename = "certificate")]
     pub certificate_pem: String,
+    #[serde(rename = "key")]
     pub private_key_pem: String,
 }
 
 /// PEM-encoded public and private keys for JWT signing.
 #[derive(Debug, Deserialize, Clone)]
 pub struct JwtKeyPairConfig {
+    #[serde(rename = "deviceIdVerificationKey")]
     pub public_key_pem: String,
+    #[serde(rename = "deviceIdSigningKey")]
     pub private_key_pem: String,
 }
 
 /// Realm, which groups together a set of virtual hosts and routing rules.
 #[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct RealmConfig {
     pub name: String,
     #[serde(flatten)]
