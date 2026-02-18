@@ -760,7 +760,7 @@ fn main() -> pingora::Result<()> {
     env_logger::init();
 
     let opt = Opt {
-        conf: Some("src/conf.yaml".to_string()),
+        conf: Some("pinconfing.yaml".to_string()),
         ..Default::default()
     };
 
