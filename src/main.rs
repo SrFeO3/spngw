@@ -10,12 +10,9 @@
 //
 // TODO:
 // - Add functionality to HttpRedirectRouter to drop requests for unrelated hostnames.
-// - Support TLS on port 7080
-// - Consider easy temporary use of first realm
 // - Consider default_cert on main should be configurable instead of hardcoded.
 // - Consider adding a route for requests with no SNI found in the filter
 // - Consider handling cases where no upstream is found in upstream_peer
-// - Consider default TLS cert
 // - Implement application sessions and background session cleaner
 // - Implement operational settings to be configured externally
 // - Implement `/api/logout` endpoint to invalidate sessions and tokens
@@ -40,7 +37,8 @@ use actions::{GatewayAction, RouteLogic};
 
 mod config;
 use crate::config::{
-    ActionConfig, AppConfig, AuthScopeRegistry, CertificateCache, JwtKeysCache, UpstreamCache,
+    ActionConfig, AppConfig, AuthScopeRegistry, CertificateCache, JwtKeysCache, RealmMap,
+    UpstreamCache,
 };
 
 /// Core logic and shared state for the proxy service
@@ -55,6 +53,7 @@ struct GatewayRouter {
     upstream_peer_cache: Arc<ArcSwap<UpstreamCache>>,
     sni_ex_data_index: Index<Ssl, Option<String>>,
     jwt_keys_cache: Arc<ArcSwap<JwtKeysCache>>,
+    realm_map: Arc<ArcSwap<RealmMap>>,
     main_config: Arc<ArcSwap<AppConfig>>,
     _gateway_start_time: Instant,
 }
@@ -165,10 +164,21 @@ impl ProxyHttp for GatewayRouter {
         // Determine Realm for this request.
         // TODO: Implement proper realms selection
         let app_config = self.main_config.load();
+        let realm_map = self.realm_map.load();
         ctx.app_config = Some(app_config.clone());
-        // For now, we fall back to the first realm in the configuration as a default.
-        if let Some((index, realm)) = app_config.realms.iter().enumerate().next() {
-            ctx.realm_name = realm.name.clone();
+
+        let realm_name = ctx
+            .front_sni_name
+            .as_ref()
+            .and_then(|sni| realm_map.map.get(sni).map(|v| v.value().clone()));
+
+        if let Some(name) = realm_name {
+            ctx.realm_name = name.clone();
+            let index = app_config
+                .realms
+                .iter()
+                .position(|r| r.name == ctx.realm_name)
+                .unwrap_or(0); // Should be safe if map is consistent with config
             ctx.realm_index = Some(index);
         } else {
             warn!("[{}] No realm found", ctx.request_id);
@@ -654,7 +664,9 @@ impl ProxyHttp for GatewayRouter {
 //
 // A dedicated router for handling HTTP traffic and redirecting to HTTPS.
 //
-struct HttpRedirectRouter;
+struct HttpRedirectRouter {
+    tls_port: u16,
+}
 
 #[async_trait]
 impl ProxyHttp for HttpRedirectRouter {
@@ -675,7 +687,7 @@ impl ProxyHttp for HttpRedirectRouter {
             .unwrap_or("/");
         // Remove port from host if present, as we are redirecting to a specific HTTPS port
         let host_name = host.split(':').next().unwrap_or(host);
-        let location = format!("https://{}:8000{}", host_name, path);
+        let location = format!("https://{}:{}{}", host_name, self.tls_port, path);
 
         info!("Plaintext HTTP request. Redirecting to {}", location);
         let mut resp = ResponseHeader::build(301, None)?;
@@ -704,6 +716,7 @@ impl ProxyHttp for HttpRedirectRouter {
 struct SniCertificateSelector {
     sni_ex_data_index: Index<Ssl, Option<String>>,
     cert_cache: Arc<ArcSwap<CertificateCache>>,
+    realm_map: Arc<ArcSwap<RealmMap>>,
     default_cert: Arc<config::CertAndKey>,
 }
 
@@ -714,6 +727,17 @@ impl pingora::listeners::TlsAccept for SniCertificateSelector {
             .servername(pingora::tls::ssl::NameType::HOST_NAME)
             .map(|s| s.to_string());
         info!("SNI from client: {:?}", sni_opt_string.as_deref());
+
+        // Check if the host is allowed (exists in RealmMap)
+        let is_allowed = sni_opt_string
+            .as_ref()
+            .map_or(false, |sni| self.realm_map.load().map.contains_key(sni));
+
+        if !is_allowed {
+            warn!("Connection rejected: Hostname not found in configuration.");
+            // Returning without setting a certificate will typically cause the TLS handshake to fail.
+            return;
+        }
 
         // Store SNI in ex_data to pass it to the http proxy phase.
         ssl.set_ex_data(self.sni_ex_data_index, sni_opt_string.clone());
@@ -759,6 +783,20 @@ impl pingora::listeners::TlsAccept for SniCertificateSelector {
 fn main() -> pingora::Result<()> {
     env_logger::init();
 
+    // Read environment variables
+    let _inventory_url = std::env::var("APIGW_INVENTORY_URL").ok();
+    if let Some(url) = &_inventory_url {
+        info!("APIGW_INVENTORY_URL: {}", url);
+    }
+    let gateway_listen_addr = std::env::var("APIGW_TLS_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8443".to_string());
+    let redirect_service_listen_addr = std::env::var("APIGW_HTTP_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+
+    let tls_port = gateway_listen_addr
+        .split(':')
+        .nth(1)
+        .and_then(|p| p.parse::<u16>().ok())
+        .expect("Invalid APIGW_TLS_BIND_ADDRESS format");
+
     let opt = Opt {
         conf: Some("conf/pinconfig.yaml".to_string()),
         ..Default::default()
@@ -801,6 +839,14 @@ fn main() -> pingora::Result<()> {
     UpstreamCache::reload_from_config(&app_config, &initial_upstream_cache);
     let upstream_peer_swapper = Arc::new(ArcSwap::new(Arc::new(initial_upstream_cache)));
 
+    // Load initial realm map and wrap it in ArcSwap for hot-reloading.
+    let initial_realm_map = RealmMap {
+        map: DashMap::new(),
+    };
+    // Perform an initial load.
+    RealmMap::reload_from_config(&app_config, &initial_realm_map);
+    let realm_map_swapper = Arc::new(ArcSwap::new(Arc::new(initial_realm_map)));
+
     // --- Initialize and register authentication scopes from config ---
     AuthScopeRegistry::reload_from_config(&app_config);
 
@@ -826,6 +872,7 @@ fn main() -> pingora::Result<()> {
         jwt_keys_cache_swapper.clone(),
         cert_cache_swapper.clone(),
         upstream_peer_swapper.clone(),
+        realm_map_swapper.clone(),
         main_config_swapper.clone(),
         initial_config_content,
     );
@@ -835,6 +882,7 @@ fn main() -> pingora::Result<()> {
         upstream_peer_cache: upstream_peer_swapper,
         sni_ex_data_index: sni_ex_data_index.clone(),
         jwt_keys_cache: jwt_keys_cache_swapper,
+        realm_map: realm_map_swapper.clone(),
         main_config: main_config_swapper,
         _gateway_start_time: gateway_start_time,
     };
@@ -843,6 +891,7 @@ fn main() -> pingora::Result<()> {
     let selector = SniCertificateSelector {
         sni_ex_data_index: sni_ex_data_index.clone(),
         cert_cache: cert_cache_swapper.clone(),
+        realm_map: realm_map_swapper.clone(),
         default_cert,
     };
 
@@ -850,8 +899,7 @@ fn main() -> pingora::Result<()> {
     let tls_settings_tcp =
         pingora::listeners::tls::TlsSettings::with_callbacks(Box::new(selector))?;
 
-    let gateway_listen_addr = "0.0.0.0:8000";
-    gateway_service.add_tls_with_settings(gateway_listen_addr, None, tls_settings_tcp);
+    gateway_service.add_tls_with_settings(&gateway_listen_addr, None, tls_settings_tcp);
     my_server.add_service(gateway_service);
     info!(
         "Gateway server starting on {}. Preparation took {:?}",
@@ -860,9 +908,8 @@ fn main() -> pingora::Result<()> {
     );
 
     // Create a separate service for HTTP redirects
-    let redirect_service_listen_addr = "0.0.0.0:7080";
-    let mut redirect_service = http_proxy_service(&my_server.configuration, HttpRedirectRouter);
-    redirect_service.add_tcp(redirect_service_listen_addr);
+    let mut redirect_service = http_proxy_service(&my_server.configuration, HttpRedirectRouter { tls_port });
+    redirect_service.add_tcp(&redirect_service_listen_addr);
     my_server.add_service(redirect_service);
     info!(
         "Redirect server starting on {}. Preparation took {:?}",

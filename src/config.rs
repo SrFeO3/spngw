@@ -101,11 +101,28 @@ pub struct RoutingChainConfig {
     pub rules: Vec<RuleConfig>,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SubdomainConfig {
+    pub urn: String,
+    pub fqdn: String,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ZoneConfig {
+    pub _name: String,
+    pub _urn: String,
+    pub subdomains: Vec<SubdomainConfig>,
+}
+
 /// Virtual host, which maps a hostname to a specific TLS certificate.
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct VirtualHostConfig {
+    #[serde(skip)]
     pub hostname: String,
+    pub subdomain: String,
     #[serde(rename = "certificate")]
     pub certificate_pem: String,
     #[serde(rename = "key")]
@@ -130,6 +147,8 @@ pub struct RealmConfig {
     pub jwt_key_pair: JwtKeyPairConfig, // Flatten the keys directly into the realm
     pub virtual_hosts: Vec<VirtualHostConfig>,
     pub routing_chains: Vec<RoutingChainConfig>,
+    #[serde(default)]
+    pub zones: Vec<ZoneConfig>,
 }
 
 /// Root of the application's configuration.
@@ -138,6 +157,30 @@ pub struct AppConfig {
     pub realms: Vec<RealmConfig>,
 }
 
+impl AppConfig {
+    pub fn resolve_hostnames(&mut self) -> Result<(), String> {
+        for realm in &mut self.realms {
+            let mut urn_to_fqdn = std::collections::HashMap::new();
+            for zone in &realm.zones {
+                for subdomain in &zone.subdomains {
+                    urn_to_fqdn.insert(subdomain.urn.clone(), subdomain.fqdn.clone());
+                }
+            }
+
+            for vhost in &mut realm.virtual_hosts {
+                if let Some(fqdn) = urn_to_fqdn.get(&vhost.subdomain) {
+                    vhost.hostname = fqdn.clone();
+                } else {
+                    return Err(format!(
+                        "Realm '{}': VirtualHost subdomain URN '{}' not found in zones configuration.",
+                        realm.name, vhost.subdomain
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
 // --- Runtime Data Structures ---
 
 /// Certificate and its corresponding private key.
@@ -178,6 +221,11 @@ pub struct AuthScopeRegistry {
     // The actual state is managed globally in `actions.rs`.
     // A `phantom` field could be used if we needed to associate a lifetime.
     _private: (),
+}
+
+/// Cache for Realm lookups by hostname.
+pub struct RealmMap {
+    pub map: DashMap<String, String>,
 }
 
 impl JwtKeysCache {
@@ -308,6 +356,26 @@ impl CertificateCache {
     }
 }
 
+impl RealmMap {
+    /// Performs a differential update of the hostname-to-realm mapping.
+    pub fn reload_from_config(app_config: &Arc<AppConfig>, current_map: &Self) {
+        let mut new_map = std::collections::HashMap::new();
+        for realm in &app_config.realms {
+            for vhost in &realm.virtual_hosts {
+                new_map.insert(vhost.hostname.clone(), realm.name.clone());
+            }
+        }
+
+        // Update existing or insert new
+        for (host, realm) in &new_map {
+            current_map.map.insert(host.clone(), realm.clone());
+        }
+
+        // Remove obsolete
+        current_map.map.retain(|host, _| new_map.contains_key(host));
+    }
+}
+
 impl UpstreamCache {
     /// Performs a differential update of upstream peers from the configuration.
     ///
@@ -430,8 +498,11 @@ pub fn load_app_config() -> Arc<AppConfig> {
     // to determine which configuration file to load.
     let config_str = fs::read_to_string(CONFIG_PATH)
         .unwrap_or_else(|e| panic!("Failed to read configuration from {}: {}", CONFIG_PATH, e));
-    let config: AppConfig = serde_yaml::from_str(&config_str)
+    let mut config: AppConfig = serde_yaml::from_str(&config_str)
         .unwrap_or_else(|e| panic!("Failed to parse configuration from {}: {}", CONFIG_PATH, e));
+    if let Err(e) = config.resolve_hostnames() {
+        panic!("Failed to resolve hostnames: {}", e);
+    }
     Arc::new(config)
 }
 
@@ -442,6 +513,7 @@ pub struct ConfigHotReloadService {
     keys_swapper: Arc<ArcSwap<JwtKeysCache>>,
     cert_swapper: Arc<ArcSwap<CertificateCache>>,
     upstream_swapper: Arc<ArcSwap<UpstreamCache>>,
+    realm_map_swapper: Arc<ArcSwap<RealmMap>>,
     main_config_swapper: Arc<ArcSwap<AppConfig>>,
     last_known_content: Mutex<String>,
 }
@@ -451,6 +523,7 @@ impl ConfigHotReloadService {
         keys_swapper: Arc<ArcSwap<JwtKeysCache>>,
         cert_swapper: Arc<ArcSwap<CertificateCache>>,
         upstream_swapper: Arc<ArcSwap<UpstreamCache>>,
+        realm_map_swapper: Arc<ArcSwap<RealmMap>>,
         main_config_swapper: Arc<ArcSwap<AppConfig>>,
         initial_config_content: String,
     ) -> Self {
@@ -458,6 +531,7 @@ impl ConfigHotReloadService {
             keys_swapper,
             cert_swapper,
             upstream_swapper,
+            realm_map_swapper,
             main_config_swapper,
             last_known_content: Mutex::new(initial_config_content),
         }
@@ -485,7 +559,11 @@ impl BackgroundService for ConfigHotReloadService {
 impl ConfigHotReloadService {
     fn reload_config(&self, current_content: &str) {
         match serde_yaml::from_str::<AppConfig>(current_content) {
-            Ok(new_config) => {
+            Ok(mut new_config) => {
+                if let Err(e) = new_config.resolve_hostnames() {
+                    warn!("Failed to resolve hostnames in reloaded configuration: {}. Skipping update.", e);
+                    return;
+                }
                 let new_config_arc = Arc::new(new_config);
                 // Atomically swap the entire application configuration.
                 self.main_config_swapper.store(new_config_arc.clone());
@@ -497,6 +575,10 @@ impl ConfigHotReloadService {
                 // Upstream Cache Reload
                 let current_upstream_cache = self.upstream_swapper.load();
                 UpstreamCache::reload_from_config(&new_config_arc, &current_upstream_cache);
+
+                // Realm Map Reload
+                let current_realm_map = self.realm_map_swapper.load();
+                RealmMap::reload_from_config(&new_config_arc, &current_realm_map);
 
                 // Auth Scopes Reload
                 AuthScopeRegistry::reload_from_config(&new_config_arc);
