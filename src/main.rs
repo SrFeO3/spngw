@@ -9,7 +9,6 @@
 //   RUST_LOG=info cargo run
 //
 // TODO:
-// - Add functionality to HttpRedirectRouter to drop requests for unrelated hostnames.
 // - Consider default_cert on main should be configurable instead of hardcoded.
 // - Consider adding a route for requests with no SNI found in the filter
 // - Consider handling cases where no upstream is found in upstream_peer
@@ -666,6 +665,7 @@ impl ProxyHttp for GatewayRouter {
 //
 struct HttpRedirectRouter {
     tls_port: u16,
+    realm_map: Arc<ArcSwap<RealmMap>>,
 }
 
 #[async_trait]
@@ -675,27 +675,37 @@ impl ProxyHttp for HttpRedirectRouter {
     fn new_ctx(&self) -> Self::CTX {}
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
-        let host = session
+        let valid_host = session
             .get_header("Host")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("localhost");
-        let path = session
-            .req_header()
-            .uri
-            .path_and_query()
-            .map(|p| p.as_str())
-            .unwrap_or("/");
-        // Remove port from host if present, as we are redirecting to a specific HTTPS port
-        let host_name = host.split(':').next().unwrap_or(host);
-        let location = format!("https://{}:{}{}", host_name, self.tls_port, path);
+            .map(|h| h.split(':').next().unwrap_or(h))
+            .filter(|h| self.realm_map.load().map.contains_key(*h))
+            .map(String::from);
 
-        info!("Plaintext HTTP request. Redirecting to {}", location);
-        let mut resp = ResponseHeader::build(301, None)?;
-        resp.insert_header("Location", location)?;
+        if let Some(host) = valid_host {
+            let path = session
+                .req_header()
+                .uri
+                .path_and_query()
+                .map(|p| p.as_str())
+                .unwrap_or("/");
+            let location = format!("https://{}:{}{}", host, self.tls_port, path);
+
+            info!("HTTP request. Redirecting to {}", location);
+            let mut resp = ResponseHeader::build(301, None)?;
+            resp.insert_header("Location", location)?;
+            resp.insert_header("Connection", "Close")?;
+            resp.insert_header("Content-Length", "0")?;
+            session.write_response_header(Box::new(resp), true).await?;
+            return Ok(true);
+        }
+
+        warn!("HTTP request rejected: missing or unknown Host header.");
+        let mut resp = ResponseHeader::build(400, None)?;
         resp.insert_header("Connection", "Close")?;
         resp.insert_header("Content-Length", "0")?;
         session.write_response_header(Box::new(resp), true).await?;
-        Ok(true) // Stop processing and close the session
+        Ok(true)
     }
 
     async fn upstream_peer(
@@ -912,7 +922,10 @@ fn main() -> pingora::Result<()> {
     );
 
     // Create a separate service for HTTP redirects
-    let mut redirect_service = http_proxy_service(&my_server.configuration, HttpRedirectRouter { tls_port });
+    let mut redirect_service = http_proxy_service(&my_server.configuration, HttpRedirectRouter {
+        tls_port,
+        realm_map: realm_map_swapper.clone(),
+    });
     redirect_service.add_tcp(&redirect_service_listen_addr);
     my_server.add_service(redirect_service);
     info!(
