@@ -784,12 +784,16 @@ fn main() -> pingora::Result<()> {
     env_logger::init();
 
     // Read environment variables
-    let _inventory_url = std::env::var("APIGW_INVENTORY_URL").ok();
-    if let Some(url) = &_inventory_url {
-        info!("APIGW_INVENTORY_URL: {}", url);
-    }
+    let _inventory_url = std::env::var("APIGW_INVENTORY_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
     let gateway_listen_addr = std::env::var("APIGW_TLS_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8443".to_string());
     let redirect_service_listen_addr = std::env::var("APIGW_HTTP_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    info!(
+        "Startup settings:\n\
+        APIGW_INVENTORY_URL: {}\n\
+        APIGW_TLS_BIND_ADDRESS: {}\n\
+        APIGW_HTTP_BIND_ADDRESS: {}",
+        _inventory_url, gateway_listen_addr, redirect_service_listen_addr
+    );
 
     let tls_port = gateway_listen_addr
         .split(':')
