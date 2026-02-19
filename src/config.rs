@@ -120,6 +120,7 @@ pub struct ZoneConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct VirtualHostConfig {
+    pub name: String,
     #[serde(skip)]
     pub hostname: String,
     pub subdomain: String,
@@ -127,6 +128,8 @@ pub struct VirtualHostConfig {
     pub certificate_pem: String,
     #[serde(rename = "key")]
     pub private_key_pem: String,
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 /// PEM-encoded public and private keys for JWT signing.
@@ -148,12 +151,15 @@ pub struct RealmConfig {
     pub virtual_hosts: Vec<VirtualHostConfig>,
     pub routing_chains: Vec<RoutingChainConfig>,
     #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
     pub zones: Vec<ZoneConfig>,
 }
 
 /// Root of the application's configuration.
 #[derive(Debug, Deserialize, Clone)]
 pub struct AppConfig {
+    #[serde(deserialize_with = "deserialize_realms")]
     pub realms: Vec<RealmConfig>,
 }
 
@@ -181,6 +187,33 @@ impl AppConfig {
         Ok(())
     }
 }
+
+fn deserialize_realms<'de, D>(deserializer: D) -> Result<Vec<RealmConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut realms: Vec<RealmConfig> = Vec::deserialize(deserializer)?;
+    realms.retain(|realm| {
+        if realm.disabled {
+            info!("[ConfigLoad] Skipping disabled realm: '{}'", realm.name);
+            false
+        } else {
+            true
+        }
+    });
+    for realm in &mut realms {
+        realm.virtual_hosts.retain(|vhost| {
+            if vhost.disabled {
+                info!("[ConfigLoad] Skipping disabled virtual host: '{}'", vhost.name);
+                false
+            } else {
+                true
+            }
+        });
+    }
+    Ok(realms)
+}
+
 // --- Runtime Data Structures ---
 
 /// Certificate and its corresponding private key.

@@ -385,6 +385,7 @@ realms:
                 2fTpGOkVl1EDqLloqSqSHZ4wXber4lgqnrgo5ts7qYavSimnl0XVmMPynpxiWp31
                 vx2GQEX/+amdfPthcqN4Bm4=
                 -----END PRIVATE KEY-----
+            disabled: true
       routingChains:
           - name: fruit-shop-route
             title: Routing-Chain fruit-shop-route
@@ -664,7 +665,7 @@ realms:
           - admin1dev@example.com
           - admin2@devexample.com
       expiredAt: "not-implemented"
-      disabled: false
+      disabled: true
       zones:
           - name: sr.example.com
             urn: "urn:chip-in:zone:development:sr.example.com"
@@ -742,7 +743,7 @@ realms:
                 UpsNWCA0ddoMNAvH4nSSRYevIvwma3pUTAtNKN+1jFWwrYOiSs8IGzIuVCVaezkI
                 NFYcow6EFowIZP+BuVpJb40=
                 -----END PRIVATE KEY-----
-            disabled: false
+            disabled: true
       routingChains:
           - name: fruit-shop-route
             title: Routing-Chain fruit-shop-route
