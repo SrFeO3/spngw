@@ -46,6 +46,7 @@ use url::Url;
 use crate::GatewayCtx;
 
 pub const HSTS_HEADER_VALUE: &str = "max-age=31536000; includeSubDomains; preload";
+const DEVICE_COOKIE_MAX_AGE: u64 = 60 * 60 * 24 * 365; // 1 year
 
 /// A type alias for a session store, which is a thread-safe map from session IDs to ApplicationSession objects.
 pub type SessionStore = Arc<DashMap<String, Arc<ApplicationSession>>>;
@@ -98,6 +99,7 @@ pub struct ApplicationSession {
     pub oidc_state: Option<String>,
     pub oidc_token_endpoint: Option<String>,
     pub oidc_client_id: Option<String>,
+    pub oidc_client_secret: Option<String>,
     pub auth_scope_name: Option<String>,
     pub auth_original_destination: Option<String>,
 }
@@ -145,6 +147,7 @@ pub enum GatewayAction {
         oidc_redirect_url: Cow<'static, str>,
         oidc_token_endpoint: Cow<'static, str>,
         auth_scope_name: Cow<'static, str>,
+        oidc_client_secret: Option<Cow<'static, str>>,
     },
 }
 
@@ -210,6 +213,7 @@ pub struct RequireAuthenticationRoute {
     pub oidc_redirect_url: Cow<'static, str>,
     pub oidc_token_endpoint: Cow<'static, str>,
     pub auth_scope_name: Cow<'static, str>,
+    pub oidc_client_secret: Option<Cow<'static, str>>,
 }
 
 // Helper function to inject the Authorization header into the upstream request.
@@ -256,11 +260,14 @@ async fn inject_authorization_header_and_token_refresh(
                             refresh_token: Option<String>,
                         }
 
-                        let params = [
+                        let mut params = vec![
                             ("grant_type", "refresh_token"),
-                            ("refresh_token", refresh_token),
-                            ("client_id", client_id),
+                            ("refresh_token", refresh_token.as_str()),
+                            ("client_id", client_id.as_str()),
                         ];
+                        if let Some(secret) = &app_session.oidc_client_secret {
+                            params.push(("client_secret", secret.as_str()));
+                        }
 
                         match client.post(endpoint).form(&params).send().await {
                             Ok(resp) => {
@@ -342,14 +349,22 @@ async fn inject_authorization_header_and_token_refresh(
 
             if let Some(scope) = scope_to_use {
                 if let Some(store) = get_auth_session_store(&ctx.realm_name, scope) {
-                    store.insert(
-                        app_session.session_id.clone(),
-                        Arc::new(app_session.clone()),
-                    );
-                    info!(
-                        "[{}] [{}] Updated session in store after refresh.",
-                        ctx.request_id, action_name
-                    );
+                    if is_token_valid {
+                        store.insert(
+                            app_session.session_id.clone(),
+                            Arc::new(app_session.clone()),
+                        );
+                        info!(
+                            "[{}] [{}] Updated session in store after refresh.",
+                            ctx.request_id, action_name
+                        );
+                    } else {
+                        store.remove(&app_session.session_id);
+                        info!(
+                            "[{}] [{}] Removed session from store due to invalid refresh token.",
+                            ctx.request_id, action_name
+                        );
+                    }
                 }
             } else {
                 warn!(
@@ -385,12 +400,22 @@ impl RouteLogic for ReturnStaticTextRoute {
             _ctx.request_id,
             self.name()
         );
-        let _ = session
-            .respond_error_with_body(
-                self.status_code,
-                Bytes::from(self.content.as_bytes().to_vec()),
-            )
-            .await;
+        // Manually build the response to ensure HSTS header is included.
+        // `session.respond_error_with_body` does not allow for header customization.
+        let body = Bytes::from(self.content.as_bytes().to_vec());
+        let mut header = ResponseHeader::build(self.status_code, None)?;
+        header
+            .insert_header("Content-Length", body.len().to_string())?;
+        // It's good practice to set the Content-Type for static text.
+        header
+            .insert_header("Content-Type", "text/plain; charset=utf-8")?;
+        // Add the HSTS header as this action terminates the request before the global response_filter.
+        header
+            .insert_header("Strict-Transport-Security", HSTS_HEADER_VALUE)?;
+        header.insert_header("Connection", "close")?;
+
+        session.write_response_header(Box::new(header), false).await?;
+        session.write_response_body(Some(body), true).await?;
         // Return true to stop the pipeline and send the response immediately.
         Ok(true)
     }
@@ -479,19 +504,19 @@ impl RouteLogic for ProxyToRoute {
             self.name()
         );
 
-        // Retrieve session information from the APP_COOKIE
+        // Retrieve session information from the CHIPIN_SESSION_ID cookie
         // in case RequireAuthentication has not been executed before this action.
         if ctx.action_state_app_session.is_none() {
             if let Some(scope_name) = &self.auth_scope_name {
                 info!(
-                    "[{}] [{}] No app_session in context, attempting to load from APP_COOKIE for scope: {}",
+                    "[{}] [{}] No app_session in context, attempting to load from CHIPIN_SESSION_ID for scope: {}",
                     ctx.request_id,
                     self.name(),
                     scope_name
                 );
                 // Get the session store for the specified scope.
                 if let Some(session_store) = get_auth_session_store(&ctx.realm_name, scope_name) {
-                    let cookie_name = format!("APP_COOKIE_{}", scope_name.to_uppercase());
+                    let cookie_name = format!("CHIPIN_SESSION_ID_{}", scope_name.to_uppercase());
                     // Extract the session ID from the cookie header.
                     let app_session_opt = _session
                         .req_header()
@@ -556,22 +581,22 @@ impl RouteLogic for IssueDeviceCookieRoute {
                 cookies_str.split(';').find_map(|cookie| {
                     cookie
                         .trim()
-                        .strip_prefix("DEV_COOKIE=")
+                        .strip_prefix("CHIPIN_DEVICE_CONTEXT=")
                         .map(str::to_string)
                 })
             });
 
         // Attempt to validate the cookie if it exists.
         let is_cookie_valid = if let Some(token) = dev_cookie_value {
-            // For simplicity, we still use the first realm's key.
-            // A real implementation would select the key based on the request's realm.
-            let key = match ctx.jwt_keys.keys_by_realm.iter().next() {
+            // Use the key corresponding to the current realm.
+            let key = match ctx.jwt_keys.keys_by_realm.get(&ctx.realm_name) {
                 Some(entry) => entry.value().clone(),
                 None => {
                     warn!(
-                        "[{}] [{}] No JWT keys found in cache.",
+                        "[{}] [{}] No JWT keys found in cache for realm: {}.",
                         ctx.request_id,
-                        self.name()
+                        self.name(),
+                        ctx.realm_name
                     );
                     return Ok(false); // Cannot validate, treat as invalid.
                 }
@@ -585,7 +610,7 @@ impl RouteLogic for IssueDeviceCookieRoute {
                 Ok(token_data) => {
                     let claims = token_data.claims;
                     info!(
-                        "[{}] [{}] Successfully validated DEV_COOKIE JWT. iss: {}, sub: {}, cn: {}, iat: {}, exp: {}",
+                        "[{}] [{}] Successfully validated CHIPIN_DEVICE_CONTEXT JWT. iss: {}, sub: {}, cn: {}, iat: {}, exp: {}",
                         ctx.request_id,
                         self.name(),
                         claims.iss,
@@ -594,11 +619,56 @@ impl RouteLogic for IssueDeviceCookieRoute {
                         claims.iat,
                         claims.exp
                     );
+
+                    // Check if the cookie needs to be refreshed (50% of life passed)
+                    let now_ts = Utc::now().timestamp() as u64;
+                    let total_duration = claims.exp.saturating_sub(claims.iat);
+                    let elapsed = now_ts.saturating_sub(claims.iat);
+
+                    if elapsed > total_duration / 2 {
+                        info!(
+                            "[{}] [{}] CHIPIN_DEVICE_CONTEXT passed 50% of life ({}s / {}s). Refreshing.",
+                            ctx.request_id,
+                            self.name(),
+                            elapsed,
+                            total_duration
+                        );
+
+                        let new_claims = DeviceContext {
+                            iss: claims.iss,
+                            sub: claims.sub,
+                            cn: claims.cn,
+                            iat: now_ts,
+                            exp: now_ts + DEVICE_COOKIE_MAX_AGE,
+                        };
+
+                        let encoding_key = EncodingKey::from_rsa_pem(&key.private_key_pem)
+                            .expect("Failed to create encoding key from PEM");
+
+                        match encode(
+                            &Header::new(jsonwebtoken::Algorithm::RS256),
+                            &new_claims,
+                            &encoding_key,
+                        ) {
+                            Ok(new_token) => {
+                                ctx.action_state_new_dev_cookie = Some(new_token);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "[{}] [{}] Failed to refresh device cookie: {}",
+                                    ctx.request_id,
+                                    self.name(),
+                                    e
+                                );
+                            }
+                        }
+                    }
+
                     true // The cookie is valid.
                 }
                 Err(e) => {
                     warn!(
-                        "[{}] [{}] Failed to validate DEV_COOKIE JWT: {}. A new cookie will be issued.",
+                        "[{}] [{}] Failed to validate CHIPIN_DEVICE_CONTEXT JWT: {}. A new cookie will be issued.",
                         ctx.request_id,
                         self.name(),
                         e
@@ -613,7 +683,7 @@ impl RouteLogic for IssueDeviceCookieRoute {
         // If the cookie is not valid (or doesn't exist), generate a new one.
         if !is_cookie_valid {
             info!(
-                "[{}] [{}] Issuing a new DEV_COOKIE.",
+                "[{}] [{}] Issuing a new CHIPIN_DEVICE_CONTEXT.",
                 ctx.request_id,
                 self.name()
             );
@@ -627,16 +697,17 @@ impl RouteLogic for IssueDeviceCookieRoute {
                 sub,
                 cn: "My New Device".to_string(),
                 iat: now_ts,
-                exp: now_ts + (60 * 60 * 24 * 365), // 1 year expiration
+                exp: now_ts + DEVICE_COOKIE_MAX_AGE,
             };
-            // For simplicity, we still use the first realm's key for signing.
-            let key = match ctx.jwt_keys.keys_by_realm.iter().next() {
+            // Use the key corresponding to the current realm for signing.
+            let key = match ctx.jwt_keys.keys_by_realm.get(&ctx.realm_name) {
                 Some(entry) => entry.value().clone(),
                 None => {
                     warn!(
-                        "[{}] [{}] No JWT keys found in cache for signing.",
+                        "[{}] [{}] No JWT keys found in cache for signing (realm: {}).",
                         ctx.request_id,
-                        self.name()
+                        self.name(),
+                        ctx.realm_name
                     );
                     let err = Error::new(ErrorType::InternalError);
                     return Err(err);
@@ -673,14 +744,13 @@ impl RouteLogic for IssueDeviceCookieRoute {
         );
         if let Some(new_cookie_value) = &ctx.action_state_new_dev_cookie {
             info!(
-                "[{}] [{}] Setting new DEV_COOKIE in response.",
+                "[{}] [{}] Setting new CHIPIN_DEVICE_CONTEXT in response.",
                 ctx.request_id,
                 self.name()
             );
-            let max_age_seconds = 60 * 60 * 24 * 365; // 1 year
             let cookie_value = format!(
-                "DEV_COOKIE={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict",
-                new_cookie_value, max_age_seconds
+                "CHIPIN_DEVICE_CONTEXT={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict",
+                new_cookie_value, DEVICE_COOKIE_MAX_AGE
             );
             response.append_header("Set-Cookie", cookie_value).unwrap();
         }
@@ -795,7 +865,7 @@ impl RouteLogic for RequireAuthenticationRoute {
         let mut session_found = false;
         let mut app_session_opt: Option<ApplicationSession> = None;
 
-        let cookie_name = format!("APP_COOKIE_{}", self.auth_scope_name.to_uppercase());
+        let cookie_name = format!("CHIPIN_SESSION_ID_{}", self.auth_scope_name.to_uppercase());
         if let Some(cookie_header) = session.req_header().headers.get("Cookie") {
             if let Ok(cookies) = cookie_header.to_str() {
                 for cookie in cookies.split(';') {
@@ -859,6 +929,7 @@ impl RouteLogic for RequireAuthenticationRoute {
                 oidc_state: None,
                 oidc_token_endpoint: Some(self.oidc_token_endpoint.to_string()),
                 oidc_client_id: Some(self.oidc_client_id.to_string()),
+                oidc_client_secret: self.oidc_client_secret.as_ref().map(|s| s.to_string()),
                 auth_scope_name: Some(self.auth_scope_name.to_string()),
                 auth_original_destination: None,
             };
@@ -957,6 +1028,12 @@ impl RouteLogic for RequireAuthenticationRoute {
                     refresh_token: Option<String>,
                 }
 
+                #[derive(Deserialize, Debug)]
+                struct OidcDiscovery {
+                    issuer: String,
+                    jwks_uri: String,
+                }
+
                 // 2. Exchange the authorization code for an access token and ID token.
                 let pkce_verifier = match ctx
                     .action_state_app_session
@@ -976,15 +1053,19 @@ impl RouteLogic for RequireAuthenticationRoute {
                 };
 
                 let client = reqwest::Client::new();
+                let mut token_params = vec![
+                    ("grant_type", "authorization_code"),
+                    ("code", code.as_str()),
+                    ("redirect_uri", self.oidc_redirect_url.as_ref()),
+                    ("client_id", self.oidc_client_id.as_ref()),
+                    ("code_verifier", pkce_verifier.as_str()),
+                ];
+                if let Some(secret) = &self.oidc_client_secret {
+                    token_params.push(("client_secret", secret.as_ref()));
+                }
                 let response = client
                     .post(self.oidc_token_endpoint.as_ref())
-                    .form(&[
-                        ("grant_type", "authorization_code"),
-                        ("code", &code),
-                        ("redirect_uri", self.oidc_redirect_url.as_ref()),
-                        ("client_id", self.oidc_client_id.as_ref()),
-                        ("code_verifier", &pkce_verifier),
-                    ])
+                    .form(&token_params)
                     .send()
                     .await
                     .map_err(|e| {
@@ -1038,53 +1119,65 @@ impl RouteLogic for RequireAuthenticationRoute {
                 // 3. Validate the received ID token (signature, issuer, audience, nonce, expiration).
                 let id_token = &tokens.id_token;
 
-                // ToDo: JWKS should be retrieved from /.well-known/openid-configuration.
-                // Fetch JWKS from the OIDC provider. Using `Url::join` is more robust
-                // than string concatenation as it correctly handles path resolution.
-                let mut base_url =
+                // Fetch OIDC configuration (Discovery) to get JWKS URI and Issuer.
+                // We attempt to find the discovery document relative to the token endpoint.
+                // Heuristic: Assume the token endpoint is something like `.../token` or `.../oauth2/v1/token`.
+                // We try to go up one level and look for `.well-known/openid-configuration`.
+                let token_endpoint_url =
                     Url::parse(self.oidc_token_endpoint.as_ref()).map_err(|e| {
                         warn!(
-                            "[{}] [{}] Invalid OIDC token endpoint URL for JWKS discovery: {}",
+                            "[{}] [{}] Invalid OIDC token endpoint URL: {}",
                             ctx.request_id,
                             self.name(),
                             e
                         );
                         Error::new(ErrorType::InternalError)
                     })?;
-                base_url.set_path(""); // Keep only the origin (scheme, host, port)
-                let jwks_uri = base_url.join("/jwks.json").map_err(|e| {
+
+                let discovery_url = token_endpoint_url
+                    .join("../.well-known/openid-configuration")
+                    .map_err(|e| {
+                        warn!(
+                            "[{}] [{}] Failed to construct OIDC discovery URL: {}",
+                            ctx.request_id,
+                            self.name(),
+                            e
+                        );
+                        Error::new(ErrorType::InternalError)
+                    })?;
+
+                let discovery_resp = client.get(discovery_url.clone()).send().await.map_err(|e| {
                     warn!(
-                        "[{}] [{}] Failed to construct JWKS URI from base '{}': {}",
+                        "[{}] [{}] Failed to fetch OIDC discovery from {}: {}",
                         ctx.request_id,
                         self.name(),
-                        base_url,
+                        discovery_url,
                         e
                     );
                     Error::new(ErrorType::InternalError)
                 })?;
 
-                let jwks_response = client.get(jwks_uri.as_ref()).send().await.map_err(|e| {
+                let oidc_config: OidcDiscovery = discovery_resp.json().await.map_err(|e| {
+                    warn!(
+                        "[{}] [{}] Failed to parse OIDC discovery response: {}",
+                        ctx.request_id,
+                        self.name(),
+                        e
+                    );
+                    Error::new(ErrorType::InternalError)
+                })?;
+
+                // Fetch JWKS using the URI from discovery
+                let jwks_response = client.get(&oidc_config.jwks_uri).send().await.map_err(|e| {
                     warn!(
                         "[{}] [{}] Failed to fetch JWKS from {}: {}",
                         ctx.request_id,
                         self.name(),
-                        jwks_uri,
+                        oidc_config.jwks_uri,
                         e
                     );
                     Error::new(ErrorType::InternalError)
                 })?;
-
-                if !jwks_response.status().is_success() {
-                    warn!(
-                        "[{}] [{}] Failed to fetch JWKS from {}, Status: {}",
-                        ctx.request_id,
-                        self.name(),
-                        jwks_uri,
-                        jwks_response.status()
-                    );
-                    let _ = session.respond_error(502).await; // Bad Gateway
-                    return Ok(true);
-                }
 
                 let jwks_text = jwks_response.text().await.map_err(|e| {
                     warn!(
@@ -1115,21 +1208,8 @@ impl RouteLogic for RequireAuthenticationRoute {
                 let mut validation = Validation::new(jsonwebtoken::Algorithm::RS256); // Assuming RS256 for OIDC
                 validation.set_audience(&[self.oidc_client_id.as_ref()]);
 
-                // The issuer should be the base URL of the OIDC provider, typically derived from oidc_authorization_endpoint
-                let expected_issuer = Url::parse(self.oidc_authorization_endpoint.as_ref())
-                    .map_err(|e| {
-                        warn!(
-                            "[{}] [{}] Invalid OIDC login URL for issuer check: {}",
-                            ctx.request_id,
-                            self.name(),
-                            e
-                        );
-                        Error::new(ErrorType::InternalError)
-                    })?
-                    .origin()
-                    .ascii_serialization(); // Get the origin (scheme, host, port) as issuer
-
-                validation.set_issuer(&[expected_issuer.as_str()]);
+                // Use the issuer from the discovery document
+                validation.set_issuer(&[oidc_config.issuer]);
 
                 if let Some(_stored_nonce) = ctx
                     .action_state_app_session
@@ -1219,9 +1299,8 @@ impl RouteLogic for RequireAuthenticationRoute {
                             stored_nonce,
                             token_nonce
                         );
-                        // !! SKIP NOUNCE CHECK !!
-                        //let _ = session.respond_error(401).await; // Unauthorized
-                        //return Ok(true);
+                        let _ = session.respond_error(401).await; // Unauthorized
+                        return Ok(true);
                     }
                 }
 
@@ -1250,6 +1329,11 @@ impl RouteLogic for RequireAuthenticationRoute {
                     .and_then(|v| v.as_str())
                     .unwrap_or("Unknown")
                     .to_string();
+
+                // Clear OIDC state from session as it is no longer needed
+                app_session.oidc_nonce = None;
+                app_session.oidc_pkce_verifier = None;
+                app_session.oidc_state = None;
 
                 // Update the session in the central store
                 session_store.insert(
@@ -1367,14 +1451,14 @@ impl RouteLogic for RequireAuthenticationRoute {
             let mut header = ResponseHeader::build(302, None).unwrap();
             header.insert_header("Location", auth_url.as_str()).unwrap();
 
-            // Set the APP_COOKIE here because the response_filter will not be called on redirect.
+            // Set the CHIPIN_SESSION_ID here because the response_filter will not be called on redirect.
             if let Some((new_cookie_value, scope_name)) = &ctx.action_state_new_app_session_cookie {
                 info!(
-                    "[{}] [{}] Setting new APP_COOKIE in redirect response.",
+                    "[{}] [{}] Setting new CHIPIN_SESSION_ID in redirect response.",
                     ctx.request_id,
                     self.name()
                 );
-                let cookie_name = format!("APP_COOKIE_{}", scope_name.to_uppercase());
+                let cookie_name = format!("CHIPIN_SESSION_ID_{}", scope_name.to_uppercase());
                 let cookie_value = format!(
                     "{}={}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax",
                     cookie_name, new_cookie_value
@@ -1497,11 +1581,11 @@ impl RouteLogic for RequireAuthenticationRoute {
     ) -> Result<()> {
         if let Some((new_cookie_value, scope_name)) = &ctx.action_state_new_app_session_cookie {
             info!(
-                "[{}] [{}] Setting new APP_COOKIE in response.",
+                "[{}] [{}] Setting new CHIPIN_SESSION_ID in response.",
                 ctx.request_id,
                 self.name()
             );
-            let cookie_name = format!("APP_COOKIE_{}", scope_name.to_uppercase());
+            let cookie_name = format!("CHIPIN_SESSION_ID_{}", scope_name.to_uppercase());
             let cookie_value = format!(
                 "{}={}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax",
                 cookie_name, new_cookie_value

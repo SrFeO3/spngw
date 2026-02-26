@@ -78,6 +78,7 @@ pub enum ActionConfig {
         oidc_redirect_url: String,
         oidc_token_endpoint: String,
         auth_scope_name: String,
+        oidc_client_secret: Option<String>,
     },
 }
 

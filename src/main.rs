@@ -135,8 +135,7 @@ impl ProxyHttp for GatewayRouter {
         //
         let sni_opt = session
             .stream()
-            .unwrap()
-            .get_ssl()
+            .and_then(|s| s.get_ssl())
             .and_then(|ssl| ssl.ex_data(self.sni_ex_data_index));
         let sni: Option<String> = sni_opt.and_then(|s| s.as_deref().map(String::from));
         let front_sni_name = match sni.as_deref() {
@@ -244,6 +243,7 @@ impl ProxyHttp for GatewayRouter {
                     "[{}] Using routing_chain '{}' for request",
                     ctx.request_id, chain.name
                 );
+                let sni_str = ctx.front_sni_name.as_deref().unwrap_or("");
                 for rule in &chain.rules {
                     let is_match = if rule.match_expr.contains(" and ") {
                         // Handle 'and' conditions
@@ -256,13 +256,13 @@ impl ProxyHttp for GatewayRouter {
                             // A more robust solution would parse them regardless of order.
                             let match1 = evaluate_single_expr(
                                 part1,
-                                &ctx.front_sni_name.clone().expect("").to_string(), // !!!
+                                sni_str,
                                 path,
                                 &ctx.request_id,
                             );
                             let match2 = evaluate_single_expr(
                                 part2,
-                                &ctx.front_sni_name.clone().expect("").to_string(), // !!!
+                                sni_str,
                                 path,
                                 &ctx.request_id,
                             );
@@ -279,7 +279,7 @@ impl ProxyHttp for GatewayRouter {
                         // Handle single conditions
                         evaluate_single_expr(
                             &rule.match_expr,
-                            &ctx.front_sni_name.clone().expect("").to_string(), // !!!
+                            sni_str,
                             path,
                             &ctx.request_id,
                         )
@@ -326,6 +326,7 @@ impl ProxyHttp for GatewayRouter {
                                 oidc_redirect_url,
                                 oidc_token_endpoint,
                                 auth_scope_name,
+                                oidc_client_secret,
                             } => GatewayAction::RequireAuthentication {
                                 protected_upstream: protected_upstream.clone().into(),
                                 oidc_authorization_endpoint: oidc_authorization_endpoint.clone().into(),
@@ -333,6 +334,7 @@ impl ProxyHttp for GatewayRouter {
                                 oidc_redirect_url: oidc_redirect_url.clone().into(),
                                 oidc_token_endpoint: oidc_token_endpoint.clone().into(),
                                 auth_scope_name: auth_scope_name.clone().into(),
+                                oidc_client_secret: oidc_client_secret.clone().map(|s| s.into()),
                             },
                         };
                         ctx.action_pipeline.push(action);
@@ -387,6 +389,7 @@ impl ProxyHttp for GatewayRouter {
                     oidc_redirect_url,
                     oidc_token_endpoint,
                     auth_scope_name,
+                    oidc_client_secret,
                 } => {
                     let logic = actions::RequireAuthenticationRoute {
                         protected_upstream,
@@ -395,6 +398,7 @@ impl ProxyHttp for GatewayRouter {
                         oidc_redirect_url,
                         oidc_token_endpoint,
                         auth_scope_name,
+                        oidc_client_secret,
                     };
                     logic
                         .request_filter_and_prepare_upstream_peer(session, ctx)
@@ -513,6 +517,7 @@ impl ProxyHttp for GatewayRouter {
                     oidc_redirect_url,
                     oidc_token_endpoint,
                     auth_scope_name,
+                    oidc_client_secret,
                 } => {
                     let logic = actions::RequireAuthenticationRoute {
                         protected_upstream,
@@ -521,6 +526,7 @@ impl ProxyHttp for GatewayRouter {
                         oidc_redirect_url,
                         oidc_token_endpoint,
                         auth_scope_name,
+                        oidc_client_secret,
                     };
                     logic
                         .upstream_request_filter(session, upstream_request, ctx)
@@ -609,6 +615,7 @@ impl ProxyHttp for GatewayRouter {
                     oidc_redirect_url,
                     oidc_token_endpoint,
                     auth_scope_name,
+                    oidc_client_secret,
                 } => {
                     let logic = actions::RequireAuthenticationRoute {
                         protected_upstream: protected_upstream.clone(),
@@ -617,6 +624,7 @@ impl ProxyHttp for GatewayRouter {
                         oidc_redirect_url: oidc_redirect_url.clone(),
                         oidc_token_endpoint: oidc_token_endpoint.clone(),
                         auth_scope_name: auth_scope_name.clone(),
+                        oidc_client_secret: oidc_client_secret.clone(),
                     };
                     logic.response_filter(session, response, ctx).await
                 }
