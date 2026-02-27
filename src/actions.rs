@@ -748,10 +748,13 @@ impl RouteLogic for IssueDeviceCookieRoute {
                 ctx.request_id,
                 self.name()
             );
-            let cookie_value = format!(
+            let mut cookie_value = format!(
                 "CHIPIN_DEVICE_CONTEXT={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict",
                 new_cookie_value, DEVICE_COOKIE_MAX_AGE
             );
+            if let Some(domain) = &ctx.cookie_domain {
+                cookie_value.push_str(&format!("; Domain={}", domain));
+            }
             response.append_header("Set-Cookie", cookie_value).unwrap();
         }
         Ok(())
@@ -1459,10 +1462,13 @@ impl RouteLogic for RequireAuthenticationRoute {
                     self.name()
                 );
                 let cookie_name = format!("CHIPIN_SESSION_ID_{}", scope_name.to_uppercase());
-                let cookie_value = format!(
+                let mut cookie_value = format!(
                     "{}={}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax",
                     cookie_name, new_cookie_value
                 );
+                if let Some(domain) = &ctx.cookie_domain {
+                    cookie_value.push_str(&format!("; Domain={}", domain));
+                }
                 // Use `append_header` in case other cookies (like DEV_COOKIE) are also being set.
                 header.append_header("Set-Cookie", cookie_value).unwrap();
             }
@@ -1586,10 +1592,13 @@ impl RouteLogic for RequireAuthenticationRoute {
                 self.name()
             );
             let cookie_name = format!("CHIPIN_SESSION_ID_{}", scope_name.to_uppercase());
-            let cookie_value = format!(
+            let mut cookie_value = format!(
                 "{}={}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax",
                 cookie_name, new_cookie_value
             );
+            if let Some(domain) = &ctx.cookie_domain {
+                cookie_value.push_str(&format!("; Domain={}", domain));
+            }
             response.append_header("Set-Cookie", cookie_value).unwrap();
         }
 

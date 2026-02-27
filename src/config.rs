@@ -105,8 +105,15 @@ pub struct RoutingChainConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SubdomainConfig {
+    pub _name: String,
     pub urn: String,
+    #[serde(default)]
+    pub _title: String,
+    #[serde(default)]
+    pub _description: String,
     pub fqdn: String,
+    #[serde(default)]
+    pub share_cookie: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -114,6 +121,12 @@ pub struct SubdomainConfig {
 pub struct ZoneConfig {
     pub _name: String,
     pub _urn: String,
+    #[serde(default)]
+    pub _title: String,
+    #[serde(default)]
+    pub _description: String,
+    pub _dns_provider: Option<String>,
+    pub _acme_certificate_provider: Option<String>,
     pub subdomains: Vec<SubdomainConfig>,
 }
 
@@ -123,7 +136,7 @@ pub struct ZoneConfig {
 pub struct VirtualHostConfig {
     pub name: String,
     #[serde(skip)]
-    pub hostname: String,
+    pub hostname: String, // This is resolved from `subdomain` URN later
     pub subdomain: String,
     #[serde(rename = "certificate")]
     pub certificate_pem: String,
@@ -147,14 +160,30 @@ pub struct JwtKeyPairConfig {
 #[serde(rename_all = "camelCase")]
 pub struct RealmConfig {
     pub name: String,
+    #[serde(default)]
+    pub _urn: String,
+    #[serde(default)]
+    pub _title: String,
+    #[serde(default)]
+    pub _description: String,
     #[serde(flatten)]
     pub jwt_key_pair: JwtKeyPairConfig, // Flatten the keys directly into the realm
+    #[serde(default)]
+    pub _cacert: String,
+    #[serde(default)]
+    pub _session_timeout: u64,
+    #[serde(default)]
+    pub _administrators: Vec<String>,
+    #[serde(default)]
+    pub _expired_at: String,
     pub virtual_hosts: Vec<VirtualHostConfig>,
     pub routing_chains: Vec<RoutingChainConfig>,
     #[serde(default)]
     pub disabled: bool,
     #[serde(default)]
     pub zones: Vec<ZoneConfig>,
+    #[serde(default)]
+    pub _hubs: Vec<serde_json::Value>, // Using Value as Hubs/Services are not used yet
 }
 
 /// Root of the application's configuration.

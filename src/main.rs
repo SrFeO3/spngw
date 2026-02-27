@@ -96,6 +96,8 @@ struct GatewayCtx {
     action_state_new_app_session_cookie: Option<(String, String)>, // (value, scope_name)
     // Set by RequireAuthentication action
     action_state_app_session: Option<actions::ApplicationSession>,
+    // The domain to set on cookies, if share_cookie is enabled.
+    pub cookie_domain: Option<String>,
 }
 
 #[async_trait]
@@ -120,6 +122,7 @@ impl ProxyHttp for GatewayRouter {
             action_state_new_dev_cookie: None,
             action_state_new_app_session_cookie: None,
             action_state_app_session: None,
+            cookie_domain: None,
         }
     }
 
@@ -157,6 +160,29 @@ impl ProxyHttp for GatewayRouter {
                 return Ok(true);
             }
         };
+
+        // Verify that the HTTP Host header matches the SNI, as per the specification.
+        let host_header_val = session
+            .get_header("Host")
+            .and_then(|h| h.to_str().ok())
+            .map(|h| h.split(':').next().unwrap_or(h));
+
+        if host_header_val != Some(front_sni_name.as_str()) {
+            warn!(
+                "[{}] Host header ({:?}) does not match SNI ({}). Rejecting request.",
+                ctx.request_id,
+                host_header_val.unwrap_or(""),
+                front_sni_name
+            );
+            let body = "Host header does not match SNI.";
+            let mut resp = ResponseHeader::build(400, None)?;
+            resp.insert_header("Content-Type", "text/plain")?;
+            resp.insert_header("Content-Length", body.len().to_string())?;
+            resp.insert_header("Connection", "Close")?;
+            session.write_response_header(Box::new(resp), false).await?;
+            session.write_response_body(Some(Bytes::from(body)), true).await?;
+            return Ok(true);
+        }
         ctx.front_sni_name = Some(front_sni_name);
 
         // Determine Realm for this request.
@@ -178,6 +204,27 @@ impl ProxyHttp for GatewayRouter {
                 .position(|r| r.name == ctx.realm_name)
                 .unwrap_or(0); // Should be safe if map is consistent with config
             ctx.realm_index = Some(index);
+
+            // Resolve Cookie Domain if share_cookie is enabled
+            let realm_config = &app_config.realms[index];
+            if let Some(sni) = &ctx.front_sni_name {
+                if let Some(vhost) = realm_config
+                    .virtual_hosts
+                    .iter()
+                    .find(|vh| &vh.hostname == sni)
+                {
+                    for zone in &realm_config.zones {
+                        if let Some(subdomain) =
+                            zone.subdomains.iter().find(|sd| sd.urn == vhost.subdomain)
+                        {
+                            if subdomain.share_cookie {
+                                ctx.cookie_domain = Some(subdomain.fqdn.clone());
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
         } else {
             warn!("[{}] No realm found", ctx.request_id);
             let body = "SNI not registered.";
