@@ -228,6 +228,18 @@ async fn inject_authorization_header_and_token_refresh(
 ) -> bool {
     let mut is_token_valid = true;
     if let Some(app_session) = &mut ctx.action_state_app_session {
+        // Prevent mixing sessions from different scopes.
+        // If the action specifies a scope, and the session has a scope, they must match.
+        if let (Some(req_scope), Some(session_scope)) = (fallback_auth_scope_name, &app_session.auth_scope_name) {
+            if req_scope != session_scope.as_str() {
+                warn!(
+                    "[{}] [{}] Scope mismatch: required='{}', found='{}'. Skipping token injection.",
+                    ctx.request_id, action_name, req_scope, session_scope
+                );
+                return true;
+            }
+        }
+
         let mut session_needs_update = false;
         if app_session.is_authenticated {
             let now = Utc::now().timestamp() as u64;
