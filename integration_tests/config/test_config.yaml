@@ -1,0 +1,12 @@
+bff:
+    base_url: "https://127.0.0.1:8443"
+    timeout: 5
+
+mock:
+    simple_server: "http://127.0.0.1:9000"
+    broken_server: "http://127.0.0.1:9100"
+
+oidc:
+    issuer: "http://127.0.0.1:9090"
+    client_id: "test-client"
+    client_secret: "secret"
