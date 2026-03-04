@@ -33,24 +33,35 @@
 use std::collections::HashSet;
 use std::fs;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use jsonwebtoken::{DecodingKey, EncodingKey};
-use log::{info, warn};
+use futures::future::join_all;
+use log::{error, info, warn};
 use pingora::prelude::*;
 use pingora::services::background::BackgroundService;
 use pingora::tls::pkey::Private;
-use serde::Deserialize;
-
+use jsonwebtoken::{DecodingKey, EncodingKey};
+use serde::{Deserialize, Serialize};
 use crate::actions;
+use tokio::{self, signal::unix::{signal, SignalKind}};
 
-pub const CONFIG_PATH: &str = "conf/config.yaml";
+/// Helper struct to deserialize the realm list from the inventory server.
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct ApiRealm {
+    name: String,
+    #[serde(default)]
+    disabled: bool,
+    #[serde(rename = "deviceIdVerificationKey")]
+    public_key_pem: String,
+    #[serde(rename = "deviceIdSigningKey")]
+    private_key_pem: String,
+}
 
 /// Rule that matches a request and specifies an action to perform.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct RuleConfig {
     #[serde(rename = "match")]
     pub match_expr: String,
@@ -58,7 +69,7 @@ pub struct RuleConfig {
 }
 
 /// Routing rules that are evaluated sequentially.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RoutingChainConfig {
     pub name: String,
@@ -66,10 +77,11 @@ pub struct RoutingChainConfig {
     pub _title: String,
     #[serde(default)]
     pub _description: String,
+    #[serde(default)]
     pub rules: Vec<RuleConfig>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SubdomainConfig {
     pub _name: String,
@@ -83,7 +95,7 @@ pub struct SubdomainConfig {
     pub share_cookie: bool,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ZoneConfig {
     pub _name: String,
@@ -94,11 +106,12 @@ pub struct ZoneConfig {
     pub _description: String,
     pub _dns_provider: Option<String>,
     pub _acme_certificate_provider: Option<String>,
+    #[serde(default)]
     pub subdomains: Vec<SubdomainConfig>,
 }
 
 /// Virtual host, which maps a hostname to a specific TLS certificate.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VirtualHostConfig {
     pub name: String,
@@ -114,7 +127,7 @@ pub struct VirtualHostConfig {
 }
 
 /// PEM-encoded public and private keys for JWT signing.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct JwtKeyPairConfig {
     #[serde(rename = "deviceIdVerificationKey")]
     pub public_key_pem: String,
@@ -123,7 +136,7 @@ pub struct JwtKeyPairConfig {
 }
 
 /// Realm, which groups together a set of virtual hosts and routing rules.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RealmConfig {
     pub name: String,
@@ -154,7 +167,7 @@ pub struct RealmConfig {
 }
 
 /// Root of the application's configuration.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone, Serialize)]
 pub struct AppConfig {
     #[serde(deserialize_with = "deserialize_realms")]
     pub realms: Vec<RealmConfig>,
@@ -439,7 +452,7 @@ impl UpstreamCache {
 
         // 1. Add new peers that are not in the current cache, on a per-realm basis.
         for realm in &app_config.realms {
-            let mut realm_addrs = HashSet::new();
+            let mut realm_addrs: HashSet<Arc<str>> = HashSet::new();
             for chain in &realm.routing_chains {
                 for rule in &chain.rules {
                     if let Some(addr) = match rule.action.as_ref() {
@@ -502,6 +515,7 @@ impl AuthScopeRegistry {
     /// - Existing, unchanged scopes are not touched, preserving their session stores.
     pub fn reload_from_config(config: &Arc<AppConfig>) {
         let mut all_required_scopes = HashSet::new();
+        let stores = actions::get_all_auth_session_stores();
 
         // 1. Register all scopes from the new config, on a per-realm basis.
         // `register_auth_scope` is idempotent, so it's safe to call for existing scopes.
@@ -514,11 +528,14 @@ impl AuthScopeRegistry {
                     {
                         if all_required_scopes.insert((realm.name.clone(), auth_scope_name.clone()))
                         {
-                            // Only log on the first encounter of a scope.
-                            info!(
-                                "[ConfigReload] Realm '{}': Registering new auth scope if not present: '{}'",
-                                realm.name, auth_scope_name
-                            );
+                            // Only log if the scope is actually new (not in the global store).
+                            let key = format!("{}_{}", realm.name, auth_scope_name);
+                            if !stores.contains_key(&key) {
+                                info!(
+                                    "[ConfigReload] Realm '{}': Registering new auth scope: '{}'",
+                                    realm.name, auth_scope_name
+                                );
+                            }
                         }
                         actions::register_auth_scope(&realm.name, auth_scope_name);
                     }
@@ -527,7 +544,6 @@ impl AuthScopeRegistry {
         }
 
         // 2. Remove scopes that are no longer in the new configuration.
-        let stores = actions::get_all_auth_session_stores();
         stores.retain(|realm_scope_key, _| {
             // Note: This is a simple check. It doesn't handle renaming gracefully.
             if !all_required_scopes
@@ -546,110 +562,302 @@ impl AuthScopeRegistry {
     }
 }
 
-pub fn load_app_config() -> Arc<AppConfig> {
-    // In a real application, you might use command-line arguments or environment variables
-    // to determine which configuration file to load.
-    let config_str = fs::read_to_string(CONFIG_PATH)
-        .unwrap_or_else(|e| panic!("Failed to read configuration from {}: {}", CONFIG_PATH, e));
-    let mut config: AppConfig = serde_yaml::from_str(&config_str)
-        .unwrap_or_else(|e| panic!("Failed to parse configuration from {}: {}", CONFIG_PATH, e));
-    if let Err(e) = config.resolve_hostnames() {
-        panic!("Failed to resolve hostnames: {}", e);
+/// Populates or reloads all caches from a given application configuration.
+/// This function centralizes the cache update logic for both initial load and hot reloads.
+pub fn populate_caches_from_config(
+    app_config: &Arc<AppConfig>,
+    keys_cache: &JwtKeysCache,
+    cert_cache: &CertificateCache,
+    upstream_cache: &UpstreamCache,
+    realm_map: &RealmMap,
+) {
+    // JWT Keys Reload
+    JwtKeysCache::reload_from_config(app_config, keys_cache);
+    // Certificate Cache Reload
+    CertificateCache::reload_from_config(app_config, cert_cache);
+    // Upstream Cache Reload
+    UpstreamCache::reload_from_config(app_config, upstream_cache);
+    // Realm Map Reload
+    RealmMap::reload_from_config(app_config, realm_map);
+    // Auth Scopes Reload
+    AuthScopeRegistry::reload_from_config(app_config);
+
+    // Log a summary of the loaded routing rules for verification.
+    for realm in &app_config.realms {
+        info!("[Config] Verifying rules for realm: '{}'", realm.name);
+        for chain in &realm.routing_chains {
+            info!("[Config]   Chain: '{}'", chain.name);
+            if chain.rules.is_empty() {
+                info!("[Config]     -> No rules configured.");
+            } else {
+                for (i, rule) in chain.rules.iter().enumerate() {
+                    info!(
+                        "[Config]     -> Rule {}: match '{}' -> action: {:?}",
+                        i + 1,
+                        rule.match_expr,
+                        rule.action
+                    );
+                }
+            }
+        }
     }
-    Arc::new(config)
+
+    info!("[Config] All caches have been populated from the configuration.");
+}
+
+/// Fetches configuration from multiple repository API endpoints and constructs the AppConfig.
+async fn fetch_config_from_url(url: &str) -> Result<(AppConfig, String), Box<dyn std::error::Error + Send + Sync>> {
+    // Helper to fetch and deserialize JSON from a URL, with enhanced error reporting.
+    async fn fetch_and_deserialize<T: serde::de::DeserializeOwned + Default>(client: &reqwest::Client, url: &str) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
+        info!("Fetching from {}", url);
+        let response = client.get(url).send().await.map_err(|e| format!("Network error while fetching from {}: {}", url, e))?;
+        // Handle 404 Not Found gracefully by returning a default (empty) value.
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            warn!("API endpoint not found (404): {}. Assuming empty collection.", url);
+            return Ok(T::default());
+        }
+        let status = response.status();
+        if !status.is_success() {
+            let body_text = response.text().await.unwrap_or_else(|_| "<failed to read body>".to_string());
+            error!("API at {} returned error status {}: {}", url, status, &body_text);
+            return Err(format!("API error for {}: status {}" , url, status).into());
+        }
+
+        // Read body as text first to handle cases where the API might return an empty body for an empty list.
+        let body_text = response.text().await?;
+        if body_text.is_empty() {
+            info!("Received empty body from {}, defaulting to empty collection.", url);
+            return Ok(T::default());
+        }
+
+        serde_json::from_str(&body_text).map_err(|e| {
+            let err_msg = format!("Failed to deserialize JSON from {}: {}. Body: '{}'", url, e, body_text);
+            error!("{}", &err_msg);
+            err_msg.into()
+        })
+    }
+
+    let base_url = url.trim_end_matches('/');
+    let client = reqwest::Client::new();
+    let realms_url = format!("{}/realms", base_url);
+    let api_realms: Vec<ApiRealm> = fetch_and_deserialize(&client, &realms_url).await?;
+
+    let realm_tasks = api_realms.into_iter().filter(|r| !r.disabled).map(|api_realm| {
+        let client = client.clone();
+        let base_url = base_url.to_string();
+        async move {
+            let realm_name = api_realm.name.clone();
+
+            let vhosts_url = format!("{}/realms/{}/virtual-hosts", base_url, realm_name);
+            let chains_url = format!("{}/realms/{}/routing-chains", base_url, realm_name);
+            let zones_url = format!("{}/realms/{}/zones", base_url, realm_name);
+
+            let vhosts_future = fetch_and_deserialize::<Vec<VirtualHostConfig>>(&client, &vhosts_url);
+            let chains_future = fetch_and_deserialize::<Vec<RoutingChainConfig>>(&client, &chains_url);
+            let zones_future = async {
+                let zones: Vec<ZoneConfig> = fetch_and_deserialize(&client, &zones_url).await?;
+                let zone_tasks = zones.into_iter().map(|mut zone| {
+                    let client = client.clone();
+                    let base_url = base_url.clone();
+                    let realm_name = realm_name.clone();
+                    async move {
+                        let subdomains_url = format!("{}/realms/{}/zones/{}/subdomains", base_url, realm_name, zone._name);
+                        let subdomains: Vec<SubdomainConfig> = fetch_and_deserialize(&client, &subdomains_url).await?;
+                        zone.subdomains = subdomains;
+                        Ok(zone)
+                    }
+                });
+                join_all(zone_tasks).await.into_iter().collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()
+            };
+
+            let (vhosts_res, chains_res, zones_res) = tokio::join!(vhosts_future, chains_future, zones_future);
+
+            let virtual_hosts = vhosts_res?;
+            let zones = zones_res?;
+            let routing_chains = chains_res?;
+
+            let realm_config = RealmConfig {
+                name: api_realm.name,
+                jwt_key_pair: JwtKeyPairConfig {
+                    public_key_pem: api_realm.public_key_pem,
+                    private_key_pem: api_realm.private_key_pem,
+                },
+                virtual_hosts,
+                routing_chains,
+                zones,
+                disabled: api_realm.disabled,
+                // Assume these fields are not provided by the API and set defaults.
+                _urn: String::new(),
+                _title: String::new(),
+                _description: String::new(),
+                _cacert: String::new(),
+                _session_timeout: 0,
+                _administrators: Vec::new(),
+                _expired_at: String::new(),
+                _hubs: Vec::new(),
+            };
+
+            let result: Result<RealmConfig, Box<dyn std::error::Error + Send + Sync>> = Ok(realm_config);
+            result
+        }
+    });
+
+    let realms: Vec<RealmConfig> = join_all(realm_tasks)
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut config = AppConfig { realms };
+    config.resolve_hostnames()?;
+
+    // Serialize the constructed config to a YAML string to be used as the "content" for change detection.
+    let content = serde_yaml::to_string(&config)?;
+    Ok((config, content))
+}
+
+pub fn load_app_config(path: &str) -> (Arc<AppConfig>, String) {
+    if path.starts_with("http://") || path.starts_with("https://") {
+        info!("[ConfigLoad] Fetching configuration from repository: {}", path);
+        // Create a temporary runtime to execute the async fetch function during synchronous startup.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (config, content) = rt.block_on(fetch_config_from_url(path))
+            .unwrap_or_else(|e| panic!("Failed to fetch and build configuration from repository {}: {}", path, e));
+        (Arc::new(config), content)
+    } else {
+        info!("[ConfigLoad] Reading configuration from file: {}", path);
+        let content = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("Failed to read configuration from {}: {}", path, e));
+        let mut config: AppConfig = serde_yaml::from_str(&content)
+            .unwrap_or_else(|e| panic!("Failed to parse configuration from {}: {}", path, e));
+        // Use blocking client for initial synchronous load
+        if let Err(e) = config.resolve_hostnames() {
+            panic!("Failed to resolve hostnames: {}", e);
+        }
+        (Arc::new(config), content)
+    }
 }
 
 // --- Hot Reload Service ---
 
 /// A background service that periodically checks for configuration updates and applies them.
-pub struct ConfigHotReloadService {
+pub struct SignalReloadService {
     keys_swapper: Arc<ArcSwap<JwtKeysCache>>,
     cert_swapper: Arc<ArcSwap<CertificateCache>>,
     upstream_swapper: Arc<ArcSwap<UpstreamCache>>,
     realm_map_swapper: Arc<ArcSwap<RealmMap>>,
     main_config_swapper: Arc<ArcSwap<AppConfig>>,
+    config_path: String,
     last_known_content: Mutex<String>,
 }
 
-impl ConfigHotReloadService {
+impl SignalReloadService {
     pub fn new(
         keys_swapper: Arc<ArcSwap<JwtKeysCache>>,
         cert_swapper: Arc<ArcSwap<CertificateCache>>,
         upstream_swapper: Arc<ArcSwap<UpstreamCache>>,
         realm_map_swapper: Arc<ArcSwap<RealmMap>>,
         main_config_swapper: Arc<ArcSwap<AppConfig>>,
+        config_path: String,
         initial_config_content: String,
     ) -> Self {
-        ConfigHotReloadService {
+        SignalReloadService {
             keys_swapper,
             cert_swapper,
             upstream_swapper,
             realm_map_swapper,
             main_config_swapper,
+            config_path,
             last_known_content: Mutex::new(initial_config_content),
         }
     }
 }
 
 #[async_trait]
-impl BackgroundService for ConfigHotReloadService {
-    async fn start(&self, _shutdown: tokio::sync::watch::Receiver<bool>) {
-        let mut interval = tokio::time::interval(Duration::from_secs(10));
+impl BackgroundService for SignalReloadService {
+    async fn start(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        let mut sigusr1 = match signal(SignalKind::user_defined1()) { Ok(s) => s, Err(e) => { warn!("Failed to register SIGUSR1 handler: {}. Hot-reloading via signal will be disabled.", e); return; } };
+        info!("Signal handler for SIGUSR1 registered. Send SIGUSR1 to this process to reload configuration.");
+
         loop {
-            interval.tick().await;
-            if let Ok(current_content) = tokio::fs::read_to_string(CONFIG_PATH).await {
-                // Lock the mutex to safely read the last known content.
-                let last_content = self.last_known_content.lock().unwrap().clone();
-                if current_content != last_content {
-                    info!("Configuration file change detected. Attempting to reload...");
-                    self.reload_config(&current_content);
+            tokio::select! {
+                _ = sigusr1.recv() => {
+                    self.reload_config().await;
+                }
+                _ = shutdown.changed() => {
+                    info!("[Signal] Shutdown signal received, terminating signal handler.");
+                    break;
                 }
             }
         }
     }
 }
 
-impl ConfigHotReloadService {
-    fn reload_config(&self, current_content: &str) {
-        match serde_yaml::from_str::<AppConfig>(current_content) {
-            Ok(mut new_config) => {
-                if let Err(e) = new_config.resolve_hostnames() {
-                    warn!("Failed to resolve hostnames in reloaded configuration: {}. Skipping update.", e);
+impl SignalReloadService {
+    async fn reload_config(&self) { // This is now synchronous but fast enough.
+        info!("[Signal] SIGUSR1 received. Triggering configuration reload.");
+
+        let result = if self.config_path.starts_with("http://") || self.config_path.starts_with("https://") {
+            fetch_config_from_url(&self.config_path).await
+        } else {
+            // Local file logic
+            let content = match tokio::fs::read_to_string(&self.config_path).await {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("[ConfigReload] Failed to read configuration file {}: {}", self.config_path, e);
                     return;
                 }
-                let new_config_arc = Arc::new(new_config);
-                // Atomically swap the entire application configuration.
-                self.main_config_swapper.store(new_config_arc.clone());
-
-                // JWT Keys Reload
-                let current_keys_cache = self.keys_swapper.load();
-                JwtKeysCache::reload_from_config(&new_config_arc, &current_keys_cache);
-
-                // Upstream Cache Reload
-                let current_upstream_cache = self.upstream_swapper.load();
-                UpstreamCache::reload_from_config(&new_config_arc, &current_upstream_cache);
-
-                // Realm Map Reload
-                let current_realm_map = self.realm_map_swapper.load();
-                RealmMap::reload_from_config(&new_config_arc, &current_realm_map);
-
-                // Auth Scopes Reload
-                AuthScopeRegistry::reload_from_config(&new_config_arc);
-
-                // Certificate Cache Reload
-                let current_cert_cache = self.cert_swapper.load();
-                CertificateCache::reload_from_config(&new_config_arc, &current_cert_cache);
-
-                // Lock the mutex to safely update the last known content.
-                let mut last_content = self.last_known_content.lock().unwrap();
-                *last_content = current_content.to_string();
-
-                info!("Successfully reloaded and applied new configuration.");
+            };
+            match serde_yaml::from_str::<AppConfig>(&content) {
+                Ok(mut config) => {
+                    if let Err(e) = config.resolve_hostnames() {
+                        warn!("Failed to resolve hostnames in reloaded file: {}", e);
+                        return;
+                    }
+                    Ok((config, content))
+                },
+                Err(e) => {
+                    warn!("Failed to parse configuration file: {}", e);
+                    return;
+                }
             }
-            Err(e) => warn!(
-                "Failed to parse reloaded configuration, continuing with the old version. Error: {}",
-                e
-            ),
+        };
+
+        let (new_config, current_content) = match result {
+            Ok(res) => res,
+            Err(e) => {
+                warn!("[ConfigReload] Failed to load new configuration: {}. Continuing with the old configuration.", e);
+                return;
+            }
+        };
+
+        {
+            let last_content = self.last_known_content.lock().unwrap();
+            if *last_content == current_content {
+                info!("[ConfigReload] Configuration content has not changed. Skipping reload.");
+                return;
+            }
         }
+
+        let new_config_arc = Arc::new(new_config);
+
+        // Atomically swap the main config first.
+        self.main_config_swapper.store(new_config_arc.clone());
+
+        // Use the unified function to reload all caches.
+        populate_caches_from_config(
+            &new_config_arc,
+            &self.keys_swapper.load(),
+            &self.cert_swapper.load(),
+            &self.upstream_swapper.load(),
+            &self.realm_map_swapper.load(),
+        );
+        // Lock the mutex to safely update the last known content.
+        let mut last_content = self.last_known_content.lock().unwrap();
+        *last_content = current_content;
+
+        info!("Successfully reloaded and applied new configuration.");
     }
 }

@@ -36,8 +36,7 @@ use actions::{GatewayAction, RouteLogic};
 
 mod config;
 use crate::config::{
-    AppConfig, AuthScopeRegistry, CertificateCache, JwtKeysCache, RealmMap,
-    UpstreamCache,
+    AppConfig, CertificateCache, JwtKeysCache, RealmMap, UpstreamCache,
 };
 
 /// Core logic and shared state for the proxy service
@@ -809,15 +808,16 @@ fn main() -> pingora::Result<()> {
     env_logger::init();
 
     // Read environment variables
-    let _inventory_url = std::env::var("APIGW_INVENTORY_URL").unwrap_or_else(|_| "http://localhost:8080".to_string());
+    // If APIGW_INVENTORY_URL is not set, default to the local file.
+    let config_path = std::env::var("APIGW_INVENTORY_URL").unwrap_or_else(|_| "conf/config.yaml".to_string());
     let gateway_listen_addr = std::env::var("APIGW_TLS_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8443".to_string());
     let redirect_service_listen_addr = std::env::var("APIGW_HTTP_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     info!(
         "Startup settings:\n\
-        APIGW_INVENTORY_URL: {}\n\
+        APIGW_INVENTORY_URL (config path): {}\n\
         APIGW_TLS_BIND_ADDRESS: {}\n\
         APIGW_HTTP_BIND_ADDRESS: {}",
-        _inventory_url, gateway_listen_addr, redirect_service_listen_addr
+        config_path, gateway_listen_addr, redirect_service_listen_addr
     );
 
     let tls_port = gateway_listen_addr
@@ -832,24 +832,42 @@ fn main() -> pingora::Result<()> {
     };
 
     let gateway_start_time = Instant::now();
-    let app_config = config::load_app_config();
+    let (app_config, initial_config_content) = config::load_app_config(&config_path);
     let main_config_swapper = Arc::new(ArcSwap::new(app_config.clone()));
 
     // Load initial JWT signing keys and wrap them in ArcSwap for hot-reloading.
-    // For simplicity, we'll use the keys from the first realm defined in the config.
     let initial_keys_cache = JwtKeysCache {
         keys_by_realm: dashmap::DashMap::new(),
     };
-    // Perform an initial load.
-    JwtKeysCache::reload_from_config(&app_config, &initial_keys_cache);
-    let jwt_keys_cache_swapper = Arc::new(ArcSwap::new(Arc::new(initial_keys_cache)));
 
     // Load initial certificates and wrap them in ArcSwap for hot-reloading.
-    let mut initial_certs = CertificateCache {
+    let initial_certs = CertificateCache {
         cert_map: DashMap::new(),
     };
-    CertificateCache::reload_from_config(&app_config, &mut initial_certs);
+
+    // Create initial upstream peer cache and wrap it in ArcSwap for hot-reloading.
+    let initial_upstream_cache = UpstreamCache {
+        peer_map: DashMap::new(),
+    };
+
+    // Load initial realm map and wrap it in ArcSwap for hot-reloading.
+    let initial_realm_map = RealmMap {
+        map: DashMap::new(),
+    };
+
+    // Populate all caches using the unified function
+    config::populate_caches_from_config(
+        &app_config,
+        &initial_keys_cache,
+        &initial_certs,
+        &initial_upstream_cache,
+        &initial_realm_map,
+    );
+
+    let jwt_keys_cache_swapper = Arc::new(ArcSwap::new(Arc::new(initial_keys_cache)));
     let cert_cache_swapper = Arc::new(ArcSwap::new(Arc::new(initial_certs)));
+    let upstream_peer_swapper = Arc::new(ArcSwap::new(Arc::new(initial_upstream_cache)));
+    let realm_map_swapper = Arc::new(ArcSwap::new(Arc::new(initial_realm_map)));
 
     // Determine the default certificate. For simplicity, we use the first one found.
     let default_cert = cert_cache_swapper
@@ -859,25 +877,6 @@ fn main() -> pingora::Result<()> {
         .next() // Get the first key-value pair
         .map(|pair| pair.value().clone()) // Extract and clone the value (the Arc<CertAndKey>)
         .expect("At least one certificate must be configured to serve as the default.");
-
-    // Create initial upstream peer cache and wrap it in ArcSwap for hot-reloading.
-    let initial_upstream_cache = UpstreamCache {
-        peer_map: DashMap::new(),
-    };
-    // Perform an initial load.
-    UpstreamCache::reload_from_config(&app_config, &initial_upstream_cache);
-    let upstream_peer_swapper = Arc::new(ArcSwap::new(Arc::new(initial_upstream_cache)));
-
-    // Load initial realm map and wrap it in ArcSwap for hot-reloading.
-    let initial_realm_map = RealmMap {
-        map: DashMap::new(),
-    };
-    // Perform an initial load.
-    RealmMap::reload_from_config(&app_config, &initial_realm_map);
-    let realm_map_swapper = Arc::new(ArcSwap::new(Arc::new(initial_realm_map)));
-
-    // --- Initialize and register authentication scopes from config ---
-    AuthScopeRegistry::reload_from_config(&app_config);
 
     let mut my_server = Server::new(Some(opt))?;
 
@@ -891,21 +890,17 @@ fn main() -> pingora::Result<()> {
         }
     };
 
-    // Read the initial config content to pass to the hot-reload service.
-    // This ensures the service starts with the same state as the main application.
-    let initial_config_content = std::fs::read_to_string(config::CONFIG_PATH)
-        .expect("Failed to read initial configuration file content.");
-
     // Create and add the configuration hot reload service.
-    let config_reload_service = config::ConfigHotReloadService::new(
+    let signal_reload_service = config::SignalReloadService::new(
         jwt_keys_cache_swapper.clone(),
         cert_cache_swapper.clone(),
         upstream_peer_swapper.clone(),
         realm_map_swapper.clone(),
         main_config_swapper.clone(),
+        config_path,
         initial_config_content,
     );
-    my_server.add_service(background_service("Config Reloader", config_reload_service));
+    my_server.add_service(background_service("Config Reloader", signal_reload_service));
 
     // Initialize a shared HTTP client for the gateway
     let http_client = reqwest::Client::new();
