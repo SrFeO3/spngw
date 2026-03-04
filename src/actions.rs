@@ -25,7 +25,6 @@
 /// These are complex, multi-step workflows encapsulated into a single action.
 /// - `RequireAuthentication`: An action for paths that require OIDC authentication. It manages
 ///   the redirect-based login flow. (Note: Callback handling is not yet implemented).
-use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
@@ -33,7 +32,7 @@ use base64::{Engine, engine::general_purpose};
 use bytes::Bytes;
 use chrono::Utc;
 use dashmap::DashMap;
-use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use jsonwebtoken::{DecodingKey, Header, Validation, decode, encode};
 use log::{info, warn};
 use pingora::http::ResponseHeader;
 use pingora::prelude::*;
@@ -99,7 +98,7 @@ pub struct ApplicationSession {
     pub oidc_state: Option<String>,
     pub oidc_token_endpoint: Option<String>,
     pub oidc_client_id: Option<String>,
-    pub oidc_client_secret: Option<String>,
+    pub oidc_client_secret: String,
     pub auth_scope_name: Option<String>,
     pub auth_original_destination: Option<String>,
 }
@@ -115,39 +114,42 @@ struct DeviceContext {
 }
 
 /// Set of possible actions that can be applied to a request in the pipeline.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum GatewayAction {
     // --- Terminal Actions: Mutually exclusive actions that define the final request handling. ---
     ReturnStaticText {
-        content: Cow<'static, str>,
-        status_code: u16,
+        content: Arc<str>,
+        status: u16,
     },
     Redirect {
-        url: Cow<'static, str>,
+        url: Arc<str>,
     },
     // --- Modifier Actions: Actions that can be combined with a terminal action and each other. ---
+    #[serde(rename = "proxy")]
     ProxyTo {
-        upstream: Cow<'static, str>,
-        auth_scope_name: Option<Cow<'static, str>>,
+        upstream: Arc<str>,
+        auth_scope_name: Option<Arc<str>>,
     },
+    #[serde(skip)]
     IssueDeviceCookie,
     SetUpstreamRequestHeader {
-        name: Cow<'static, str>,
-        value: Cow<'static, str>,
+        name: Arc<str>,
+        value: Arc<str>,
     },
     SetDownstreamResponseHeader {
-        name: Cow<'static, str>,
-        value: Cow<'static, str>,
+        name: Arc<str>,
+        value: Arc<str>,
     },
     // --- Composite Actions: Complex workflows composed of multiple steps. ---
     RequireAuthentication {
-        protected_upstream: Cow<'static, str>,
-        oidc_authorization_endpoint: Cow<'static, str>,
-        oidc_client_id: Cow<'static, str>,
-        oidc_redirect_url: Cow<'static, str>,
-        oidc_token_endpoint: Cow<'static, str>,
-        auth_scope_name: Cow<'static, str>,
-        oidc_client_secret: Option<Cow<'static, str>>,
+        protected_upstream: Arc<str>,
+        oidc_authorization_endpoint: Arc<str>,
+        oidc_client_id: Arc<str>,
+        oidc_redirect_url: Arc<str>,
+        oidc_token_endpoint: Arc<str>,
+        auth_scope_name: Arc<str>,
+        oidc_client_secret: Arc<str>,
     },
 }
 
@@ -186,34 +188,34 @@ pub trait RouteLogic: Send + Sync {
 }
 
 // Create structs for each route.
-pub struct ReturnStaticTextRoute {
-    pub content: Cow<'static, str>,
+pub struct ReturnStaticTextRoute<'a> {
+    pub content: &'a str,
     pub status_code: u16,
 }
-pub struct RedirectRoute {
-    pub url: Cow<'static, str>,
+pub struct RedirectRoute<'a> {
+    pub url: &'a str,
 }
-pub struct ProxyToRoute {
-    pub upstream: Cow<'static, str>,
-    pub auth_scope_name: Option<Cow<'static, str>>,
+pub struct ProxyToRoute<'a> {
+    pub upstream: &'a str,
+    pub auth_scope_name: Option<&'a str>,
 }
 pub struct IssueDeviceCookieRoute;
-pub struct SetUpstreamRequestHeaderRoute {
-    pub name: Cow<'static, str>,
-    pub value: Cow<'static, str>,
+pub struct SetUpstreamRequestHeaderRoute<'a> {
+    pub name: &'a str,
+    pub value: &'a str,
 }
-pub struct SetDownstreamResponseHeaderRoute {
-    pub name: Cow<'static, str>,
-    pub value: Cow<'static, str>,
+pub struct SetDownstreamResponseHeaderRoute<'a> {
+    pub name: &'a str,
+    pub value: &'a str,
 }
-pub struct RequireAuthenticationRoute {
-    pub protected_upstream: Cow<'static, str>,
-    pub oidc_authorization_endpoint: Cow<'static, str>,
-    pub oidc_client_id: Cow<'static, str>,
-    pub oidc_redirect_url: Cow<'static, str>,
-    pub oidc_token_endpoint: Cow<'static, str>,
-    pub auth_scope_name: Cow<'static, str>,
-    pub oidc_client_secret: Option<Cow<'static, str>>,
+pub struct RequireAuthenticationRoute<'a> {
+    pub protected_upstream: &'a str,
+    pub oidc_authorization_endpoint: &'a str,
+    pub oidc_client_id: &'a str,
+    pub oidc_redirect_url: &'a str,
+    pub oidc_token_endpoint: &'a str,
+    pub auth_scope_name: &'a str,
+    pub oidc_client_secret: &'a str,
 }
 
 // Helper function to inject the Authorization header into the upstream request.
@@ -264,7 +266,7 @@ async fn inject_authorization_header_and_token_refresh(
                         &app_session.oidc_token_endpoint,
                         &app_session.oidc_client_id,
                     ) {
-                        let client = reqwest::Client::new();
+                        let client = &ctx.http_client;
                         #[derive(Deserialize)]
                         struct RefreshResponse {
                             access_token: String,
@@ -272,14 +274,12 @@ async fn inject_authorization_header_and_token_refresh(
                             refresh_token: Option<String>,
                         }
 
-                        let mut params = vec![
+                        let params = vec![
                             ("grant_type", "refresh_token"),
                             ("refresh_token", refresh_token.as_str()),
                             ("client_id", client_id.as_str()),
+                            ("client_secret", app_session.oidc_client_secret.as_str()),
                         ];
-                        if let Some(secret) = &app_session.oidc_client_secret {
-                            params.push(("client_secret", secret.as_str()));
-                        }
 
                         match client.post(endpoint).form(&params).send().await {
                             Ok(resp) => {
@@ -397,7 +397,7 @@ async fn inject_authorization_header_and_token_refresh(
 /// * `content` - The static text content to be sent in the response body.
 /// * `status_code` - The HTTP status code for the response.
 #[async_trait]
-impl RouteLogic for ReturnStaticTextRoute {
+impl<'a> RouteLogic for ReturnStaticTextRoute<'a> {
     fn name(&self) -> &'static str {
         "ReturnStaticText"
     }
@@ -438,7 +438,7 @@ impl RouteLogic for ReturnStaticTextRoute {
 /// # Arguments
 /// * `url` - The destination URL for the redirect.
 #[async_trait]
-impl RouteLogic for RedirectRoute {
+impl<'a> RouteLogic for RedirectRoute<'a> {
     fn name(&self) -> &'static str {
         "Redirect"
     }
@@ -483,7 +483,7 @@ impl RouteLogic for RedirectRoute {
 /// # Arguments
 /// * `upstream` - The address of the upstream service to proxy to (e.g., "127.0.0.1:8083").
 #[async_trait]
-impl RouteLogic for ProxyToRoute {
+impl<'a> RouteLogic for ProxyToRoute<'a> {
     fn name(&self) -> &'static str {
         "ProxyTo"
     }
@@ -500,7 +500,7 @@ impl RouteLogic for ProxyToRoute {
             self.upstream
         );
         // Overwrite the upstream peer address in the context.
-        ctx.override_upstream_addr = Some(self.upstream.to_string());
+        ctx.override_upstream_addr = Some(self.upstream.into());
         Ok(false) // Continue the pipeline
     }
 
@@ -613,12 +613,9 @@ impl RouteLogic for IssueDeviceCookieRoute {
                     return Ok(false); // Cannot validate, treat as invalid.
                 }
             };
-            let decoding_key = DecodingKey::from_rsa_pem(&key.public_key_pem)
-                .expect("Failed to create decoding key from PEM");
-
             let validation = Validation::new(jsonwebtoken::Algorithm::RS256);
 
-            match decode::<DeviceContext>(&token, &decoding_key, &validation) {
+            match decode::<DeviceContext>(&token, &key.decoding_key, &validation) {
                 Ok(token_data) => {
                     let claims = token_data.claims;
                     info!(
@@ -654,13 +651,10 @@ impl RouteLogic for IssueDeviceCookieRoute {
                             exp: now_ts + DEVICE_COOKIE_MAX_AGE,
                         };
 
-                        let encoding_key = EncodingKey::from_rsa_pem(&key.private_key_pem)
-                            .expect("Failed to create encoding key from PEM");
-
                         match encode(
                             &Header::new(jsonwebtoken::Algorithm::RS256),
                             &new_claims,
-                            &encoding_key,
+                            &key.encoding_key,
                         ) {
                             Ok(new_token) => {
                                 ctx.action_state_new_dev_cookie = Some(new_token);
@@ -725,12 +719,10 @@ impl RouteLogic for IssueDeviceCookieRoute {
                     return Err(err);
                 }
             };
-            let encoding_key = EncodingKey::from_rsa_pem(&key.private_key_pem)
-                .expect("Failed to create encoding key from PEM");
             let token = encode(
                 &Header::new(jsonwebtoken::Algorithm::RS256),
                 &claims,
-                &encoding_key,
+                &key.encoding_key,
             )
             .map_err(|e| {
                 let mut err = Error::new(ErrorType::InternalError);
@@ -779,7 +771,7 @@ impl RouteLogic for IssueDeviceCookieRoute {
 /// * `name` - The name of the HTTP header.
 /// * `value` - The value of the HTTP header.
 #[async_trait]
-impl RouteLogic for SetUpstreamRequestHeaderRoute {
+impl<'a> RouteLogic for SetUpstreamRequestHeaderRoute<'a> {
     fn name(&self) -> &'static str {
         "SetUpstreamRequestHeader"
     }
@@ -801,8 +793,8 @@ impl RouteLogic for SetUpstreamRequestHeaderRoute {
         upstream_request.remove_header(&*self.name); // remove_header is fine with a reference
         upstream_request
             .insert_header(
-                self.name.clone().into_owned(),
-                self.value.clone().into_owned(),
+                self.name.to_string(),
+                self.value.to_string(),
             )
             .unwrap();
         Ok(())
@@ -815,7 +807,7 @@ impl RouteLogic for SetUpstreamRequestHeaderRoute {
 /// * `name` - The name of the HTTP header.
 /// * `value` - The value of the HTTP header.
 #[async_trait]
-impl RouteLogic for SetDownstreamResponseHeaderRoute {
+impl<'a> RouteLogic for SetDownstreamResponseHeaderRoute<'a> {
     fn name(&self) -> &'static str {
         "SetDownstreamResponseHeader"
     }
@@ -837,8 +829,8 @@ impl RouteLogic for SetDownstreamResponseHeaderRoute {
         response.remove_header(&*self.name); // remove_header is fine with a reference
         response
             .insert_header(
-                self.name.clone().into_owned(),
-                self.value.clone().into_owned(),
+                self.name.to_string(),
+                self.value.to_string(),
             )
             .unwrap();
         Ok(())
@@ -855,7 +847,7 @@ impl RouteLogic for SetDownstreamResponseHeaderRoute {
 /// * `oidc_token_endpoint` - The token endpoint of the OIDC provider.
 /// * `auth_scope_name` - A unique name for this authentication scope, used to isolate session cookies.
 #[async_trait]
-impl RouteLogic for RequireAuthenticationRoute {
+impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
     fn name(&self) -> &'static str {
         "RequireAuthentication"
     }
@@ -875,7 +867,7 @@ impl RouteLogic for RequireAuthenticationRoute {
         let session_store = get_auth_session_store(&ctx.realm_name, &self.auth_scope_name)
             .unwrap_or_else(|| panic!("Authentication scope '{}' for realm '{}' not registered. Please call register_auth_scope at startup.", self.auth_scope_name, ctx.realm_name));
 
-        ctx.override_upstream_addr = Some(self.protected_upstream.to_string());
+        ctx.override_upstream_addr = Some(self.protected_upstream.into());
         // --- Start of merged logic from ApplicationSessionManagementRoute ---
         let mut session_found = false;
         let mut app_session_opt: Option<ApplicationSession> = None;
@@ -944,7 +936,7 @@ impl RouteLogic for RequireAuthenticationRoute {
                 oidc_state: None,
                 oidc_token_endpoint: Some(self.oidc_token_endpoint.to_string()),
                 oidc_client_id: Some(self.oidc_client_id.to_string()),
-                oidc_client_secret: self.oidc_client_secret.as_ref().map(|s| s.to_string()),
+                oidc_client_secret: self.oidc_client_secret.to_string(),
                 auth_scope_name: Some(self.auth_scope_name.to_string()),
                 auth_original_destination: None,
             };
@@ -1067,19 +1059,17 @@ impl RouteLogic for RequireAuthenticationRoute {
                     }
                 };
 
-                let client = reqwest::Client::new();
-                let mut token_params = vec![
+                let client = &ctx.http_client;
+                let token_params = vec![
                     ("grant_type", "authorization_code"),
                     ("code", code.as_str()),
-                    ("redirect_uri", self.oidc_redirect_url.as_ref()),
-                    ("client_id", self.oidc_client_id.as_ref()),
+                    ("redirect_uri", self.oidc_redirect_url),
+                    ("client_id", self.oidc_client_id),
                     ("code_verifier", pkce_verifier.as_str()),
+                    ("client_secret", self.oidc_client_secret),
                 ];
-                if let Some(secret) = &self.oidc_client_secret {
-                    token_params.push(("client_secret", secret.as_ref()));
-                }
                 let response = client
-                    .post(self.oidc_token_endpoint.as_ref())
+                    .post(self.oidc_token_endpoint)
                     .form(&token_params)
                     .send()
                     .await
@@ -1139,7 +1129,7 @@ impl RouteLogic for RequireAuthenticationRoute {
                 // Heuristic: Assume the token endpoint is something like `.../token` or `.../oauth2/v1/token`.
                 // We try to go up one level and look for `.well-known/openid-configuration`.
                 let token_endpoint_url =
-                    Url::parse(self.oidc_token_endpoint.as_ref()).map_err(|e| {
+                    Url::parse(self.oidc_token_endpoint).map_err(|e| {
                         warn!(
                             "[{}] [{}] Invalid OIDC token endpoint URL: {}",
                             ctx.request_id,
@@ -1221,7 +1211,7 @@ impl RouteLogic for RequireAuthenticationRoute {
 
                 // Prepare validation parameters
                 let mut validation = Validation::new(jsonwebtoken::Algorithm::RS256); // Assuming RS256 for OIDC
-                validation.set_audience(&[self.oidc_client_id.as_ref()]);
+                validation.set_audience(&[self.oidc_client_id]);
 
                 // Use the issuer from the discovery document
                 validation.set_issuer(&[oidc_config.issuer]);
@@ -1443,7 +1433,7 @@ impl RouteLogic for RequireAuthenticationRoute {
 
             // 7. Build the OIDC authorization URL with all the necessary parameters.
             let mut auth_url =
-                Url::parse(&self.oidc_authorization_endpoint).expect("Invalid OIDC login URL");
+                Url::parse(self.oidc_authorization_endpoint).expect("Invalid OIDC login URL");
             auth_url
                 .query_pairs_mut()
                 .append_pair("response_type", "code")
@@ -1554,7 +1544,7 @@ impl RouteLogic for RequireAuthenticationRoute {
             ctx,
             upstream_request,
             self.name(),
-            Some(&self.auth_scope_name),
+            Some(self.auth_scope_name),
         )
         .await;
 

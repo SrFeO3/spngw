@@ -36,7 +36,7 @@ use actions::{GatewayAction, RouteLogic};
 
 mod config;
 use crate::config::{
-    ActionConfig, AppConfig, AuthScopeRegistry, CertificateCache, JwtKeysCache, RealmMap,
+    AppConfig, AuthScopeRegistry, CertificateCache, JwtKeysCache, RealmMap,
     UpstreamCache,
 };
 
@@ -55,6 +55,7 @@ struct GatewayRouter {
     realm_map: Arc<ArcSwap<RealmMap>>,
     main_config: Arc<ArcSwap<AppConfig>>,
     _gateway_start_time: Instant,
+    http_client: reqwest::Client,
 }
 
 /// Context that holds state for each HTTP request
@@ -74,11 +75,11 @@ struct GatewayCtx {
     jwt_keys: Arc<JwtKeysCache>,
     front_sni_name: Option<String>,
     // Pipeline of routes to be applied to the request
-    action_pipeline: Vec<GatewayAction>,
+    action_pipeline: Vec<Arc<GatewayAction>>,
     // The default upstream address for the request, can be overridden by an action.
-    default_upstream_addr: Option<String>,
+    default_upstream_addr: Option<Arc<str>>,
     // The upstream address set by an action, which overrides the default.
-    override_upstream_addr: Option<String>,
+    override_upstream_addr: Option<Arc<str>>,
 
     // --- State for GatewayActions ---
     // These fields store state that is shared across the lifecycle of a single request.
@@ -98,6 +99,8 @@ struct GatewayCtx {
     action_state_app_session: Option<actions::ApplicationSession>,
     // The domain to set on cookies, if share_cookie is enabled.
     pub cookie_domain: Option<String>,
+    // Shared HTTP client for actions
+    pub http_client: reqwest::Client,
 }
 
 #[async_trait]
@@ -123,6 +126,7 @@ impl ProxyHttp for GatewayRouter {
             action_state_new_app_session_cookie: None,
             action_state_app_session: None,
             cookie_domain: None,
+            http_client: self.http_client.clone(),
         }
     }
 
@@ -186,7 +190,6 @@ impl ProxyHttp for GatewayRouter {
         ctx.front_sni_name = Some(front_sni_name);
 
         // Determine Realm for this request.
-        // TODO: Implement proper realms selection
         let app_config = self.main_config.load();
         let realm_map = self.realm_map.load();
         ctx.app_config = Some(app_config.clone());
@@ -244,18 +247,15 @@ impl ProxyHttp for GatewayRouter {
         //
 
         // Set the default upstream for all routes that fall into this block.
-        ctx.default_upstream_addr = Some("127.0.0.1:8081".to_string());
+        ctx.default_upstream_addr = Some("127.0.0.1:8081".into());
 
         ctx.action_pipeline.clear();
 
         // All for DeviceCookie
-        ctx.action_pipeline.push(GatewayAction::IssueDeviceCookie);
+        ctx.action_pipeline.push(Arc::new(GatewayAction::IssueDeviceCookie));
 
         // Dynamically generate Action Pipelines from config
         let path = session.req_header().uri.path();
-        // For simplicity, we are using the first realm and its first routing chain.
-        // A real-world scenario would involve matching the request's hostname to a virtual_host
-        // and then finding the associated routing_chain.
 
         /// Evaluates a single match expression against the request's hostname and path.
         fn evaluate_single_expr(expr: &str, hostname: &str, path: &str, request_id: &str) -> bool {
@@ -337,54 +337,7 @@ impl ProxyHttp for GatewayRouter {
                             "[{}] Matched rule: '{}', applying action",
                             ctx.request_id, rule.match_expr
                         );
-                        let action = match &rule.action {
-                            ActionConfig::ReturnStaticText { content, status } => {
-                                GatewayAction::ReturnStaticText {
-                                    content: content.clone().into(),
-                                    status_code: *status,
-                                }
-                            }
-                            ActionConfig::Proxy {
-                                upstream,
-                                auth_scope_name,
-                            } => GatewayAction::ProxyTo {
-                                upstream: upstream.clone().into(),
-                                auth_scope_name: auth_scope_name.clone().map(|s| s.into()),
-                            },
-                            ActionConfig::Redirect { url } => GatewayAction::Redirect {
-                                url: url.clone().into(),
-                            },
-                            ActionConfig::SetUpstreamRequestHeader { name, value } => {
-                                GatewayAction::SetUpstreamRequestHeader {
-                                    name: name.clone().into(),
-                                    value: value.clone().into(),
-                                }
-                            }
-                            ActionConfig::SetDownstreamResponseHeader { name, value } => {
-                                GatewayAction::SetDownstreamResponseHeader {
-                                    name: name.clone().into(),
-                                    value: value.clone().into(),
-                                }
-                            }
-                            ActionConfig::RequireAuthentication {
-                                protected_upstream,
-                                oidc_authorization_endpoint,
-                                oidc_client_id,
-                                oidc_redirect_url,
-                                oidc_token_endpoint,
-                                auth_scope_name,
-                                oidc_client_secret,
-                            } => GatewayAction::RequireAuthentication {
-                                protected_upstream: protected_upstream.clone().into(),
-                                oidc_authorization_endpoint: oidc_authorization_endpoint.clone().into(),
-                                oidc_client_id: oidc_client_id.clone().into(),
-                                oidc_redirect_url: oidc_redirect_url.clone().into(),
-                                oidc_token_endpoint: oidc_token_endpoint.clone().into(),
-                                auth_scope_name: auth_scope_name.clone().into(),
-                                oidc_client_secret: oidc_client_secret.clone().map(|s| s.into()),
-                            },
-                        };
-                        ctx.action_pipeline.push(action);
+                        ctx.action_pipeline.push(rule.action.clone());
                     }
                 }
             }
@@ -398,20 +351,21 @@ impl ProxyHttp for GatewayRouter {
         //
         // Execute the pipeline for request_filter_and_prepare_upstream_peer.
         //
-        for action in ctx.action_pipeline.clone() {
+        let pipeline = std::mem::take(&mut ctx.action_pipeline);
+        for action in &pipeline {
             info!(
                 "[{}] Pipeline: Executing request_filter_and_prepare_upstream_peer for action: {:?}",
                 ctx.request_id, action
             );
             // Pass the session stores to the dispatch macro so it can construct the full scope.
-            let early_exit = match action {
+            let early_exit = match action.as_ref() {
                 GatewayAction::ReturnStaticText {
                     content,
-                    status_code,
+                    status,
                 } => {
                     let logic = actions::ReturnStaticTextRoute {
                         content,
-                        status_code,
+                        status_code: *status,
                     };
                     logic
                         .request_filter_and_prepare_upstream_peer(session, ctx)
@@ -445,7 +399,7 @@ impl ProxyHttp for GatewayRouter {
                         oidc_redirect_url,
                         oidc_token_endpoint,
                         auth_scope_name,
-                        oidc_client_secret,
+                        oidc_client_secret: oidc_client_secret.as_ref(),
                     };
                     logic
                         .request_filter_and_prepare_upstream_peer(session, ctx)
@@ -463,7 +417,7 @@ impl ProxyHttp for GatewayRouter {
                 } => {
                     let logic = actions::ProxyToRoute {
                         upstream,
-                        auth_scope_name,
+                        auth_scope_name: auth_scope_name.as_deref(),
                     };
                     logic
                         .request_filter_and_prepare_upstream_peer(session, ctx)
@@ -476,10 +430,12 @@ impl ProxyHttp for GatewayRouter {
                 }
             }?;
             if early_exit {
+                ctx.action_pipeline = pipeline;
                 return Ok(true); // Stop the pipeline if a filter decides to exit early.
             }
         }
 
+        ctx.action_pipeline = pipeline;
         Ok(false) // Continue to the next phase
     }
 
@@ -526,20 +482,21 @@ impl ProxyHttp for GatewayRouter {
     ) -> Result<()> {
         // Dispatch to the correct upstream request filter logic.
         // Loop through the pipeline to apply all relevant filters.
-        for action in ctx.action_pipeline.clone() {
+        let pipeline = std::mem::take(&mut ctx.action_pipeline);
+        for action in &pipeline {
             info!(
                 "[{}] Pipeline: Executing upstream_request_filter for action: {:?}",
                 ctx.request_id, action
             );
             // Use the dispatch macro to call the upstream_request_filter method.
-            match action {
+            match action.as_ref() {
                 GatewayAction::ReturnStaticText {
                     content,
-                    status_code,
+                    status,
                 } => {
                     let logic = actions::ReturnStaticTextRoute {
                         content,
-                        status_code,
+                        status_code: *status,
                     };
                     logic
                         .upstream_request_filter(session, upstream_request, ctx)
@@ -573,7 +530,7 @@ impl ProxyHttp for GatewayRouter {
                         oidc_redirect_url,
                         oidc_token_endpoint,
                         auth_scope_name,
-                        oidc_client_secret,
+                        oidc_client_secret: oidc_client_secret.as_ref(),
                     };
                     logic
                         .upstream_request_filter(session, upstream_request, ctx)
@@ -596,7 +553,7 @@ impl ProxyHttp for GatewayRouter {
                 } => {
                     let logic = actions::ProxyToRoute {
                         upstream,
-                        auth_scope_name,
+                        auth_scope_name: auth_scope_name.as_deref(),
                     };
                     logic
                         .upstream_request_filter(session, upstream_request, ctx)
@@ -605,6 +562,7 @@ impl ProxyHttp for GatewayRouter {
             }?;
         }
 
+        ctx.action_pipeline = pipeline;
         Ok(())
     }
 
@@ -623,35 +581,36 @@ impl ProxyHttp for GatewayRouter {
         // Loop through the pipeline in reverse order to apply response filters.
         // This follows the common middleware pattern (LIFO - Last-In, First-Out),
         // ensuring that the last request filter added is the first response filter executed.
-        // We clone the pipeline to avoid borrow checker issues with `ctx`.
-        for action in ctx.action_pipeline.clone().iter().rev() {
+        // We iterate by reference to avoid cloning the pipeline.
+        let pipeline = std::mem::take(&mut ctx.action_pipeline);
+        for action in pipeline.iter().rev() {
             info!(
                 "[{}] Pipeline: Executing response_filter for action: {:?}",
                 ctx.request_id, action
             );
 
-            match action {
+            match action.as_ref() {
                 GatewayAction::ReturnStaticText {
                     content,
-                    status_code,
+                    status,
                 } => {
                     let logic = actions::ReturnStaticTextRoute {
-                        content: content.clone(),
-                        status_code: *status_code,
+                        content,
+                        status_code: *status,
                     };
                     logic.response_filter(session, response, ctx).await
                 }
                 GatewayAction::SetUpstreamRequestHeader { name, value } => {
                     let logic = actions::SetUpstreamRequestHeaderRoute {
-                        name: name.clone(),
-                        value: value.clone(),
+                        name,
+                        value,
                     };
                     logic.response_filter(session, response, ctx).await
                 }
                 GatewayAction::SetDownstreamResponseHeader { name, value } => {
                     let logic = actions::SetDownstreamResponseHeaderRoute {
-                        name: name.clone(),
-                        value: value.clone(),
+                        name,
+                        value,
                     };
                     logic.response_filter(session, response, ctx).await
                 }
@@ -665,13 +624,13 @@ impl ProxyHttp for GatewayRouter {
                     oidc_client_secret,
                 } => {
                     let logic = actions::RequireAuthenticationRoute {
-                        protected_upstream: protected_upstream.clone(),
-                        oidc_authorization_endpoint: oidc_authorization_endpoint.clone(),
-                        oidc_client_id: oidc_client_id.clone(),
-                        oidc_redirect_url: oidc_redirect_url.clone(),
-                        oidc_token_endpoint: oidc_token_endpoint.clone(),
-                        auth_scope_name: auth_scope_name.clone(),
-                        oidc_client_secret: oidc_client_secret.clone(),
+                        protected_upstream,
+                        oidc_authorization_endpoint,
+                        oidc_client_id,
+                        oidc_redirect_url,
+                        oidc_token_endpoint,
+                        auth_scope_name,
+                        oidc_client_secret: oidc_client_secret.as_ref(),
                     };
                     logic.response_filter(session, response, ctx).await
                 }
@@ -681,7 +640,7 @@ impl ProxyHttp for GatewayRouter {
                         .await
                 }
                 GatewayAction::Redirect { url } => {
-                    let logic = actions::RedirectRoute { url: url.clone() };
+                    let logic = actions::RedirectRoute { url };
                     logic.response_filter(session, response, ctx).await
                 }
                 GatewayAction::ProxyTo {
@@ -689,13 +648,14 @@ impl ProxyHttp for GatewayRouter {
                     auth_scope_name,
                 } => {
                     let logic = actions::ProxyToRoute {
-                        upstream: upstream.clone(),
-                        auth_scope_name: auth_scope_name.clone(),
+                        upstream,
+                        auth_scope_name: auth_scope_name.as_deref(),
                     };
                     logic.response_filter(session, response, ctx).await
                 }
             }?;
         }
+        ctx.action_pipeline = pipeline;
         Ok(())
     }
 
@@ -947,6 +907,9 @@ fn main() -> pingora::Result<()> {
     );
     my_server.add_service(background_service("Config Reloader", config_reload_service));
 
+    // Initialize a shared HTTP client for the gateway
+    let http_client = reqwest::Client::new();
+
     let gw = GatewayRouter {
         upstream_peer_cache: upstream_peer_swapper,
         sni_ex_data_index: sni_ex_data_index.clone(),
@@ -954,6 +917,7 @@ fn main() -> pingora::Result<()> {
         realm_map: realm_map_swapper.clone(),
         main_config: main_config_swapper,
         _gateway_start_time: gateway_start_time,
+        http_client,
     };
 
     let mut gateway_service = http_proxy_service(&my_server.configuration, gw);

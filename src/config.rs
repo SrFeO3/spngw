@@ -38,6 +38,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use dashmap::DashMap;
+use jsonwebtoken::{DecodingKey, EncodingKey};
 use log::{info, warn};
 use pingora::prelude::*;
 use pingora::services::background::BackgroundService;
@@ -48,46 +49,12 @@ use crate::actions;
 
 pub const CONFIG_PATH: &str = "conf/config.yaml";
 
-/// All possible actions that can be performed when a rule matches.
-#[derive(Debug, Deserialize, Clone)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
-pub enum ActionConfig {
-    ReturnStaticText {
-        content: String,
-        status: u16,
-    },
-    Proxy {
-        upstream: String,
-        auth_scope_name: Option<String>,
-    },
-    Redirect {
-        url: String,
-    },
-    SetUpstreamRequestHeader {
-        name: String,
-        value: String,
-    },
-    SetDownstreamResponseHeader {
-        name: String,
-        value: String,
-    },
-    RequireAuthentication {
-        protected_upstream: String,
-        oidc_authorization_endpoint: String,
-        oidc_client_id: String,
-        oidc_redirect_url: String,
-        oidc_token_endpoint: String,
-        auth_scope_name: String,
-        oidc_client_secret: Option<String>,
-    },
-}
-
 /// Rule that matches a request and specifies an action to perform.
 #[derive(Debug, Deserialize, Clone)]
 pub struct RuleConfig {
     #[serde(rename = "match")]
     pub match_expr: String,
-    pub action: ActionConfig,
+    pub action: Arc<actions::GatewayAction>,
 }
 
 /// Routing rules that are evaluated sequentially.
@@ -261,7 +228,7 @@ pub struct CertificateCache {
 /// All loaded certificates, which can be reloaded atomically.
 pub struct UpstreamCache {
     // A map from upstream address string to its HttpPeer object.
-    pub peer_map: DashMap<String, Arc<HttpPeer>>,
+    pub peer_map: DashMap<Arc<str>, Arc<HttpPeer>>,
 }
 
 /// Application's cryptographic keys.
@@ -269,6 +236,8 @@ pub struct UpstreamCache {
 pub struct JwtKeyPair {
     pub public_key_pem: Vec<u8>,
     pub private_key_pem: Vec<u8>,
+    pub encoding_key: EncodingKey,
+    pub decoding_key: DecodingKey,
 }
 
 /// Cache for JWT signing keys, keyed by realm name.
@@ -302,23 +271,44 @@ impl JwtKeysCache {
 
         // Update existing or add new keys
         for realm in &app_config.realms {
-            let new_keys = JwtKeyPair {
-                public_key_pem: realm.jwt_key_pair.public_key_pem.clone().into_bytes(),
-                private_key_pem: realm.jwt_key_pair.private_key_pem.clone().into_bytes(),
-            };
+            let public_key_pem = realm.jwt_key_pair.public_key_pem.as_bytes();
+            let private_key_pem = realm.jwt_key_pair.private_key_pem.as_bytes();
 
             // Check if the key is new or has changed.
             let needs_update = match current_cache.keys_by_realm.get(&realm.name) {
                 // The realm exists. Check if the key material has changed.
                 Some(existing_keys) => {
-                    existing_keys.public_key_pem != new_keys.public_key_pem
-                        || existing_keys.private_key_pem != new_keys.private_key_pem
+                    existing_keys.public_key_pem != public_key_pem
+                        || existing_keys.private_key_pem != private_key_pem
                 }
                 // The realm is new and not in the cache, so it needs to be added.
                 None => true,
             };
 
             if needs_update {
+                // Parse keys only when update is needed
+                let encoding_key = match EncodingKey::from_rsa_pem(private_key_pem) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        warn!("[ConfigReload] Failed to parse private key for realm '{}': {}", realm.name, e);
+                        continue;
+                    }
+                };
+                let decoding_key = match DecodingKey::from_rsa_pem(public_key_pem) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        warn!("[ConfigReload] Failed to parse public key for realm '{}': {}", realm.name, e);
+                        continue;
+                    }
+                };
+
+                let new_keys = JwtKeyPair {
+                    public_key_pem: public_key_pem.to_vec(),
+                    private_key_pem: private_key_pem.to_vec(),
+                    encoding_key,
+                    decoding_key,
+                };
+
                 info!(
                     "[ConfigReload] Updating JWT keys for realm: '{}'",
                     realm.name
@@ -452,9 +442,9 @@ impl UpstreamCache {
             let mut realm_addrs = HashSet::new();
             for chain in &realm.routing_chains {
                 for rule in &chain.rules {
-                    if let Some(addr) = match &rule.action {
-                        ActionConfig::Proxy { upstream, .. } => Some(upstream.clone()),
-                        ActionConfig::RequireAuthentication {
+                    if let Some(addr) = match rule.action.as_ref() {
+                        actions::GatewayAction::ProxyTo { upstream, .. } => Some(upstream.clone()),
+                        actions::GatewayAction::RequireAuthentication {
                             protected_upstream, ..
                         } => Some(protected_upstream.clone()),
                         _ => None,
@@ -480,7 +470,7 @@ impl UpstreamCache {
         }
 
         // Manually add the default upstream if not already present.
-        let default_upstream = "http://127.0.0.1:8081".to_string();
+        let default_upstream: Arc<str> = "http://127.0.0.1:8081".into();
         if !current_cache.peer_map.contains_key(&default_upstream) {
             info!(
                 "[ConfigReload] System: Creating default upstream peer for '{}'",
@@ -518,9 +508,9 @@ impl AuthScopeRegistry {
         for realm in &config.realms {
             for chain in &realm.routing_chains {
                 for rule in &chain.rules {
-                    if let ActionConfig::RequireAuthentication {
+                    if let actions::GatewayAction::RequireAuthentication {
                         auth_scope_name, ..
-                    } = &rule.action
+                    } = rule.action.as_ref()
                     {
                         if all_required_scopes.insert((realm.name.clone(), auth_scope_name.clone()))
                         {
