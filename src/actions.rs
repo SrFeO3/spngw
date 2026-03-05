@@ -698,8 +698,9 @@ impl RouteLogic for IssueDeviceCookieRoute {
             rand::rng().fill_bytes(&mut sub_bytes);
             let sub = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sub_bytes);
             let now_ts = Utc::now().timestamp() as u64;
+            let issuer = ctx.front_sni_name.as_deref().unwrap_or_default();
             let claims = DeviceContext {
-                iss: "TestFruitShop".to_string(),
+                iss: issuer.to_string(),
                 sub,
                 cn: "My New Device".to_string(),
                 iat: now_ts,
