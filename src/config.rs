@@ -482,20 +482,6 @@ impl UpstreamCache {
             all_required_addrs.extend(realm_addrs);
         }
 
-        // Manually add the default upstream if not already present.
-        let default_upstream: Arc<str> = "http://127.0.0.1:8081".into();
-        if !current_cache.peer_map.contains_key(&default_upstream) {
-            info!(
-                "[ConfigReload] System: Creating default upstream peer for '{}'",
-                default_upstream
-            );
-            let peer = HttpPeer::new("127.0.0.1:8081", false, "".to_string());
-            current_cache
-                .peer_map
-                .insert(default_upstream.clone(), Arc::new(peer));
-        }
-        all_required_addrs.insert(default_upstream);
-
         // 2. Remove peers that are no longer in the new configuration.
         current_cache.peer_map.retain(|addr, _| {
             if !all_required_addrs.contains(addr) {

@@ -76,3 +76,17 @@ def test_downstream_header(resolve_to_localhost):
     r = requests.get(url, verify=False, timeout=5)
     assert r.status_code == 200
     assert r.headers.get("X-Powered-By") == "BFF-Proxy"
+
+@pytest.mark.parametrize("resolve_to_localhost", ["www.test.example.com"], indirect=True)
+def test_no_backend_route_returns_503(resolve_to_localhost):
+    """
+    Tests that a request to a path with no matching upstream rule results in a 503 Service Unavailable.
+
+    This test case verifies the scenario where no routing rule defines a backend
+    (e.g., via 'proxyTo') and no default upstream is configured, forcing the gateway
+    to return an error as it cannot proxy the request.
+    """
+    # This path is assumed not to match any rule that sets an upstream.
+    url = "https://betelgeuse.test.example.com:8443/unmatched/path/to/trigger/no/backend/case"
+    r = requests.get(url, verify=False, timeout=5)
+    assert r.status_code == 503

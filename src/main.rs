@@ -245,9 +245,9 @@ impl ProxyHttp for GatewayRouter {
         // Set the action pipeline actions for this request.
         //
 
-        // Set the default upstream for all routes that fall into this block.
-        ctx.default_upstream_addr = Some("127.0.0.1:8081".into());
-
+        // No default upstream is set. A route must explicitly define one using
+        // `proxyTo` or `requireAuthentication`, otherwise a 503 Service Unavailable will be returned.
+        ctx.default_upstream_addr = None;
         ctx.action_pipeline.clear();
 
         // All for DeviceCookie
@@ -445,14 +445,20 @@ impl ProxyHttp for GatewayRouter {
     ) -> Result<Box<HttpPeer>> {
         // The upstream address is now determined during the request_filter_and_prepare_upstream_peer phase and stored in the context.
         // We prioritize the address set by a specific action, and fall back to the default if none is set.
-        let upstream_addr = ctx
+        let upstream_addr = match ctx
             .override_upstream_addr
             .as_ref()
             .or(ctx.default_upstream_addr.as_ref())
-            .expect(
-                "Upstream address not set in GatewayCtx, neither by an action nor as a default",
-            );
-
+        {
+            Some(addr) => addr,
+            None => {
+                warn!(
+                    "[{}] No upstream defined for this request and no default is set. Responding with 503.",
+                    ctx.request_id
+                );
+                return Err(Error::new(pingora::ErrorType::HTTPStatus(503)));
+            }
+        };
         info!(
             "[{}] Selecting upstream peer for address: {}",
             ctx.request_id, upstream_addr
