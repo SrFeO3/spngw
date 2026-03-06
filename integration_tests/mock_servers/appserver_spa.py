@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Simple API Server (multithreaded) for integration tests.
+Simple SPA Server (multithreaded) for integration tests.
 
-Protected API backend requiring OIDC authentication (Bearer token).
-Supports JWS (Signed) and JWE (Encrypted) tokens.
+This implementation uses a pure SPA without a BFF.
 """
 
-# --- OIDC Configuration ---
-# Expects Bearer token issued by OIDC provider.
-OIDC_ISSUER_URL = "https://xxx/" # Must end with a slash for Auth0
-OIDC_AUDIENCE = "https://xxx" # API Identifier
+# OIDC Configuration
+OIDC_ISSUER_URL = "https://xxx/"
+OIDC_AUTHORIZATION_ENDPOINT = "https://xxx/authorize"
+OIDC_CLIENT_ID = "xxx"
+OIDC_REDIRECT_URI = "https://xxx/oidc/callback"
+OIDC_AUDIENCE = "https://xxx:8443" # audience is an Auth0-specific dialect.
+# Note on OIDC Provider differences:
+# - Google OIDC: Access Token is opaque (Access Tokens issued for Google APIs are often opaque strings, not JWTs. Only ID Tokens are JWT.)
+# - Auth0: Uses audience instead of resource (OAuth2 RFC 8707 defines the resource parameter; Auth0 uses audience parameter instead, but the resulting JWT aud claim is correct.)
+# - Logto: Access Token may be opaque or JWT (Depending on configuration, Logto may issue JWT or opaque Access Tokens; behavior is not fully predictable.)
 
-# If you expect JWE (Encrypted Tokens), set the decryption key here.
-# For 'alg: dir', this is the shared secret. For RSA, this is the PEM private key.
-JWE_DECRYPTION_KEY = None
+# Backend API Configuration
+API_BASE_URL = "https://procyon.test.example.com:8443"
 
+import json
 import time
 import threading
-from datetime import datetime
 import re
+import hashlib
+import base64
+from datetime import datetime
 import requests
-from jose import jwt, jwk
 from bottle import Bottle, request, response, ServerAdapter
 
 # --- Boilerplate for multi-threaded server ---
@@ -42,150 +48,277 @@ class MultiThreadedServer(ServerAdapter):
 
 app = Bottle()
 
-# --- JWT Validation Cache ---
-JWKS_CACHE = {}
-
-def get_jwks():
-    """Fetches and caches JWKS using OIDC Discovery."""
-    # Simple in-memory cache.
-    if "keys" in JWKS_CACHE:
-        return JWKS_CACHE["keys"]
-
-    # 1. Fetch OIDC Discovery Document
-    discovery_url = f"{OIDC_ISSUER_URL.rstrip('/')}/.well-known/openid-configuration"
-    print(f" > Fetching OIDC Discovery from {discovery_url}")
-    disc_resp = requests.get(discovery_url, timeout=5)
-    disc_resp.raise_for_status()
-    discovery_doc = disc_resp.json()
-    jwks_uri = discovery_doc.get('jwks_uri')
-    print(f" > Discovery successful. jwks_uri: {jwks_uri}")
-
-    # 2. Fetch JWKS
-    print(f" > Fetching JWKS from {jwks_uri}")
-    response = requests.get(jwks_uri, timeout=5)
-    response.raise_for_status()
-    jwks = response.json()
-    print(f" > Fetched JWKS content: {jwks}")
-    JWKS_CACHE["keys"] = jwks["keys"]
-    print(f" > Successfully fetched and cached {len(jwks['keys'])} key(s).")
-    return jwks["keys"]
-
-
-@app.hook('after_request')
-def enable_cors():
-    response.headers['Access-Control-Allow-Origin'] = '*'
-    response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type'
-
-@app.route('/api/add/<x:int>/<y:int>', method=['GET', 'OPTIONS'])
-@app.route('/protected/api/add/<x:int>/<y:int>', method=['GET', 'OPTIONS'])
-def add_api(x, y):
+@app.get('/')
+def index():
     """
-    Protected API adding two numbers. Requires Bearer token.
+    Main page. Serves the SPA.
     """
-    if request.method == 'OPTIONS':
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] {request.method} {request.url} - Responding to OPTIONS preflight.")
-        return {}
 
-    # --- Debug Logging ---
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] {request.method} {request.url}")
     print(f" > Host: {request.headers.get('Host')}")
-    print(f" > Origin: {request.headers.get('Origin')}")
-    for k, v in request.headers.items():
-        print(f" > Header: {k}: {v}")
+    print(f" > Cookie: {request.headers.get('Cookie')}")
 
-    auth_header = request.headers.get('Authorization')
-    response.content_type = 'application/json'
+    response.content_type = 'text/html; charset=utf-8'
+    return f"""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <title>Pure SPA Test(Non-BFF)</title>
+            <style>body {{ font-family: sans-serif; padding: 20px; }} .box {{ border: 1px solid #ccc; padding: 15px; margin-bottom: 20px; border-radius: 5px; }}</style>
+        </head>
+        <body>
+            <h1>Pure SPA Test Application (Non-BFF)</h1>
+            <p>Single Page Application accessing the API directly (CORS).</p>
 
-    if auth_header and auth_header.startswith('Bearer '):
-        token = auth_header.split(" ", 1)[1]
-        print(f" > Bearer token found. Validating as JWT...")
-        print(f" > Token: {token}")
+            <div class="box">
+                <h3>1. Authentication</h3>
+                <p>Status: <strong id="auth-status" style="color: red;">Not Logged In</strong></p>
+                <button onclick="loginWithOidc()">Login with OIDC</button>
+                <button onclick="logout()">Logout</button>
+            </div>
 
-        try:
-            # A JWE has 5 parts, a JWS has 3.
-            token_parts = token.split('.')
-            if len(token_parts) == 5:
-                # Handle as JWE (Encrypted)
-                print(f" > Token appears to be JWE (5 parts). Attempting decryption...")
+            <div class="box">
+                <h3>2. API Call</h3>
+                <p>Target: <code>{API_BASE_URL}/api/add/1/2</code></p>
+                <button onclick="callApi()">Call API (1 + 2)</button>
+                <p>Result: <span id="api-result" style="font-weight: bold;">...</span></p>
+            </div>
 
-                if not JWE_DECRYPTION_KEY:
-                    raise Exception("Received JWE token but JWE_DECRYPTION_KEY is not configured in apiserver.py.")
+            <script>
+                let accessToken = null;
 
-                # Decrypt and validate JWE
-                # python-jose handles decryption if the key is provided.
-                payload = jwt.decode(
-                    token,
-                    JWE_DECRYPTION_KEY,
-                    audience=OIDC_AUDIENCE,
-                    issuer=OIDC_ISSUER_URL
-                )
-            elif len(token_parts) == 3:
-                # Handle as JWS (Signed)
-                print(f" > Token appears to be JWS (3 parts). Verifying signature...")
+                // Generate random code verifier
+                function generateCodeVerifier() {{
+                    const randomBytes = new Uint8Array(32);
+                    window.crypto.getRandomValues(randomBytes);
+                    return btoa(String.fromCharCode.apply(null, randomBytes))
+                        .replace(/\+/g, '-')
+                        .replace(/\//g, '_')
+                        .replace(/=/g, '');
+                }}
 
-                try:
-                    unverified_header = jwt.get_unverified_header(token)
-                except Exception as e:
-                    print(f" > PRE-VALIDATION FAILED: Could not decode token header. Error: {e}")
-                    raise Exception(f"Token header decode failed. Is it a valid JWT? Error: {e}")
+                // Compute code challenge
+                async function generateCodeChallenge(verifier) {{
+                    const encoder = new TextEncoder();
+                    const data = encoder.encode(verifier);
+                    const digest = await window.crypto.subtle.digest('SHA-256', data);
+                    return btoa(String.fromCharCode.apply(null, new Uint8Array(digest)))
+                        .replace(/\+/g, '-')
+                        .replace(/\//g, '_')
+                        .replace(/=/g, '');
+                }}
 
-                print(f" > Unverified Token Header: {unverified_header}")
+                async function loginWithOidc() {{
+                    const codeVerifier = generateCodeVerifier();
+                    sessionStorage.setItem('pkce_code_verifier', codeVerifier);
+                    const codeChallenge = await generateCodeChallenge(codeVerifier);
 
-                jwks = get_jwks()
-                kid = unverified_header.get("kid")
-                if not kid:
-                    raise Exception("Token header does not contain 'kid' (Key ID)")
+                    const nonce = "test_nonce_" + Math.random().toString(36).substring(7);
+                    sessionStorage.setItem('oidc_nonce', nonce);
 
-                print(f" > Token KID: {kid}")
+                    const state = "test_state_" + Math.random().toString(36).substring(7);
+                    sessionStorage.setItem('oidc_state', state);
 
-                rsa_key = {}
-                for key in jwks:
-                    if key.get("kid") == kid:
-                        rsa_key = key
-                        break # Found the key
+                    console.log("--- OIDC Login Start ---");
+                    console.log("Code Verifier:", codeVerifier);
+                    console.log("Code Challenge:", codeChallenge);
+                    console.log("Nonce:", nonce);
+                    console.log("State:", state);
 
-                if not rsa_key:
-                    raise Exception(f"Unable to find a matching key for KID '{kid}' in JWKS")
+                    // Redirect to OIDC Provider
+                    const authEndpoint = "{OIDC_AUTHORIZATION_ENDPOINT}";
+                    const params = new URLSearchParams({{
+                        client_id: "{OIDC_CLIENT_ID}",
+                        redirect_uri: "{OIDC_REDIRECT_URI}",
+                        response_type: "code",
+                        scope: "openid offline_access",
+                        state: state,
+                        nonce: nonce,
+                        code_challenge: codeChallenge,
+                        code_challenge_method: 'S256',
+                        audience: "{OIDC_AUDIENCE}", // Request JWT for this API
+                    }});
+                    window.location.href = `${{authEndpoint}}?${{params.toString()}}`;
+                }}
 
-                print(f" > Found key for KID: {kid}. Validating...")
+                function logout() {{
+                    accessToken = null;
+                    document.getElementById('auth-status').textContent = "Not Logged In";
+                    document.getElementById('auth-status').style.color = "red";
+                    document.getElementById('api-result').textContent = "...";
+                }}
 
-                # Validate signature, expiration, issuer, and audience.
-                try:
-                    payload = jwt.decode(
-                        token, rsa_key, algorithms=["RS256"],
-                        audience=OIDC_AUDIENCE,
-                        issuer=OIDC_ISSUER_URL
-                    )
-                except Exception as e:
-                    print(f" > VALIDATION FAILED: {e.__class__.__name__} - {e}")
-                    raise e
-            else:
-                raise Exception(f"Invalid token format. Expected 3 (JWS) or 5 (JWE) parts, got {len(token_parts)}.")
+                function callApi() {{
+                    const headers = accessToken ? {{ 'Authorization': 'Bearer ' + accessToken }} : {{}};
+                    fetch('{API_BASE_URL}/api/add/1/2', {{ headers: headers }})
+                        .then(res => res.ok ? res.json() : {{ error: res.status + " " + res.statusText }})
+                        .then(data => document.getElementById('api-result').textContent = data.result || data.error)
+                        .catch(err => document.getElementById('api-result').textContent = "Error: " + err);
+                }}
+            </script>
+        </body>
+        </html>
+        """
 
-            print(f" > JWT signature, expiration, issuer, and audience are all valid.")
-            print(f" > Decision: Authenticated (JWT validation successful).")
-            print(f" > Payload: {payload}")
+@app.route('/oidc/callback')
+def oidc_callback():
+    """
+    Handle OIDC callback for SPA mode.
+    Handles the 'After Login' state via JS router.
+    """
+    print(f"\n[{datetime.now().strftime('%H:%M:%S')}] {request.method} {request.url}")
+    code = request.query.get('code')
+    state = request.query.get('state')
+    print(f" > Code: {code}")
+    print(f" > State: {state}")
 
-            result = x + y
-            return {'result': result}
+    # Server serves the page; JS handles token exchange.
+    token_endpoint = f"{OIDC_ISSUER_URL.rstrip('/')}/oauth/token"
+    userinfo_endpoint = f"{OIDC_ISSUER_URL.rstrip('/')}/userinfo"
 
-        except Exception as e:
-            print(f" > Decision: Not Authenticated (JWT validation failed: {e.__class__.__name__}: {e})")
-            response.status = 401
-            return {'error': f'Token validation failed: {e}'}
-    else:
-        print(" > Decision: Not Authenticated (No/Invalid Bearer token)")
-        response.status = 401
-        return {'error': 'Authentication required'}
+    # Render the SPA page in 'Logged In' state
+    response.content_type = 'text/html; charset=utf-8'
+    return f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <title>Pure SPA Test (Callback)</title>
+        <style>body {{ font-family: sans-serif; padding: 20px; }} .box {{ border: 1px solid #ccc; padding: 15px; margin-bottom: 20px; border-radius: 5px; }}</style>
+    </head>
+    <body>
+        <h1>Pure SPA Test Application (Callback Received)</h1>
+        <p>OIDC Callback handled by App Server (Non-BFF Mode).</p>
+
+        <div class="box">
+            <h3>1. Authentication</h3>
+            <p>Status: <strong style="color: green;">Logged In</strong></p>
+            <p>Code: <code>{code}</code></p>
+            <p>State (Returned): <code>{state}</code></p>
+            <p>State (Stored): <code id="state-display">...</code></p>
+            <p>Nonce: <code id="nonce-display">...</code></p>
+            <p>Code Verifier: <code id="verifier-display">...</code></p>
+            <p>Access Token: <code id="access-token-display" style="word-break: break-all;">Exchanging code...</code></p>
+            <button onclick="window.location.href='/'">Logout (Reset)</button>
+        </div>
+
+        <div class="box">
+            <h3>2. User Info</h3>
+            <pre id="userinfo-display" style="background-color: #f4f4f4; padding: 10px; border-radius: 5px;">Waiting for token...</pre>
+        </div>
+
+        <div class="box">
+            <h3>3. API Call</h3>
+            <p>Target: <code>{API_BASE_URL}/api/add/1/2</code></p>
+            <button onclick="callApi()">Call API (1 + 2)</button>
+            <p>Result: <span id="api-result" style="font-weight: bold;">...</span></p>
+        </div>
+
+        <script>
+            // Script runs on callback page.
+            const codeVerifier = sessionStorage.getItem('pkce_code_verifier');
+            const nonce = sessionStorage.getItem('oidc_nonce');
+            const state = sessionStorage.getItem('oidc_state');
+
+            document.getElementById('verifier-display').textContent = codeVerifier || "Not found in storage";
+            document.getElementById('nonce-display').textContent = nonce || "Not found in storage";
+            document.getElementById('state-display').textContent = state || "Not found in storage";
+
+            console.log("--- Callback Page Loaded ---");
+            console.log("Code Verifier (from storage):", codeVerifier);
+            console.log("Nonce (from storage):", nonce);
+            console.log("State (from storage):", state);
+
+            let accessToken = null;
+
+            function callApi() {{
+                if (!accessToken) {{
+                    document.getElementById('api-result').textContent = "Cannot call API: No Access Token.";
+                    return;
+                }}
+                const headers = {{ 'Authorization': 'Bearer ' + accessToken }};
+                fetch('{API_BASE_URL}/api/add/1/2', {{ headers }})
+                    .then(res => res.ok ? res.json() : res.text().then(text => Promise.reject(res.status + " " + res.statusText + ": " + text)))
+                    .then(data => {{
+                        document.getElementById('api-result').textContent = data.result !== undefined ? data.result : JSON.stringify(data);
+                    }})
+                    .catch(err => {{
+                        document.getElementById('api-result').textContent = "API Error: " + err;
+                    }});
+            }}
+
+            // Exchange authorization code for access token using PKCE.
+            async function exchangeCodeForToken() {{
+                const tokenDisplay = document.getElementById('access-token-display');
+                if (!codeVerifier) {{
+                    tokenDisplay.textContent = "ERROR: code_verifier not found in sessionStorage. Please start login flow again.";
+                    return;
+                }}
+
+                const payload = new URLSearchParams({{
+                    grant_type: 'authorization_code',
+                    code: '{code}',
+                    redirect_uri: '{OIDC_REDIRECT_URI}',
+                    client_id: '{OIDC_CLIENT_ID}',
+                    code_verifier: codeVerifier
+                }});
+
+                try {{
+                    console.log("--- Token Exchange Request 2---");
+                    console.log("Endpoint:", `{token_endpoint}`);
+                    console.log("Payload:", payload.toString());
+
+                    const response = await fetch(`{token_endpoint}`, {{ method: 'POST', headers: {{'Content-Type': 'application/x-www-form-urlencoded'}}, body: payload }});
+
+                    console.log("--- Token Exchange Response ---");
+                    console.log("Status:", response.status, response.statusText);
+                    const data = await response.json();
+                    console.log("Body:", data);
+
+                    if (data.access_token) {{
+                        accessToken = data.access_token;
+                        tokenDisplay.textContent = accessToken;
+                        fetchUserInfo(accessToken);
+                    }} else {{
+                        tokenDisplay.textContent = "ERROR: " + (data.error_description || JSON.stringify(data));
+                    }}
+                }} catch (err) {{
+                    tokenDisplay.textContent = "FATAL: " + err;
+                }}
+            }}
+
+            async function fetchUserInfo(token) {{
+                const display = document.getElementById('userinfo-display');
+                display.textContent = "Fetching...";
+                try {{
+                    console.log("--- Fetching User Info ---");
+                    const res = await fetch(`{userinfo_endpoint}`, {{
+                        headers: {{ 'Authorization': `Bearer ${{token}}` }}
+                    }});
+                    console.log("User Info Status:", res.status);
+                    const info = await res.json();
+                    console.log("User Info Body:", info);
+                    display.textContent = JSON.stringify(info, null, 2);
+                }} catch (e) {{
+                    display.textContent = "Failed to fetch user info: " + e;
+                }}
+            }}
+
+            exchangeCodeForToken();
+        </script>
+    </body>
+    </html>
+    """
 
 # --- Main execution ---
 
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Simple API Server for OIDC tests")
-    parser.add_argument("--port", type=int, default=7444,
-                        help="Port (default: 7444)")
+    parser = argparse.ArgumentParser(description="Simple App Server for OIDC tests")
+    parser.add_argument("--port", type=int, default=7443,
+                        help="Port (default: 7443)")
     parser.add_argument("--host", type=str, default="0.0.0.0",
                         help="Bind address (default: 0.0.0.0)")
 
