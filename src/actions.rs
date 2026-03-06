@@ -1085,12 +1085,25 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                     })?;
 
                 if !response.status().is_success() {
+                    let status = response.status();
+                    let body = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|e| format!("<failed to read body: {}>", e));
                     warn!(
-                        "[{}] [{}] Failed to exchange code for token. Status: {}, Body: {:?}",
+                        "[{}] [{}] Failed to exchange code for token.\n\
+                        > Target Endpoint: {}\n\
+                        > Request Parameters: client_id={}, redirect_uri={}, grant_type=authorization_code, code_verifier={}\n\
+                        > Response Status: {}\n\
+                        > Response Body: {}",
                         ctx.request_id,
                         self.name(),
-                        response.status(),
-                        response.text().await
+                        self.oidc_token_endpoint,
+                        self.oidc_client_id,
+                        self.oidc_redirect_url,
+                        pkce_verifier,
+                        status,
+                        body
                     );
                     let _ = session.respond_error(502).await; // Bad Gateway
                     return Ok(true);
