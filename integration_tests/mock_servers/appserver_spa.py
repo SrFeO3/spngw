@@ -4,14 +4,33 @@
 Simple SPA Server (multithreaded) for integration tests.
 
 This implementation uses a pure SPA without a BFF.
+Contrast this with appserver_bff.py (BFF SPA).
 """
 
-# OIDC Configuration
-OIDC_ISSUER_URL = "https://xxx/"
-OIDC_AUTHORIZATION_ENDPOINT = "https://xxx/authorize"
-OIDC_CLIENT_ID = "xxx"
-OIDC_REDIRECT_URI = "https://xxx/oidc/callback"
-OIDC_AUDIENCE = "https://xxx:8443" # audience is an Auth0-specific dialect.
+# --- OIDC Configuration ---
+# Select the provider by commenting/uncommenting the desired section.
+
+# OIDC Configuration for OKTA (default)
+OIDC_PROVIDER = "okta"
+OIDC_AUTHORIZATION_ENDPOINT = "https://xxx/oauth2/default/v1/authorize"
+OIDC_CLIENT_ID = "abc"
+OIDC_REDIRECT_URI = "https://betelgeuse.test.example.com:8443/oidc/callback"
+OIDC_ENDPOINT_TOKEN = "https://xxx/oauth2/default/v1/token"
+OIDC_ENDPOINT_USER = "https://xxx/oauth2/default/userinfo"
+# OIDC_AUDIENCE: For OKTA, not included in auth request; pre-configured on server side.
+# OIDC_AUDIENCE = "https://procyon.test.example.com:8443/"
+
+# OIDC Configuration for Auth0
+# OIDC_PROVIDER = "auth0"
+# OIDC_AUTHORIZATION_ENDPOINT = "https://xxx/authorize"
+# OIDC_CLIENT_ID = "abc"
+# OIDC_REDIRECT_URI = "https://betelgeuse.test.example.com:8443/oidc/callback"
+# OIDC_ENDPOINT_TOKEN = "https://xxx/oauth/token"
+# OIDC_ENDPOINT_USER = "https://xxx/userinfo"
+# # OIDC_AUDIENCE: Included in auth request for Auth0.
+# # (Note: Parameter name is 'audience'. OIDC standard is 'resource', but Auth0 uses custom.)
+# OIDC_AUDIENCE = "https://procyon.test.example.com:8443"
+
 # Note on OIDC Provider differences:
 # - Google OIDC: Access Token is opaque (Access Tokens issued for Google APIs are often opaque strings, not JWTs. Only ID Tokens are JWT.)
 # - Auth0: Uses audience instead of resource (OAuth2 RFC 8707 defines the resource parameter; Auth0 uses audience parameter instead, but the resulting JWT aud claim is correct.)
@@ -128,7 +147,7 @@ def index():
 
                     // Redirect to OIDC Provider
                     const authEndpoint = "{OIDC_AUTHORIZATION_ENDPOINT}";
-                    const params = new URLSearchParams({{
+                    const params = {{
                         client_id: "{OIDC_CLIENT_ID}",
                         redirect_uri: "{OIDC_REDIRECT_URI}",
                         response_type: "code",
@@ -136,10 +155,15 @@ def index():
                         state: state,
                         nonce: nonce,
                         code_challenge: codeChallenge,
-                        code_challenge_method: 'S256',
-                        audience: "{OIDC_AUDIENCE}", // Request JWT for this API
-                    }});
-                    window.location.href = `${{authEndpoint}}?${{params.toString()}}`;
+                        code_challenge_method: 'S256'
+                    }};
+
+                    // Auth0 requires an 'audience' parameter to issue a JWT access token.
+                    if ("{OIDC_PROVIDER}" === "auth0") {{
+                        params.audience = "{OIDC_AUDIENCE}";
+                    }}
+
+                    window.location.href = `${{authEndpoint}}?${{new URLSearchParams(params).toString()}}`;
                 }}
 
                 function logout() {{
@@ -174,8 +198,8 @@ def oidc_callback():
     print(f" > State: {state}")
 
     # Server serves the page; JS handles token exchange.
-    token_endpoint = f"{OIDC_ISSUER_URL.rstrip('/')}/oauth/token"
-    userinfo_endpoint = f"{OIDC_ISSUER_URL.rstrip('/')}/userinfo"
+    token_endpoint = OIDC_ENDPOINT_TOKEN
+    userinfo_endpoint = OIDC_ENDPOINT_USER
 
     # Render the SPA page in 'Logged In' state
     response.content_type = 'text/html; charset=utf-8'

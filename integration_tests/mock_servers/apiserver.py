@@ -8,9 +8,16 @@ Supports JWS (Signed) and JWE (Encrypted) tokens.
 """
 
 # --- OIDC Configuration ---
-# Expects Bearer token issued by OIDC provider.
-OIDC_ISSUER_URL = "https://xxx/" # Must end with a slash for Auth0
-OIDC_AUDIENCE = "https://xxx" # API Identifier
+# Select the provider by commenting/uncommenting the desired section.
+
+# OIDC Configuration for OKTA
+OIDC_ISSUER_URL = "https://xxx/oauth2/default"
+OIDC_AUDIENCE = "https://procyon.test.example.com:8443/"
+
+# OIDC Configuration for Auth0
+# OIDC_ISSUER_URL = "https://xxx/"
+# OIDC_AUDIENCE = "https://procyon.test.example.com:8443"
+
 
 # If you expect JWE (Encrypted Tokens), set the decryption key here.
 # For 'alg: dir', this is the shared secret. For RSA, this is the PEM private key.
