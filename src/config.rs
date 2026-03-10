@@ -58,6 +58,8 @@ struct ApiRealm {
     public_key_pem: String,
     #[serde(rename = "deviceIdSigningKey")]
     private_key_pem: String,
+    #[serde(rename = "sessionTimeout", default)]
+    session_timeout: u64,
 }
 
 /// Rule that matches a request and specifies an action to perform.
@@ -151,7 +153,7 @@ pub struct RealmConfig {
     #[serde(default)]
     pub _cacert: String,
     #[serde(default)]
-    pub _session_timeout: u64,
+    pub session_timeout: u64,
     #[serde(default)]
     pub _administrators: Vec<String>,
     #[serde(default)]
@@ -672,12 +674,12 @@ async fn fetch_config_from_url(url: &str) -> Result<(AppConfig, String), Box<dyn
                 routing_chains,
                 zones,
                 disabled: api_realm.disabled,
+                session_timeout: api_realm.session_timeout,
                 // Assume these fields are not provided by the API and set defaults.
                 _urn: String::new(),
                 _title: String::new(),
                 _description: String::new(),
                 _cacert: String::new(),
-                _session_timeout: 0,
                 _administrators: Vec::new(),
                 _expired_at: String::new(),
                 _hubs: Vec::new(),

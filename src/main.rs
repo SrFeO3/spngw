@@ -9,14 +9,9 @@
 //   RUST_LOG=info cargo run
 //
 // TODO:
-// - Consider default_cert on main should be configurable instead of hardcoded.
-// - Consider adding a route for requests with no SNI found in the filter
-// - Consider handling cases where no upstream is found in upstream_peer
-// - Implement application sessions and background session cleaner
-// - Implement operational settings to be configured externally
+// - Consider making the default certificate configurable instead of using the first one found.
 // - Implement `/api/logout` endpoint to invalidate sessions and tokens
-// - Implement a lock for token refresh to prevent the dog-piling effect
-// - Review the backend SSL implementation using Pingora (currently using boringssl)
+// - Implement a locking mechanism for token refresh to prevent the dog-piling effect.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -38,6 +33,10 @@ mod config;
 use crate::config::{
     AppConfig, CertificateCache, JwtKeysCache, RealmMap, UpstreamCache,
 };
+
+mod background_services;
+
+const DEFAULT_SESSION_TIMEOUT_SECONDS: u64 = 86400; // 1 day
 
 /// Core logic and shared state for the proxy service
 ///
@@ -66,6 +65,7 @@ struct GatewayRouter {
 struct GatewayCtx {
     // The name of the realm processing this request.
     realm_name: String,
+    session_timeout: u64,
     app_config: Option<Arc<AppConfig>>,
     realm_index: Option<usize>,
     request_id: String,
@@ -109,6 +109,7 @@ impl ProxyHttp for GatewayRouter {
     fn new_ctx(&self) -> Self::CTX {
         GatewayCtx {
             realm_name: String::new(),
+            session_timeout: 0, // Will be set from realm config, with a default fallback.
             app_config: None,
             realm_index: None,
             request_id: format!("req-{}", rand::random::<u32>()),
@@ -207,8 +208,19 @@ impl ProxyHttp for GatewayRouter {
                 .unwrap_or(0); // Should be safe if map is consistent with config
             ctx.realm_index = Some(index);
 
-            // Resolve Cookie Domain if share_cookie is enabled
+            // Get session timeout from realm config
             let realm_config = &app_config.realms[index];
+            let session_timeout = if realm_config.session_timeout > 0 {
+                info!("[{}] Using session timeout from realm '{}': {} seconds", ctx.request_id, realm_config.name, realm_config.session_timeout);
+                realm_config.session_timeout
+            } else {
+                info!("[{}] Realm '{}' has no session timeout configured, using default: {} seconds", ctx.request_id, realm_config.name, DEFAULT_SESSION_TIMEOUT_SECONDS);
+                DEFAULT_SESSION_TIMEOUT_SECONDS
+            };
+            ctx.session_timeout = session_timeout;
+
+
+            // Resolve Cookie Domain if share_cookie is enabled
             if let Some(sni) = &ctx.front_sni_name {
                 if let Some(vhost) = realm_config
                     .virtual_hosts
@@ -907,6 +919,10 @@ fn main() -> pingora::Result<()> {
         initial_config_content,
     );
     my_server.add_service(background_service("Config Reloader", signal_reload_service));
+
+    // Create and add the session cleanup service.
+    let session_cleanup_service = background_services::SessionCleanupService::new();
+    my_server.add_service(background_service("Session Cleaner", session_cleanup_service));
 
     // Initialize a shared HTTP client for the gateway
     let http_client = reqwest::Client::new();

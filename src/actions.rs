@@ -93,6 +93,7 @@ pub struct ApplicationSession {
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
     pub access_token_expires_at: Option<u64>, // Unix timestamp
+    pub expires_at: u64,                      // Unix timestamp for the session itself
     pub oidc_nonce: Option<String>,
     pub oidc_pkce_verifier: Option<String>,
     pub oidc_state: Option<String>,
@@ -872,6 +873,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
         // --- Start of merged logic from ApplicationSessionManagementRoute ---
         let mut session_found = false;
         let mut app_session_opt: Option<ApplicationSession> = None;
+        let now = Utc::now().timestamp() as u64;
 
         let cookie_name = format!("CHIPIN_SESSION_ID_{}", self.auth_scope_name.to_uppercase());
         if let Some(cookie_header) = session.req_header().headers.get("Cookie") {
@@ -889,17 +891,35 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                             );
 
                             if let Some(app_session_ref) = session_store.get(&session_id) {
-                                info!(
-                                    "[{}] [{}] Found active session for user: {}",
-                                    ctx.request_id,
-                                    self.name(),
-                                    app_session_ref.user_id
-                                );
-                                app_session_opt = Some(app_session_ref.value().as_ref().clone());
-                                session_found = true;
+                                let mut app_session = app_session_ref.value().as_ref().clone();
+                                // Check if session is expired
+                                if app_session.expires_at < now {
+                                    warn!(
+                                        "[{}] [{}] Session {} for user {} has expired. Removing.",
+                                        ctx.request_id,
+                                        self.name(),
+                                        app_session.session_id,
+                                        app_session.user_id
+                                    );
+                                    session_store.remove(&session_id);
+                                    session_found = false;
+                                } else {
+                                    info!(
+                                        "[{}] [{}] Found active session for user: {}",
+                                        ctx.request_id,
+                                        self.name(),
+                                        app_session.user_id
+                                    );
+                                    // Extend session lifetime
+                                    app_session.expires_at = now + ctx.session_timeout;
+                                    session_store
+                                        .insert(session_id, Arc::new(app_session.clone()));
+                                    app_session_opt = Some(app_session);
+                                    session_found = true;
+                                }
                             } else {
                                 warn!(
-                                    "[{}] [{}] {} found, but no active session in store.",
+                                    "[{}] [{}] {} cookie found, but no active session in store.",
                                     ctx.request_id,
                                     self.name(),
                                     cookie_name
@@ -932,6 +952,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 access_token: None,
                 refresh_token: None,
                 access_token_expires_at: None,
+                expires_at: now + ctx.session_timeout, // Set expiration on creation
                 oidc_nonce: None,
                 oidc_pkce_verifier: None,
                 oidc_state: None,
@@ -1479,8 +1500,8 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 );
                 let cookie_name = format!("CHIPIN_SESSION_ID_{}", scope_name.to_uppercase());
                 let mut cookie_value = format!(
-                    "{}={}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax",
-                    cookie_name, new_cookie_value
+                    "{}={}; Path=/; Max-Age={}; HttpOnly; SameSite=Lax",
+                    cookie_name, new_cookie_value, ctx.session_timeout
                 );
                 if let Some(domain) = &ctx.cookie_domain {
                     cookie_value.push_str(&format!("; Domain={}", domain));
@@ -1609,8 +1630,8 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
             );
             let cookie_name = format!("CHIPIN_SESSION_ID_{}", scope_name.to_uppercase());
             let mut cookie_value = format!(
-                "{}={}; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax",
-                cookie_name, new_cookie_value
+                "{}={}; Path=/; Max-Age={}; HttpOnly; SameSite=Lax",
+                cookie_name, new_cookie_value, ctx.session_timeout
             );
             if let Some(domain) = &ctx.cookie_domain {
                 cookie_value.push_str(&format!("; Domain={}", domain));
