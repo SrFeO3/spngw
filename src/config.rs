@@ -7,15 +7,15 @@
 /// ## Key Components:
 ///
 /// - **`AppConfig` and related structs**: These are `serde`-deserializable structures
-///   that represent the hierarchy of the `config.yaml` file.
+///   that represent the hierarchy of the configuration source (file or API).
 ///
-/// - **`ConfigHotReloadService`**: A background service that monitors `config.yaml` for changes
-///   and applies them to the running application without downtime. It uses `ArcSwap` to
-///   atomically update shared configuration data.
+/// - **`SignalReloadService`**: A background service that reloads configuration upon
+///   receiving a signal (e.g., SIGUSR1) and applies changes to the running application
+///   without downtime. It uses `ArcSwap` to atomically update shared configuration data.
 ///
-/// - **Caches and Registries (`UpstreamCache`, `CertificateCache`, `AuthScopeRegistry`, `JwtKeysCache`)**:
+/// - **Caches (`UpstreamCache`, `CertificateCache`, `RealmMap`, `JwtKeysCache`)**:
 ///   These components hold processed, ready-to-use data derived from the main configuration.
-///   They are designed to be hot-reloaded and are managed by the `ConfigHotReloadService`.
+///   They are designed to be hot-reloaded and are managed by the `SignalReloadService`.
 ///
 /// ## Hot-Reloading and Idempotency
 ///
@@ -23,15 +23,11 @@
 /// - **JWT Keys, Certificates, and Upstreams**: When the configuration changes, only the
 ///   items that have been added, modified, or removed are updated. Unchanged items are
 ///   left as-is.
-/// - **Authentication Scopes**: The `AuthScopeRegistry` performs a differential update.
-///   It adds new scopes and removes obsolete ones, but crucially, it does **not** touch
-///   existing, unchanged scopes. This ensures that active user sessions within those
+/// - **Authentication Scopes**: A differential update is performed on authentication scopes.
+///   New scopes are added and obsolete ones are removed, but crucially, existing,
+///   unchanged scopes are not touched. This ensures that active user sessions within those
 ///   scopes are preserved across configuration reloads.
-///
-/// TODO:
-/// - Consider default_upstream on UpstreamCache should be configurable instead of hardcoded.
 use std::collections::HashSet;
-use std::fs;
 use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
@@ -593,6 +589,24 @@ pub fn populate_caches_from_config(
     info!("[Config] All caches have been populated from the configuration.");
 }
 
+/// Loads configuration from a source specified by a path, which can be a URL or a file URI.
+async fn load_config_from_source(path: &str) -> Result<(AppConfig, String), Box<dyn std::error::Error + Send + Sync>> {
+    if path.starts_with("http://") || path.starts_with("https://") {
+        info!("[ConfigLoad] Fetching configuration from repository: {}", path);
+        fetch_config_from_url(path).await
+    } else if let Some(file_path) = path.strip_prefix("file://") {
+        info!("[ConfigLoad] Reading configuration from file: {}", file_path);
+        let content = tokio::fs::read_to_string(file_path).await
+            .map_err(|e| format!("Failed to read configuration from {}: {}", file_path, e))?;
+        let mut config: AppConfig = serde_yaml::from_str(&content)
+            .map_err(|e| format!("Failed to parse configuration from {}: {}", file_path, e))?;
+        config.resolve_hostnames()?;
+        Ok((config, content))
+    } else {
+        Err(format!("Unsupported configuration source scheme in path: {}. Use 'file://' or 'http(s)://'.", path).into())
+    }
+}
+
 /// Fetches configuration from multiple repository API endpoints and constructs the AppConfig.
 async fn fetch_config_from_url(url: &str) -> Result<(AppConfig, String), Box<dyn std::error::Error + Send + Sync>> {
     // Helper to fetch and deserialize JSON from a URL, with enhanced error reporting.
@@ -704,28 +718,16 @@ async fn fetch_config_from_url(url: &str) -> Result<(AppConfig, String), Box<dyn
 }
 
 pub fn load_app_config(path: &str) -> (Arc<AppConfig>, String) {
-    if path.starts_with("http://") || path.starts_with("https://") {
-        info!("[ConfigLoad] Fetching configuration from repository: {}", path);
-        // Create a temporary runtime to execute the async fetch function during synchronous startup.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let (config, content) = rt.block_on(fetch_config_from_url(path))
-            .unwrap_or_else(|e| panic!("Failed to fetch and build configuration from repository {}: {}", path, e));
-        (Arc::new(config), content)
-    } else {
-        info!("[ConfigLoad] Reading configuration from file: {}", path);
-        let content = fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("Failed to read configuration from {}: {}", path, e));
-        let mut config: AppConfig = serde_yaml::from_str(&content)
-            .unwrap_or_else(|e| panic!("Failed to parse configuration from {}: {}", path, e));
-        // Use blocking client for initial synchronous load
-        if let Err(e) = config.resolve_hostnames() {
-            panic!("Failed to resolve hostnames: {}", e);
-        }
-        (Arc::new(config), content)
-    }
+    // Create a temporary runtime to execute the async load function during synchronous startup.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let (config, content) = rt.block_on(load_config_from_source(path))
+        .unwrap_or_else(|e| panic!("Failed to load initial configuration from {}: {}", path, e));
+
+    (Arc::new(config), content)
 }
 
 // --- Hot Reload Service ---
@@ -787,31 +789,7 @@ impl SignalReloadService {
     async fn reload_config(&self) { // This is now synchronous but fast enough.
         info!("[Signal] SIGUSR1 received. Triggering configuration reload.");
 
-        let result = if self.config_path.starts_with("http://") || self.config_path.starts_with("https://") {
-            fetch_config_from_url(&self.config_path).await
-        } else {
-            // Local file logic
-            let content = match tokio::fs::read_to_string(&self.config_path).await {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("[ConfigReload] Failed to read configuration file {}: {}", self.config_path, e);
-                    return;
-                }
-            };
-            match serde_yaml::from_str::<AppConfig>(&content) {
-                Ok(mut config) => {
-                    if let Err(e) = config.resolve_hostnames() {
-                        warn!("Failed to resolve hostnames in reloaded file: {}", e);
-                        return;
-                    }
-                    Ok((config, content))
-                },
-                Err(e) => {
-                    warn!("Failed to parse configuration file: {}", e);
-                    return;
-                }
-            }
-        };
+        let result = load_config_from_source(&self.config_path).await;
 
         let (new_config, current_content) = match result {
             Ok(res) => res,

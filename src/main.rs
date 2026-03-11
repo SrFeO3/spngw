@@ -826,8 +826,8 @@ fn main() -> pingora::Result<()> {
     env_logger::init();
 
     // Read environment variables
-    // If APIGW_INVENTORY_URL is not set, default to the local file.
-    let config_path = std::env::var("APIGW_INVENTORY_URL").unwrap_or_else(|_| "conf/config.yaml".to_string());
+    let config_path = std::env::var("APIGW_INVENTORY_URL")
+        .expect("APIGW_INVENTORY_URL must be set. Use 'file:///path/to/config.yaml' or 'http(s)://...'.");
     let gateway_listen_addr = std::env::var("APIGW_TLS_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8443".to_string());
     let redirect_service_listen_addr = std::env::var("APIGW_HTTP_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     info!(
