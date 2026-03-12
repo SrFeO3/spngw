@@ -907,8 +907,7 @@ impl RouteLogic for IssueDeviceCookieRoute {
                 self.name()
             );
             let mut cookie_value = format!(
-                //"CHIPIN_DEVICE_CONTEXT={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict",
-                "CHIPIN_DEVICE_CONTEXT={}; Path=/; Max-Age={}; HttpOnly; SameSite=Strict",
+                "CHIPIN_DEVICE_CONTEXT={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict",
                 new_cookie_value, DEVICE_COOKIE_MAX_AGE
             );
             if let Some(domain) = &ctx.cookie_domain {
@@ -1143,11 +1142,12 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
 
         if !is_authenticated {
             // The user is not authenticated. This block handles two potential scenarios:
-            // 1. A new user accessing a protected resource for the first time.
-            // 2. A user returning from the OIDC provider after authentication (the callback).
+            // 1. A new user accessing a protected resource for the first time (initiate login).
+            // 2. A user returning from the OIDC provider after authentication (handle callback).
 
-            // --- Scenario 2: A user returning from the OIDC provider after authentication (the callback). ---
-            // Check for OIDC callback parameters ('code' and 'state')
+            // First, determine if this is an OIDC callback request.
+            // A callback is identified by the presence of 'code' and 'state' query parameters
+            // AND the request path matching the configured `oidc_redirect_url`.
             let mut oidc_code = None;
             let mut oidc_state = None;
             if let Some(query) = session.req_header().uri.query() {
@@ -1157,16 +1157,41 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                         "state" => oidc_state = Some(value.into_owned()),
                         _ => {}
                     }
-                    // Stop iterating once both parameters are found.
                     if oidc_code.is_some() && oidc_state.is_some() {
                         break;
                     }
                 }
             }
-            // If both 'code' and 'state' are present, handle it as an OIDC callback (Scenario 2).
-            // Otherwise, proceed to Scenario 1: initiate a new authentication flow.
-            if let (Some(code), Some(state)) = (oidc_code, oidc_state) {
+
+            let is_callback_request = if oidc_code.is_some() && oidc_state.is_some() {
+                if let Ok(configured_redirect_url) = Url::parse(self.oidc_redirect_url) {
+                    if session.req_header().uri.path() == configured_redirect_url.path() {
+                        true
+                    } else {
+                        warn!(
+                            "[{}] [{}] OIDC callback parameters detected on an unexpected path. Expected: '{}', Actual: '{}'. Ignoring callback and initiating new login.",
+                            ctx.request_id,
+                            self.name(),
+                            configured_redirect_url.path(),
+                            session.req_header().uri.path()
+                        );
+                        false
+                    }
+                } else {
+                    warn!("[{}] [{}] Invalid oidc_redirect_url in configuration: {}. Cannot process callback.", ctx.request_id, self.name(), self.oidc_redirect_url);
+                    false
+                }
+            } else {
+                false
+            };
+
+            if is_callback_request {
                 // --- Scenario 2: Handle OIDC Callback ---
+                // This block is executed when the user is redirected back from the OIDC provider.
+                // It validates the response and exchanges the authorization code for tokens.
+                let code = oidc_code.unwrap(); // Safe due to the check above
+                let state = oidc_state.unwrap(); // Safe due to the check above
+
                 info!(
                     "[{}] [{}] OIDC callback detected. Handling token exchange.",
                     ctx.request_id,
@@ -1204,23 +1229,21 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                     return Ok(true);
                 }
 
-                // 2-2. Check existence of PKCE verifier in session.
-                let pkce_verifier = match ctx
-                    .action_state_app_session
-                    .as_ref()
-                    .and_then(|s| s.oidc_pkce_verifier.as_ref())
-                {
-                    Some(v) => v.clone(),
-                    None => {
-                        warn!(
-                            "[{}] [{}] No PKCE verifier found in session for token exchange.",
-                            ctx.request_id,
-                            self.name()
-                        );
-                        let _ = session.respond_error(400).await; // Bad Request
-                        return Ok(true);
-                    }
-                };
+                // 2-2. PKCE Validation: Retrieve the verifier to prove we initiated the login.
+                // The `code_verifier` was stored in the session when the auth flow began.
+                // We send it to the token endpoint, where the OIDC provider validates it
+                // against the `code_challenge` from the initial request. This prevents
+                // authorization code interception attacks.
+                let pkce_verifier =
+                    ctx.action_state_app_session.as_ref()
+                        .and_then(|s| s.oidc_pkce_verifier.clone())
+                        .ok_or_else(|| {
+                            warn!(
+                                "[{}] [{}] No PKCE verifier found in session for token exchange.",
+                                ctx.request_id, self.name()
+                            );
+                            Error::new(ErrorType::HTTPStatus(400)) // Bad Request
+                        })?;
 
                 // 2-3. Exchange the authorization code for an access token and ID token.
                 // Define a struct to deserialize the token endpoint's response.
@@ -1238,7 +1261,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                     ("code", code.as_str()),
                     ("redirect_uri", self.oidc_redirect_url),
                     ("client_id", self.oidc_client_id),
-                    ("code_verifier", pkce_verifier.as_str()),
+                    ("code_verifier", &pkce_verifier),
                     ("client_secret", self.oidc_client_secret),
                 ];
                 let response = client
@@ -1307,9 +1330,9 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                     tokens
                 );
 
-                // 2-4. Validate the received ID token (signature, issuer, audience, nonce, expiration).
+                // 2-4. Validate the received tokens (ID Token and Access Token).
 
-                // 2-4-1. Prepare oidc key and info for token validation
+                // 2-4-1. Fetch OIDC provider's keys for validation.
                 let (oidc_config, jwks) = fetch_oidc_keys(
                     client,
                     self.oidc_token_endpoint,
@@ -1318,7 +1341,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 )
                 .await?;
 
-                // 2-4-2. check ID token
+                // 2-4-2. Validate the ID Token.
                 let id_token = &tokens.id_token;
                 let mut validation = Validation::new(jsonwebtoken::Algorithm::RS256); // Assuming RS256 for OIDC
                 validation.set_audience(&[self.oidc_client_id]);
@@ -1390,22 +1413,23 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                     }
                 };
 
-                // 2-4-3. Manually validate the nonce claim after successful decoding
+                // 2-4-3. Nonce Validation: Check the nonce to prevent replay attacks.
+                // The nonce is a random string generated at the start of the login flow.
+                // The OIDC provider must include this same nonce in the ID Token.
+                // This check ensures the token was issued for this specific login attempt.
                 if let Some(stored_nonce) = ctx
                     .action_state_app_session
                     .as_ref()
                     .and_then(|s| s.oidc_nonce.as_ref())
                 {
-                    // The `decode` function with `required_spec_claims` ensures the "nonce" claim exists.
-                    // We can safely unwrap here, but using `and_then` is more robust.
                     let token_nonce = token_data
                         .claims
                         .get("nonce")
                         .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                        .unwrap_or(""); // Should not happen due to `required_spec_claims`
                     if token_nonce != stored_nonce {
                         warn!(
-                            "[{}] [{}] ID token nonce mismatch. Expected: {}, Got: {}",
+                            "[{}] [{}] ID token nonce mismatch (replay attack?). Expected: {}, Got: {}",
                             ctx.request_id,
                             self.name(),
                             stored_nonce,
@@ -1415,6 +1439,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                         return Ok(true);
                     }
                 }
+                info!("[{}] [{}] Nonce validation successful.", ctx.request_id, self.name());
 
                 info!(
                     "[{}] [{}] ID Token successfully validated. Claims: {:?}",
@@ -1423,7 +1448,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                     token_data.claims
                 );
 
-                // 2-4-4. Validate the received Access Token (signature, issuer, audience).
+                // 2-4-4. Validate the Access Token.
                 // We perform this check immediately upon receipt to ensure we don't store an invalid token.
                 // We reuse the JWKS and OIDC config fetched for the ID token to avoid extra network costs.
                 {
@@ -1433,7 +1458,9 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                         if let Some(kid) = at_header.kid {
                             let mut at_validation = Validation::new(at_header.alg);
                             at_validation.set_issuer(&[oidc_config.issuer.as_str()]);
-                            at_validation.validate_aud = false; // skip check audience ('aud')
+                            // The audience ('aud') of an access token is the Resource Server (the API),
+                            // not this client (the BFF). So we skip the audience check here.
+                            at_validation.validate_aud = false;
 
                             let mut at_valid = false;
                             let mut last_error: Option<jsonwebtoken::errors::Error> = None;
@@ -1493,7 +1520,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                     }
                 }
 
-                // 2-5. SESSION FIXATION MITIGATION
+                // 2-5. Session Fixation Mitigation: Regenerate Session ID.
                 // Upon successful authentication, we must regenerate the session ID
                 // to prevent session fixation attacks.
 
@@ -1564,8 +1591,8 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 // This will overwrite the old session cookie.
                 ctx.action_state_new_app_session_cookie = Some((new_session_id, self.auth_scope_name.to_string()));
 
-                // 2-5-8. Redirect the user back to the original resource (or a default page).
-                // Retrieve the original destination from the session, or default to "/".
+                // 2-6. Redirect the user back to their original destination.
+                // Retrieve the original destination from the session, or default to the root.
                 let redirect_path = app_session
                     .auth_original_destination
                     .take()
@@ -1608,10 +1635,11 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 return Ok(true); // Stop the pipeline.
             }
 
-            // --- Scenario 1: A new user accessing a protected resource for the first time. ---
-            // We will generate OIDC parameters, save them to the session, and redirect the user.
+            // --- Scenario 1: Initiate New Authentication Flow ---
+            // This block is executed for unauthenticated users on a protected route.
+            // It generates OIDC parameters (state, nonce, PKCE), saves them to the session,
+            // and redirects the user to the OIDC provider's authorization endpoint.
 
-            // Ensure we have a session to store the OIDC state in.
             let mut app_session = match ctx.action_state_app_session.clone() {
                 Some(s) => s, // Clone the session to modify it.
                 None => {
@@ -1626,7 +1654,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 }
             };
 
-            // 1. Generate and store a 'nonce' for replay attack protection.
+            // 1-1. Generate and store a 'nonce' for replay attack protection.
             let nonce: String = rand::rng()
                 .sample_iter(&Alphanumeric)
                 .take(32)
@@ -1634,7 +1662,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 .collect();
             app_session.oidc_nonce = Some(nonce.clone());
 
-            // 2. Generate and store a 'code_verifier' for PKCE.
+            // 1-2. Generate and store a 'code_verifier' for PKCE.
             let code_verifier: String = rand::rng()
                 .sample_iter(&Alphanumeric)
                 .take(64)
@@ -1642,14 +1670,14 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 .collect();
             app_session.oidc_pkce_verifier = Some(code_verifier.clone());
 
-            // 3. Create the 'code_challenge' from the verifier.
+            // 1-3. Create the 'code_challenge' from the verifier.
             let mut hasher = Sha256::new();
             hasher.update(code_verifier.as_bytes());
             let challenge_bytes = hasher.finalize();
             let code_challenge = general_purpose::URL_SAFE_NO_PAD.encode(challenge_bytes);
             // The result is Base64-URL encoded with no padding, as required by the PKCE spec (RFC 7636).
 
-            // 4. Generate a 'state' parameter for CSRF protection.
+            // 1-4. Generate a 'state' parameter for CSRF protection.
             let state: String = rand::rng()
                 .sample_iter(&Alphanumeric)
                 .take(16)
@@ -1657,13 +1685,13 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 .collect();
             app_session.oidc_state = Some(state.clone());
 
-            // 5. Save the original request URL to the session so we can redirect back later.
+            // 1-5. Save the original request URL to the session so we can redirect back later.
             app_session.auth_original_destination = Some(session.req_header().uri.to_string());
 
-            // 6. Update the session in the central store with the new OIDC values.
+            // 1-6. Update the session in the central store with the new OIDC values.
             session_store.insert(app_session.session_id.clone(), Arc::new(app_session));
 
-            // 7. Build the OIDC authorization URL with all the necessary parameters.
+            // 1-7. Build the OIDC authorization URL with all the necessary parameters.
             let mut auth_url =
                 Url::parse(self.oidc_authorization_endpoint).expect("Invalid OIDC login URL");
             auth_url
@@ -1684,7 +1712,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 self.name()
             );
 
-            // 8. Perform the redirect.
+            // 1-8. Perform the redirect.
             let mut header = ResponseHeader::build(302, None).unwrap();
             header.insert_header("Location", auth_url.as_str()).unwrap();
 
@@ -1697,8 +1725,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 );
                 let cookie_name = format!("CHIPIN_SESSION_ID_{}", scope_name.to_uppercase());
                 let mut cookie_value = format!(
-                    "{}={}; Path=/; Max-Age={}; HttpOnly; SameSite=Lax",
-                    //"{}={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Lax",
+                    "{}={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Lax",
                     cookie_name, new_cookie_value, ctx.session_timeout
                 );
                 if let Some(domain) = &ctx.cookie_domain {
@@ -1828,8 +1855,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
             );
             let cookie_name = format!("CHIPIN_SESSION_ID_{}", scope_name.to_uppercase());
             let mut cookie_value = format!(
-                //"{}={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Lax",
-                "{}={}; Path=/; Max-Age={}; HttpOnly; SameSite=Lax",
+                "{}={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Lax",
                 cookie_name, new_cookie_value, ctx.session_timeout
             );
             if let Some(domain) = &ctx.cookie_domain {
