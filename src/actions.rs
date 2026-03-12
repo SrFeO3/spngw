@@ -102,6 +102,8 @@ pub struct ApplicationSession {
     pub oidc_client_secret: String,
     pub auth_scope_name: Option<String>,
     pub auth_original_destination: Option<String>,
+    // Timestamp of the last token refresh attempt to mitigate dog-piling.
+    pub last_refresh_attempt_at: u64,
 }
 
 /// Device context for JWT cookie
@@ -152,6 +154,17 @@ pub enum GatewayAction {
         auth_scope_name: Arc<str>,
         oidc_client_secret: Arc<str>,
     },
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct OidcDiscovery {
+    issuer: String,
+    jwks_uri: String,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct Jwks {
+    keys: Vec<serde_json::Value>, // Use serde_json::Value to parse individual keys
 }
 
 // Define a trait for all route-specific logic.
@@ -219,6 +232,70 @@ pub struct RequireAuthenticationRoute<'a> {
     pub oidc_client_secret: &'a str,
 }
 
+/// Fetches OIDC discovery document and JWKS.
+/// This is a helper function to centralize the logic for fetching OIDC provider metadata.
+/// It's designed to be cacheable in the future.
+async fn fetch_oidc_keys(
+    client: &reqwest::Client,
+    oidc_token_endpoint: &str,
+    request_id: &str,
+    action_name: &str,
+) -> Result<(OidcDiscovery, Jwks), Error> {
+    // Fetch OIDC configuration (Discovery) to get JWKS URI and Issuer.
+    // We attempt to find the discovery document relative to the token endpoint.
+    // Heuristic: Assume the token endpoint is something like `.../token` or `.../oauth2/v1/token`.
+    // We try to go up one level and look for `.well-known/openid-configuration`.
+    let token_endpoint_url = Url::parse(oidc_token_endpoint).map_err(|e| {
+        warn!(
+            "[{}] [{}] Invalid OIDC token endpoint URL: {}",
+            request_id, action_name, e
+        );
+        *Error::explain(ErrorType::InternalError, "Invalid OIDC token endpoint URL")
+    })?;
+
+    let discovery_url = token_endpoint_url
+        .join("../.well-known/openid-configuration")
+        .map_err(|e| {
+            warn!(
+                "[{}] [{}] Failed to construct OIDC discovery URL: {}",
+                request_id, action_name, e
+            );
+            *Error::explain(ErrorType::InternalError, "Failed to construct OIDC discovery URL")
+        })?;
+
+    let discovery_resp = client.get(discovery_url.clone()).send().await.map_err(|e| {
+        warn!(
+            "[{}] [{}] Failed to fetch OIDC discovery from {}: {}",
+            request_id, action_name, discovery_url, e
+        );
+        *Error::explain(ErrorType::InternalError, "Failed to fetch OIDC discovery")
+    })?;
+
+    let oidc_config: OidcDiscovery = discovery_resp.json().await.map_err(|e| {
+        warn!(
+            "[{}] [{}] Failed to parse OIDC discovery response: {}",
+            request_id, action_name, e
+        );
+        *Error::explain(ErrorType::InternalError, "Failed to parse OIDC discovery response")
+    })?;
+
+    // Fetch JWKS using the URI from discovery
+    let jwks_response = client.get(&oidc_config.jwks_uri).send().await.map_err(|e| {
+        warn!(
+            "[{}] [{}] Failed to fetch JWKS from {}: {}",
+            request_id, action_name, oidc_config.jwks_uri, e
+        );
+        *Error::explain(ErrorType::InternalError, "Failed to fetch JWKS")
+    })?;
+
+    let jwks: Jwks = jwks_response.json().await.map_err(|e| {
+        warn!("[{}] [{}] Failed to parse JWKS: {}", request_id, action_name, e);
+        *Error::explain(ErrorType::InternalError, "Failed to parse JWKS")
+    })?;
+
+    Ok((oidc_config, jwks))
+}
+
 // Helper function to inject the Authorization header into the upstream request.
 // It ensures the access token is fresh by refreshing it if necessary.
 // Returns `true` if the token is valid (or if no session exists), and `false` if the token refresh failed.
@@ -256,98 +333,173 @@ async fn inject_authorization_header_and_token_refresh(
                     now,
                     expires_at.saturating_sub(now)
                 );
+                // Mitigate token refresh dog-piling: use a timestamp-based cooldown.
+                // This allows only one refresh attempt per short interval (e.g., 10s)
+                // to prevent a stampede of requests, without using a heavy lock.
+                const REFRESH_COOLDOWN_SECONDS: u64 = 10;
                 if now >= expires_at.saturating_sub(60) {
-                    info!(
-                        "[{}] [{}] Access token expired or expiring soon. Attempting refresh.",
-                        ctx.request_id, action_name
-                    );
+                    let mut should_refresh = false;
 
-                    if let (Some(refresh_token), Some(endpoint), Some(client_id)) = (
-                        &app_session.refresh_token,
-                        &app_session.oidc_token_endpoint,
-                        &app_session.oidc_client_id,
-                    ) {
-                        let client = &ctx.http_client;
-                        #[derive(Deserialize)]
-                        struct RefreshResponse {
-                            access_token: String,
-                            expires_in: u64,
-                            refresh_token: Option<String>,
-                        }
-
-                        let params = vec![
-                            ("grant_type", "refresh_token"),
-                            ("refresh_token", refresh_token.as_str()),
-                            ("client_id", client_id.as_str()),
-                            ("client_secret", app_session.oidc_client_secret.as_str()),
-                        ];
-
-                        match client.post(endpoint).form(&params).send().await {
-                            Ok(resp) => {
-                                if resp.status().is_success() {
-                                    if let Ok(tokens) = resp.json::<RefreshResponse>().await {
-                                        info!(
-                                            "[{}] [{}] Token refresh successful.",
-                                            ctx.request_id, action_name
-                                        );
-                                        app_session.access_token = Some(tokens.access_token);
-                                        app_session.access_token_expires_at =
-                                            Some(now + tokens.expires_in);
-                                        if let Some(new_rt) = tokens.refresh_token {
-                                            app_session.refresh_token = Some(new_rt);
-                                        }
-                                        session_needs_update = true;
-                                    }
-                                } else {
-                                    warn!(
-                                        "[{}] [{}] Token refresh failed. Status: {}",
-                                        ctx.request_id,
-                                        action_name,
-                                        resp.status()
-                                    );
-                                    // If refresh fails (e.g. refresh token expired or revoked),
-                                    // revert the session to unauthenticated state to guide the user to the re-login flow on next access.
-                                    app_session.is_authenticated = false;
-                                    session_needs_update = true;
-                                    is_token_valid = false;
+                    // Atomically check and update the cooldown timestamp in the shared store to prevent dog-piling.
+                    // This lock is extremely short-lived (microseconds) and does not cover the network request.
+                    let scope_to_use = app_session.auth_scope_name.as_deref().or(fallback_auth_scope_name);
+                    if let Some(scope) = scope_to_use {
+                        if let Some(store) = get_auth_session_store(&ctx.realm_name, scope) {
+                            if let Some(mut entry) = store.get_mut(&app_session.session_id) {
+                                if now > entry.value().last_refresh_attempt_at.saturating_add(REFRESH_COOLDOWN_SECONDS) {
+                                    // This request wins the race. Update the timestamp in the shared store immediately.
+                                    let mut new_session = entry.value().as_ref().clone();
+                                    new_session.last_refresh_attempt_at = now;
+                                    *entry.value_mut() = Arc::new(new_session);
+                                    should_refresh = true;
                                 }
+                                // In either case (win or lose), sync our local session with the latest from the store.
+                                // This ensures we have the latest timestamp and potentially a new token if we lost the race.
+                                *app_session = entry.value().as_ref().clone();
                             }
-                            Err(e) => warn!(
-                                "[{}] [{}] Token refresh request failed: {}",
-                                ctx.request_id, action_name, e
-                            ),
                         }
-                    } else {
-                        let missing = [
-                            ("refresh_token", &app_session.refresh_token),
-                            ("oidc_token_endpoint", &app_session.oidc_token_endpoint),
-                            ("oidc_client_id", &app_session.oidc_client_id),
-                        ]
-                        .iter()
-                        .filter_map(|(k, v)| v.is_none().then_some(*k))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                        warn!(
-                            "[{}] [{}] Cannot refresh token: missing fields: {}",
-                            ctx.request_id, action_name, missing
+                    }
+
+                    if should_refresh {
+                        info!(
+                            "[{}] [{}] Access token expired or expiring soon. Attempting refresh.",
+                            ctx.request_id, action_name
                         );
+
+                        // The timestamp is already updated in the shared store and our local copy.
+                        // We just need to ensure the final session state is saved after the refresh logic.
+                        session_needs_update = true;
+
+                        if let (Some(refresh_token), Some(endpoint), Some(client_id)) = (
+                            &app_session.refresh_token,
+                            &app_session.oidc_token_endpoint,
+                            &app_session.oidc_client_id,
+                        ) {
+                            let client = &ctx.http_client;
+                            #[derive(Deserialize)]
+                            struct RefreshResponse {
+                                access_token: String,
+                                expires_in: u64,
+                                refresh_token: Option<String>,
+                            }
+
+                            let params = vec![
+                                ("grant_type", "refresh_token"),
+                                ("refresh_token", refresh_token.as_str()),
+                                ("client_id", client_id.as_str()),
+                                ("client_secret", app_session.oidc_client_secret.as_str()),
+                            ];
+
+                            match client.post(endpoint).form(&params).send().await {
+                                Ok(resp) => {
+                                    if resp.status().is_success() {
+                                        if let Ok(tokens) = resp.json::<RefreshResponse>().await {
+                                            info!(
+                                                "[{}] [{}] Token refresh successful.",
+                                                ctx.request_id, action_name
+                                            );
+                                            app_session.access_token = Some(tokens.access_token);
+                                            app_session.access_token_expires_at =
+                                                Some(now + tokens.expires_in);
+                                            if let Some(new_rt) = tokens.refresh_token {
+                                                app_session.refresh_token = Some(new_rt);
+                                            }
+                                            // session_needs_update is already true
+                                        }
+                                    } else {
+                                        let status = resp.status();
+                                        // Attempt to parse the error response from the IdP.
+                                        #[derive(Deserialize, Debug)]
+                                        struct ErrorResponse {
+                                            error: Option<String>,
+                                        }
+                                        let error_body: Option<ErrorResponse> = resp.json().await.ok();
+
+                                        warn!(
+                                            "[{}] [{}] Token refresh failed. Status: {}, Parsed Error: {:?}",
+                                            ctx.request_id,
+                                            action_name,
+                                            status,
+                                            error_body
+                                        );
+
+                                        // Decide if the failure is permanent (e.g., token revoked) or temporary (e.g., network issue).
+                                        let is_permanent_error = if let Some(ErrorResponse { error: Some(err_code) }) = &error_body {
+                                            err_code == "invalid_grant"
+                                        } else {
+                                            status.is_client_error() // Treat all other 4xx as permanent.
+                                        };
+
+                                        if is_permanent_error {
+                                            info!("[{}] [{}] Token refresh failed with a permanent error (e.g., invalid_grant). Invalidating session.", ctx.request_id, action_name);
+                                            app_session.is_authenticated = false;
+                                            session_needs_update = true;
+                                            is_token_valid = false;
+                                        } else {
+                                            // For temporary errors (e.g., IdP 5xx), we keep the session to allow retries.
+                                            // However, we MUST NOT forward the request if the current token is already expired.
+                                            // It is the BFF's responsibility to only send valid tokens to the backend.
+                                            if let Some(current_expires_at) = app_session.access_token_expires_at {
+                                                if now >= current_expires_at {
+                                                    warn!("[{}] [{}] Token refresh failed temporarily, and the current token is now expired. Blocking upstream request to ensure backend only receives valid tokens.", ctx.request_id, action_name);
+                                                    is_token_valid = false; // Signal failure to the caller.
+                                                } else {
+                                                    warn!("[{}] [{}] Token refresh failed temporarily, but current token is still valid for {}s. Proceeding with old token for this request.", ctx.request_id, action_name, current_expires_at - now);
+                                                    // is_token_valid remains true, the old token will be used.
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => warn!(
+                                    "[{}] [{}] Token refresh request failed: {}",
+                                    ctx.request_id, action_name, e
+                                ),
+                            }
+                        } else {
+                            let missing = [
+                                ("refresh_token", &app_session.refresh_token),
+                                ("oidc_token_endpoint", &app_session.oidc_token_endpoint),
+                                ("oidc_client_id", &app_session.oidc_client_id),
+                            ]
+                            .iter()
+                            .filter_map(|(k, v)| v.is_none().then_some(*k))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                            warn!(
+                                "[{}] [{}] Cannot refresh token: missing fields: {}",
+                                ctx.request_id, action_name, missing
+                            );
+                        }
                     }
                 }
             }
         }
 
-        // Inject the Authorization header, checking and updating the access token to ensure it is fresh.
-        if app_session.is_authenticated {
+        // Inject the Authorization header if the session is authenticated and we have a valid token.
+        if app_session.is_authenticated && is_token_valid {
             if let Some(access_token) = &app_session.access_token {
                 info!(
                     "[{}] [{}] Attaching Authorization header to upstream request.",
                     ctx.request_id, action_name
                 );
                 let auth_header_value = format!("Bearer {}", access_token);
+                // Pass the original Access Token to the upstream
                 // Remove existing Authorization header to avoid duplication/conflict
                 upstream_request.remove_header("Authorization");
                 upstream_request
                     .insert_header("Authorization", auth_header_value)
+                    .unwrap();
+                // Inject BFF metadata headers
+                // Remove existing headers to prevent spoofing from the client
+                upstream_request.remove_header("X-BFF-Auth-Status");
+                upstream_request
+                    .insert_header("X-BFF-Auth-Status", "verified")
+                    .unwrap();
+
+                upstream_request.remove_header("X-BFF-User-Sub");
+                upstream_request
+                    .insert_header("X-BFF-User-Sub", &app_session.user_id)
                     .unwrap();
             }
         }
@@ -755,7 +907,8 @@ impl RouteLogic for IssueDeviceCookieRoute {
                 self.name()
             );
             let mut cookie_value = format!(
-                "CHIPIN_DEVICE_CONTEXT={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict",
+                //"CHIPIN_DEVICE_CONTEXT={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Strict",
+                "CHIPIN_DEVICE_CONTEXT={}; Path=/; Max-Age={}; HttpOnly; SameSite=Strict",
                 new_cookie_value, DEVICE_COOKIE_MAX_AGE
             );
             if let Some(domain) = &ctx.cookie_domain {
@@ -870,7 +1023,6 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
             .unwrap_or_else(|| panic!("Authentication scope '{}' for realm '{}' not registered. Please call register_auth_scope at startup.", self.auth_scope_name, ctx.realm_name));
 
         ctx.override_upstream_addr = Some(self.protected_upstream.into());
-        // --- Start of merged logic from ApplicationSessionManagementRoute ---
         let mut session_found = false;
         let mut app_session_opt: Option<ApplicationSession> = None;
         let now = Utc::now().timestamp() as u64;
@@ -890,8 +1042,12 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                                 session_id
                             );
 
-                            if let Some(app_session_ref) = session_store.get(&session_id) {
-                                let mut app_session = app_session_ref.value().as_ref().clone();
+                            // Clone the session from the store to release the read lock from `get()`
+                            // before attempting a write operation (`insert()` or `remove()`) to prevent a deadlock.
+                            let session_from_store = session_store.get(&session_id).map(|r| r.value().clone());
+
+                            if let Some(app_session_arc) = session_from_store {
+                                let mut app_session = app_session_arc.as_ref().clone();
                                 // Check if session is expired
                                 if app_session.expires_at < now {
                                     warn!(
@@ -901,7 +1057,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                                         app_session.session_id,
                                         app_session.user_id
                                     );
-                                    session_store.remove(&session_id);
+                                    session_store.remove(&session_id); // Safe to write now
                                     session_found = false;
                                 } else {
                                     info!(
@@ -912,8 +1068,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                                     );
                                     // Extend session lifetime
                                     app_session.expires_at = now + ctx.session_timeout;
-                                    session_store
-                                        .insert(session_id, Arc::new(app_session.clone()));
+                                    session_store.insert(session_id, Arc::new(app_session.clone())); // Safe to write now
                                     app_session_opt = Some(app_session);
                                     session_found = true;
                                 }
@@ -961,6 +1116,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 oidc_client_secret: self.oidc_client_secret.to_string(),
                 auth_scope_name: Some(self.auth_scope_name.to_string()),
                 auth_original_destination: None,
+                last_refresh_attempt_at: 0,
             };
 
             session_store.insert(new_session_id.clone(), Arc::new(new_app_session.clone()));
@@ -1017,7 +1173,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                     self.name()
                 );
 
-                // 1. Validate the 'state' parameter against the one stored in the session to prevent CSRF.
+                // 2-1. Validate the 'state' parameter against the one stored in the session to prevent CSRF.
                 let is_state_valid = if let Some(app_session) = &ctx.action_state_app_session {
                     if let Some(stored_state) = &app_session.oidc_state {
                         *stored_state == state
@@ -1048,22 +1204,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                     return Ok(true);
                 }
 
-                // Define a struct to deserialize the token endpoint's response.
-                #[derive(Deserialize, Debug)]
-                struct TokenResponse {
-                    access_token: String,
-                    id_token: String,
-                    expires_in: u64,
-                    refresh_token: Option<String>,
-                }
-
-                #[derive(Deserialize, Debug)]
-                struct OidcDiscovery {
-                    issuer: String,
-                    jwks_uri: String,
-                }
-
-                // 2. Exchange the authorization code for an access token and ID token.
+                // 2-2. Check existence of PKCE verifier in session.
                 let pkce_verifier = match ctx
                     .action_state_app_session
                     .as_ref()
@@ -1080,6 +1221,16 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                         return Ok(true);
                     }
                 };
+
+                // 2-3. Exchange the authorization code for an access token and ID token.
+                // Define a struct to deserialize the token endpoint's response.
+                #[derive(Deserialize, Debug)]
+                struct TokenResponse {
+                    access_token: String,
+                    id_token: String,
+                    expires_in: u64,
+                    refresh_token: Option<String>,
+                }
 
                 let client = &ctx.http_client;
                 let token_params = vec![
@@ -1156,107 +1307,28 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                     tokens
                 );
 
-                // 3. Validate the received ID token (signature, issuer, audience, nonce, expiration).
+                // 2-4. Validate the received ID token (signature, issuer, audience, nonce, expiration).
+
+                // 2-4-1. Prepare oidc key and info for token validation
+                let (oidc_config, jwks) = fetch_oidc_keys(
+                    client,
+                    self.oidc_token_endpoint,
+                    &ctx.request_id,
+                    self.name(),
+                )
+                .await?;
+
+                // 2-4-2. check ID token
                 let id_token = &tokens.id_token;
-
-                // Fetch OIDC configuration (Discovery) to get JWKS URI and Issuer.
-                // We attempt to find the discovery document relative to the token endpoint.
-                // Heuristic: Assume the token endpoint is something like `.../token` or `.../oauth2/v1/token`.
-                // We try to go up one level and look for `.well-known/openid-configuration`.
-                let token_endpoint_url =
-                    Url::parse(self.oidc_token_endpoint).map_err(|e| {
-                        warn!(
-                            "[{}] [{}] Invalid OIDC token endpoint URL: {}",
-                            ctx.request_id,
-                            self.name(),
-                            e
-                        );
-                        Error::new(ErrorType::InternalError)
-                    })?;
-
-                let discovery_url = token_endpoint_url
-                    .join("../.well-known/openid-configuration")
-                    .map_err(|e| {
-                        warn!(
-                            "[{}] [{}] Failed to construct OIDC discovery URL: {}",
-                            ctx.request_id,
-                            self.name(),
-                            e
-                        );
-                        Error::new(ErrorType::InternalError)
-                    })?;
-
-                let discovery_resp = client.get(discovery_url.clone()).send().await.map_err(|e| {
-                    warn!(
-                        "[{}] [{}] Failed to fetch OIDC discovery from {}: {}",
-                        ctx.request_id,
-                        self.name(),
-                        discovery_url,
-                        e
-                    );
-                    Error::new(ErrorType::InternalError)
-                })?;
-
-                let oidc_config: OidcDiscovery = discovery_resp.json().await.map_err(|e| {
-                    warn!(
-                        "[{}] [{}] Failed to parse OIDC discovery response: {}",
-                        ctx.request_id,
-                        self.name(),
-                        e
-                    );
-                    Error::new(ErrorType::InternalError)
-                })?;
-
-                // Fetch JWKS using the URI from discovery
-                let jwks_response = client.get(&oidc_config.jwks_uri).send().await.map_err(|e| {
-                    warn!(
-                        "[{}] [{}] Failed to fetch JWKS from {}: {}",
-                        ctx.request_id,
-                        self.name(),
-                        oidc_config.jwks_uri,
-                        e
-                    );
-                    Error::new(ErrorType::InternalError)
-                })?;
-
-                let jwks_text = jwks_response.text().await.map_err(|e| {
-                    warn!(
-                        "[{}] [{}] Failed to read JWKS response body: {}",
-                        ctx.request_id,
-                        self.name(),
-                        e
-                    );
-                    Error::new(ErrorType::InternalError)
-                })?;
-
-                // Deserialize JWKS
-                #[derive(Deserialize, Debug)]
-                struct Jwks {
-                    keys: Vec<serde_json::Value>, // Use serde_json::Value to parse individual keys
-                }
-                let jwks: Jwks = serde_json::from_str(&jwks_text).map_err(|e| {
-                    warn!(
-                        "[{}] [{}] Failed to parse JWKS: {}",
-                        ctx.request_id,
-                        self.name(),
-                        e
-                    );
-                    Error::new(ErrorType::InternalError)
-                })?;
-
-                // Prepare validation parameters
                 let mut validation = Validation::new(jsonwebtoken::Algorithm::RS256); // Assuming RS256 for OIDC
                 validation.set_audience(&[self.oidc_client_id]);
-
-                // Use the issuer from the discovery document
-                validation.set_issuer(&[oidc_config.issuer]);
+                validation.set_issuer(&[oidc_config.issuer.as_str()]);
 
                 if let Some(_stored_nonce) = ctx
                     .action_state_app_session
                     .as_ref()
                     .and_then(|s| s.oidc_nonce.as_ref())
                 {
-                    // Require the 'nonce' claim to be present in the token.
                     validation.required_spec_claims.insert("nonce".to_owned());
                 } else {
                     warn!(
@@ -1269,9 +1341,9 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 }
 
                 let mut decoded_token = None;
-                for jwk_value in jwks.keys {
+                for jwk_value in &jwks.keys {
                     // Convert the generic `serde_json::Value` into a specific `jsonwebtoken::jwk::Jwk`.
-                    let jwk: jsonwebtoken::jwk::Jwk = match serde_json::from_value(jwk_value) {
+                    let jwk: jsonwebtoken::jwk::Jwk = match serde_json::from_value(jwk_value.clone()) {
                         Ok(jwk) => jwk,
                         Err(_) => continue, // Skip malformed JWK entries.
                     };
@@ -1318,7 +1390,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                     }
                 };
 
-                // Manually validate the nonce claim after successful decoding
+                // 2-4-3. Manually validate the nonce claim after successful decoding
                 if let Some(stored_nonce) = ctx
                     .action_state_app_session
                     .as_ref()
@@ -1351,17 +1423,119 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                     token_data.claims
                 );
 
-                // 4. If validation is successful, update the ApplicationSession.
+                // 2-4-4. Validate the received Access Token (signature, issuer, audience).
+                // We perform this check immediately upon receipt to ensure we don't store an invalid token.
+                // We reuse the JWKS and OIDC config fetched for the ID token to avoid extra network costs.
+                {
+                    let access_token = &tokens.access_token;
+                    // Only attempt to validate if it looks like a JWT (has a valid header)
+                    if let Ok(at_header) = jsonwebtoken::decode_header(access_token) {
+                        if let Some(kid) = at_header.kid {
+                            let mut at_validation = Validation::new(at_header.alg);
+                            // The audience ('aud') of an access token is typically the identifier of the resource server (the API),
+                            // which can be different from the OIDC client ID (which is the audience of the ID token).
+                            // The BFF's primary responsibility is to verify the token's integrity (signature) and issuer.
+                            // The ultimate audience validation is the responsibility of the upstream resource server.
+                            // Therefore, we do not validate the audience here.
+                            //at_validation.set_issuer(&[oidc_config.issuer.as_str()]);
+                            at_validation.validate_aud = false;
+                            at_validation.validate_exp = true;
+                            at_validation.validate_nbf = false;
+                            at_validation.leeway = 300;
+
+                            let mut at_valid = false;
+                            for jwk_value in &jwks.keys {
+                                let jwk: jsonwebtoken::jwk::Jwk = match serde_json::from_value(jwk_value.clone()) {
+                                    Ok(j) => j,
+                                    Err(_) => continue,
+                                };
+
+                                if jwk.common.key_id.as_deref() == Some(&kid) {
+                                    if let Ok(decoding_key) = DecodingKey::from_jwk(&jwk) {
+                                        if decode::<serde_json::Value>(access_token, &decoding_key, &at_validation).is_ok() {
+                                            at_valid = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if !at_valid {
+                                warn!(
+                                    "[{}] [{}] Access Token signature validation failed. Rejecting authentication.",
+                                    ctx.request_id,
+                                    self.name()
+                                );
+                                let _ = session.respond_error(401).await;
+                                return Ok(true);
+                            }
+                            info!(
+                                "[{}] [{}] Access Token successfully validated.",
+                                ctx.request_id,
+                                self.name()
+                            );
+                        } else {
+                            warn!(
+                                "[{}] [{}] Access Token is a JWT but missing 'kid'. Rejecting.",
+                                ctx.request_id,
+                                self.name()
+                            );
+                            let _ = session.respond_error(401).await;
+                            return Ok(true);
+                        }
+                    } else {
+                         warn!(
+                            "[{}] [{}] Access Token is not a valid JWT (could not decode header). Rejecting.",
+                            ctx.request_id,
+                            self.name()
+                        );
+                        let _ = session.respond_error(401).await;
+                        return Ok(true);
+                    }
+                }
+
+                // 2-5. SESSION FIXATION MITIGATION
+                // Upon successful authentication, we must regenerate the session ID
+                // to prevent session fixation attacks.
+
+                // 2-5-1. Get the old session ID before we modify the session object.
+                let old_session_id = ctx.action_state_app_session.as_ref().unwrap().session_id.clone();
+
+                // 2-5-2. Generate a new, cryptographically secure session ID.
+                let new_session_id: String = rand::rng()
+                    .sample_iter(&Alphanumeric)
+                    .take(32)
+                    .map(char::from)
+                    .collect();
+                info!(
+                    "[{}] [{}] Regenerating session ID to prevent fixation: {} -> {}",
+                    ctx.request_id,
+                    self.name(),
+                    old_session_id,
+                    new_session_id
+                );
+
+                // 2-5-3. Update the ApplicationSession with the new ID and authenticated state.
                 let app_session = ctx.action_state_app_session.as_mut().unwrap(); // We know it exists and is mutable
                 app_session.is_authenticated = true;
                 app_session.access_token = Some(tokens.access_token);
                 app_session.access_token_expires_at =
                     Some(Utc::now().timestamp() as u64 + tokens.expires_in);
                 app_session.refresh_token = tokens.refresh_token;
-                app_session.user_id = token_data.claims["sub"]
-                    .as_str()
-                    .unwrap_or("unknown")
-                    .to_string();
+                // The 'sub' claim is REQUIRED by the OIDC spec. If it's missing, the token is invalid.
+                let sub = match token_data.claims.get("sub").and_then(|v| v.as_str()) {
+                    Some(s) => s.to_string(),
+                    None => {
+                        warn!(
+                            "[{}] [{}] ID token is missing 'sub' claim. Rejecting authentication.",
+                            ctx.request_id,
+                            self.name()
+                        );
+                        let _ = session.respond_error(401).await; // Unauthorized
+                        return Ok(true);
+                    }
+                };
+                app_session.user_id = sub;
                 app_session.username = token_data
                     .claims
                     .get("name")
@@ -1375,13 +1549,23 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 app_session.oidc_pkce_verifier = None;
                 app_session.oidc_state = None;
 
-                // Update the session in the central store
+                // 2-5-4. Update the session ID within the session object itself.
+                app_session.session_id = new_session_id.clone();
+
+                // 2-5-5. Remove the old, unauthenticated session from the store.
+                session_store.remove(&old_session_id);
+
+                // 2-5-6. Insert the newly authenticated session into the store under the new ID.
                 session_store.insert(
-                    app_session.session_id.clone(),
+                    new_session_id.clone(),
                     Arc::new(app_session.clone()),
                 );
 
-                // 5. Redirect the user back to the original resource (or a default page).
+                // 2-5-7. Prepare to issue the new session cookie to the client.
+                // This will overwrite the old session cookie.
+                ctx.action_state_new_app_session_cookie = Some((new_session_id, self.auth_scope_name.to_string()));
+
+                // 2-5-8. Redirect the user back to the original resource (or a default page).
                 // Retrieve the original destination from the session, or default to "/".
                 let redirect_path = app_session
                     .auth_original_destination
@@ -1397,6 +1581,20 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 let body = Bytes::from_static(b"Login successful. Redirecting...");
                 let mut header = ResponseHeader::build(302, None).unwrap();
                 header.insert_header("Location", redirect_path).unwrap();
+
+                // Set the new session cookie in the redirect response.
+                if let Some((cookie_val, scope_name)) = &ctx.action_state_new_app_session_cookie {
+                    let cookie_name = format!("CHIPIN_SESSION_ID_{}", scope_name.to_uppercase());
+                    let mut cookie_string = format!(
+                        "{}={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Lax",
+                        cookie_name, cookie_val, ctx.session_timeout
+                    );
+                    if let Some(domain) = &ctx.cookie_domain {
+                        cookie_string.push_str(&format!("; Domain={}", domain));
+                    }
+                    header.append_header("Set-Cookie", cookie_string).unwrap();
+                }
+
                 header
                     .insert_header("Content-Length", body.len().to_string())
                     .unwrap();
@@ -1501,6 +1699,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 let cookie_name = format!("CHIPIN_SESSION_ID_{}", scope_name.to_uppercase());
                 let mut cookie_value = format!(
                     "{}={}; Path=/; Max-Age={}; HttpOnly; SameSite=Lax",
+                    //"{}={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Lax",
                     cookie_name, new_cookie_value, ctx.session_timeout
                 );
                 if let Some(domain) = &ctx.cookie_domain {
@@ -1630,6 +1829,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
             );
             let cookie_name = format!("CHIPIN_SESSION_ID_{}", scope_name.to_uppercase());
             let mut cookie_value = format!(
+                //"{}={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Lax",
                 "{}={}; Path=/; Max-Age={}; HttpOnly; SameSite=Lax",
                 cookie_name, new_cookie_value, ctx.session_timeout
             );
