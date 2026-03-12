@@ -1432,40 +1432,39 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                     if let Ok(at_header) = jsonwebtoken::decode_header(access_token) {
                         if let Some(kid) = at_header.kid {
                             let mut at_validation = Validation::new(at_header.alg);
-                            // The audience ('aud') of an access token is typically the identifier of the resource server (the API),
-                            // which can be different from the OIDC client ID (which is the audience of the ID token).
-                            // The BFF's primary responsibility is to verify the token's integrity (signature) and issuer.
-                            // The ultimate audience validation is the responsibility of the upstream resource server.
-                            // Therefore, we do not validate the audience here.
-                            //at_validation.set_issuer(&[oidc_config.issuer.as_str()]);
-                            at_validation.validate_aud = false;
-                            at_validation.validate_exp = true;
-                            at_validation.validate_nbf = false;
-                            at_validation.leeway = 300;
+                            at_validation.set_issuer(&[oidc_config.issuer.as_str()]);
+                            at_validation.validate_aud = false; // skip check audience ('aud')
 
                             let mut at_valid = false;
+                            let mut last_error: Option<jsonwebtoken::errors::Error> = None;
                             for jwk_value in &jwks.keys {
                                 let jwk: jsonwebtoken::jwk::Jwk = match serde_json::from_value(jwk_value.clone()) {
                                     Ok(j) => j,
                                     Err(_) => continue,
                                 };
 
+                                // Find the key that matches the token's 'kid'
                                 if jwk.common.key_id.as_deref() == Some(&kid) {
                                     if let Ok(decoding_key) = DecodingKey::from_jwk(&jwk) {
-                                        if decode::<serde_json::Value>(access_token, &decoding_key, &at_validation).is_ok() {
-                                            at_valid = true;
-                                            break;
+                                        match decode::<serde_json::Value>(access_token, &decoding_key, &at_validation) {
+                                            Ok(_) => {
+                                                at_valid = true;
+                                                last_error = None; // Clear error on success
+                                                break; // Found a valid key and signature
+                                            }
+                                            Err(e) => {
+                                                // Store the error. It's useful for debugging if no key works.
+                                                // This will capture issues like "ExpiredSignature", "InvalidAudience", etc.
+                                                last_error = Some(e);
+                                            }
                                         }
                                     }
                                 }
                             }
 
                             if !at_valid {
-                                warn!(
-                                    "[{}] [{}] Access Token signature validation failed. Rejecting authentication.",
-                                    ctx.request_id,
-                                    self.name()
-                                );
+                                let error_details = last_error.map_or_else(|| "No matching key found or key is invalid".to_string(), |e| e.to_string());
+                                warn!("[{}] [{}] Access Token validation failed. Rejecting authentication. Reason: {}", ctx.request_id, self.name(), error_details);
                                 let _ = session.respond_error(401).await;
                                 return Ok(true);
                             }
