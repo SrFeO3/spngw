@@ -36,7 +36,10 @@ use crate::config::{
 
 mod background_services;
 
+/// The default lifetime for an authenticated session, used as a fallback if a realm does not specify a `sessionTimeout`.
 const DEFAULT_SESSION_TIMEOUT_SECONDS: u64 = 86400; // 1 day
+/// A short timeout for unauthenticated sessions to prevent store bloat from abandoned login attempts.
+pub const UNAUTHENTICATED_SESSION_TIMEOUT_SECONDS: u64 = 300; // 5 minutes
 
 /// Core logic and shared state for the proxy service
 ///

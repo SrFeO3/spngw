@@ -1106,7 +1106,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 access_token: None,
                 refresh_token: None,
                 access_token_expires_at: None,
-                expires_at: now + ctx.session_timeout, // Set expiration on creation
+                expires_at: now + crate::UNAUTHENTICATED_SESSION_TIMEOUT_SECONDS, // Short expiry for unauthenticated sessions
                 oidc_nonce: None,
                 oidc_pkce_verifier: None,
                 oidc_state: None,
@@ -1544,6 +1544,9 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 // 2-5-3. Update the ApplicationSession with the new ID and authenticated state.
                 let app_session = ctx.action_state_app_session.as_mut().unwrap(); // We know it exists and is mutable
                 app_session.is_authenticated = true;
+                // Now that the user is authenticated, extend the session lifetime to the full duration.
+                app_session.expires_at = Utc::now().timestamp() as u64 + ctx.session_timeout;
+
                 app_session.access_token = Some(tokens.access_token);
                 app_session.access_token_expires_at =
                     Some(Utc::now().timestamp() as u64 + tokens.expires_in);
