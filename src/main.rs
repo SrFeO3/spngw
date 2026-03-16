@@ -405,6 +405,7 @@ impl ProxyHttp for GatewayRouter {
                     oidc_token_endpoint,
                     auth_scope_name,
                     oidc_client_secret,
+                    oidc_dialect,
                 } => {
                     let logic = actions::RequireAuthenticationRoute {
                         protected_upstream,
@@ -414,6 +415,7 @@ impl ProxyHttp for GatewayRouter {
                         oidc_token_endpoint,
                         auth_scope_name,
                         oidc_client_secret: oidc_client_secret.as_ref(),
+                        oidc_dialect: oidc_dialect.as_deref(),
                     };
                     logic
                         .request_filter_and_prepare_upstream_peer(session, ctx)
@@ -542,6 +544,7 @@ impl ProxyHttp for GatewayRouter {
                     oidc_token_endpoint,
                     auth_scope_name,
                     oidc_client_secret,
+                    oidc_dialect,
                 } => {
                     let logic = actions::RequireAuthenticationRoute {
                         protected_upstream,
@@ -551,6 +554,7 @@ impl ProxyHttp for GatewayRouter {
                         oidc_token_endpoint,
                         auth_scope_name,
                         oidc_client_secret: oidc_client_secret.as_ref(),
+                        oidc_dialect: oidc_dialect.as_deref(),
                     };
                     logic
                         .upstream_request_filter(session, upstream_request, ctx)
@@ -642,6 +646,7 @@ impl ProxyHttp for GatewayRouter {
                     oidc_token_endpoint,
                     auth_scope_name,
                     oidc_client_secret,
+                    oidc_dialect,
                 } => {
                     let logic = actions::RequireAuthenticationRoute {
                         protected_upstream,
@@ -651,6 +656,7 @@ impl ProxyHttp for GatewayRouter {
                         oidc_token_endpoint,
                         auth_scope_name,
                         oidc_client_secret: oidc_client_secret.as_ref(),
+                        oidc_dialect: oidc_dialect.as_deref(),
                     };
                     logic.response_filter(session, response, ctx).await
                 }

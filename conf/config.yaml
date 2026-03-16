@@ -569,6 +569,7 @@ realms:
                       oidcRedirectUrl: "https://www.test.example.com:8000/shop/"
                       oidcAuthorizationEndpoint: "https://auth.test.example.com:8000/authorize"
                       oidcTokenEndpoint: "http://127.0.0.1:9001/api/token"
+                      oidcDialect: "google"
       hubs:
           - name: hub1
             urn: urn:chip-in:network:forge:hub1

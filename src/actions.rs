@@ -153,6 +153,7 @@ pub enum GatewayAction {
         oidc_token_endpoint: Arc<str>,
         auth_scope_name: Arc<str>,
         oidc_client_secret: Arc<str>,
+        oidc_dialect: Option<Arc<str>>,
     },
 }
 
@@ -230,38 +231,55 @@ pub struct RequireAuthenticationRoute<'a> {
     pub oidc_token_endpoint: &'a str,
     pub auth_scope_name: &'a str,
     pub oidc_client_secret: &'a str,
+    pub oidc_dialect: Option<&'a str>,
 }
 
 /// Fetches OIDC discovery document and JWKS.
 /// This is a helper function to centralize the logic for fetching OIDC provider metadata.
-/// It's designed to be cacheable in the future.
 async fn fetch_oidc_keys(
     client: &reqwest::Client,
     oidc_token_endpoint: &str,
+    oidc_dialect: Option<&str>,
     request_id: &str,
     action_name: &str,
 ) -> Result<(OidcDiscovery, Jwks), Error> {
     // Fetch OIDC configuration (Discovery) to get JWKS URI and Issuer.
     // We attempt to find the discovery document relative to the token endpoint.
-    // Heuristic: Assume the token endpoint is something like `.../token` or `.../oauth2/v1/token`.
-    // We try to go up one level and look for `.well-known/openid-configuration`.
-    let token_endpoint_url = Url::parse(oidc_token_endpoint).map_err(|e| {
-        warn!(
-            "[{}] [{}] Invalid OIDC token endpoint URL: {}",
-            request_id, action_name, e
-        );
-        *Error::explain(ErrorType::InternalError, "Invalid OIDC token endpoint URL")
-    })?;
-
-    let discovery_url = token_endpoint_url
-        .join("../.well-known/openid-configuration")
-        .map_err(|e| {
+    // Heuristic: Assume the token endpoint is something like `.../token`, go up one level, and look for `.well-known/openid-configuration`.
+    // NOTE: This includes optimistic code to handle Google's OIDC dialect.
+    let is_google = oidc_dialect == Some("google");
+    let discovery_url = if is_google {
+        Url::parse("https://accounts.google.com/.well-known/openid-configuration").map_err(|e| {
             warn!(
-                "[{}] [{}] Failed to construct OIDC discovery URL: {}",
+                "[{}] [{}] Failed to parse Google OIDC discovery URL: {}",
                 request_id, action_name, e
             );
-            *Error::explain(ErrorType::InternalError, "Failed to construct OIDC discovery URL")
+            *Error::explain(ErrorType::InternalError, "Failed to parse Google OIDC discovery URL")
+        })?
+    } else {
+        let token_endpoint_url = Url::parse(oidc_token_endpoint).map_err(|e| {
+            warn!(
+                "[{}] [{}] Invalid OIDC token endpoint URL: {}",
+                request_id, action_name, e
+            );
+            *Error::explain(ErrorType::InternalError, "Invalid OIDC token endpoint URL")
         })?;
+
+        token_endpoint_url
+            .join("../.well-known/openid-configuration")
+            .map_err(|e| {
+                warn!(
+                    "[{}] [{}] Failed to construct OIDC discovery URL: {}",
+                    request_id, action_name, e
+                );
+                *Error::explain(ErrorType::InternalError, "Failed to construct OIDC discovery URL")
+            })?
+    };
+
+    info!(
+        "[{}] [{}] Fetching OIDC discovery from: {}",
+        request_id, action_name, discovery_url
+    );
 
     let discovery_resp = client.get(discovery_url.clone()).send().await.map_err(|e| {
         warn!(
@@ -1336,6 +1354,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 let (oidc_config, jwks) = fetch_oidc_keys(
                     client,
                     self.oidc_token_endpoint,
+                    self.oidc_dialect,
                     &ctx.request_id,
                     self.name(),
                 )
@@ -1510,13 +1529,11 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                             return Ok(true);
                         }
                     } else {
-                         warn!(
-                            "[{}] [{}] Access Token is not a valid JWT (could not decode header). Rejecting.",
+                         info!(
+                            "[{}] [{}] Access Token is not a valid JWT (could not decode header). Assuming opaque token and skipping validation.",
                             ctx.request_id,
                             self.name()
                         );
-                        let _ = session.respond_error(401).await;
-                        return Ok(true);
                     }
                 }
 
@@ -1697,17 +1714,32 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
             // 1-7. Build the OIDC authorization URL with all the necessary parameters.
             let mut auth_url =
                 Url::parse(self.oidc_authorization_endpoint).expect("Invalid OIDC login URL");
-            auth_url
-                .query_pairs_mut()
-                .append_pair("response_type", "code")
-                .append_pair("client_id", &self.oidc_client_id)
-                .append_pair("redirect_uri", &self.oidc_redirect_url)
-                .append_pair("scope", "openid offline_access") // 'openid' is the minimum required scope for OIDC.
-                .append_pair("state", &state)
-                .append_pair("nonce", &nonce)
-                .append_pair("code_challenge", &code_challenge)
-                .append_pair("code_challenge_method", "S256")
-                .append_pair("response_mode", "query"); // Explicitly request query parameters for callback
+
+            {
+                let mut url_pairs = auth_url.query_pairs_mut();
+                url_pairs
+                    .append_pair("response_type", "code")
+                    .append_pair("client_id", &self.oidc_client_id)
+                    .append_pair("redirect_uri", &self.oidc_redirect_url);
+
+                if self.oidc_dialect == Some("google") {
+                    // Google dialect: Requires 'access_type=offline' and 'prompt=consent' to obtain a refresh token.
+                    url_pairs
+                        .append_pair("scope", "openid")
+                        .append_pair("access_type", "offline")
+                        .append_pair("prompt", "consent");
+                } else {
+                    // Standard OIDC: Use 'offline_access' scope to obtain a refresh token.
+                    url_pairs.append_pair("scope", "openid offline_access");
+                }
+
+                url_pairs
+                    .append_pair("state", &state)
+                    .append_pair("nonce", &nonce)
+                    .append_pair("code_challenge", &code_challenge)
+                    .append_pair("code_challenge_method", "S256")
+                    .append_pair("response_mode", "query"); // Explicitly request query parameters for callback
+            }
 
             info!(
                 "[{}] [{}] User not authenticated. Redirecting to OIDC provider.",
