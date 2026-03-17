@@ -1379,37 +1379,82 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                     return Ok(true);
                 }
 
-                let mut decoded_token = None;
-                for jwk_value in &jwks.keys {
-                    // Convert the generic `serde_json::Value` into a specific `jsonwebtoken::jwk::Jwk`.
-                    let jwk: jsonwebtoken::jwk::Jwk = match serde_json::from_value(jwk_value.clone()) {
-                        Ok(jwk) => jwk,
-                        Err(_) => continue, // Skip malformed JWK entries.
-                    };
+                // Decode the header to extract the Key ID (kid) for efficient key lookup.
+                let header = match jsonwebtoken::decode_header(id_token) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!(
+                            "[{}] [{}] Failed to decode ID token header: {}",
+                            ctx.request_id,
+                            self.name(),
+                            e
+                        );
+                        let _ = session.respond_error(400).await; // Bad Request
+                        return Ok(true);
+                    }
+                };
+                let target_kid = header.kid;
 
-                    if let Ok(decoding_key) = DecodingKey::from_jwk(&jwk) {
-                        match decode::<serde_json::Value>(id_token, &decoding_key, &validation) {
-                            Ok(token_data) => {
-                                decoded_token = Some(token_data);
-                                break;
+                let mut decoded_token = None;
+
+                if let Some(t_kid) = &target_kid {
+                    // A Key ID is specified. Find the specific key and use only that one.
+                    info!("[{}] [{}] ID token has kid: '{}'. Searching for matching key.", ctx.request_id, self.name(), t_kid);
+                    if let Some(jwk_value) = jwks.keys.iter().find(|k| k.get("kid").and_then(|v| v.as_str()) == Some(t_kid.as_str())) {
+                        let jwk: jsonwebtoken::jwk::Jwk = match serde_json::from_value(jwk_value.clone()) {
+                            Ok(j) => j,
+                            Err(_) => {
+                                warn!("[{}] [{}] Failed to parse matching JWK for kid: {}", ctx.request_id, self.name(), t_kid);
+                                let _ = session.respond_error(401).await;
+                                return Ok(true);
                             }
-                            Err(e) => {
-                                // If signature or algorithm is invalid, try the next JWK.
-                                // For other errors (e.g., expired, invalid issuer/audience/nonce), we fail immediately.
-                                if e.kind() == &jsonwebtoken::errors::ErrorKind::InvalidSignature
-                                    || e.kind()
-                                        == &jsonwebtoken::errors::ErrorKind::InvalidAlgorithm
-                                {
-                                    continue; // Try next JWK
-                                } else {
-                                    warn!(
-                                        "[{}] [{}] ID token validation failed: {}",
-                                        ctx.request_id,
-                                        self.name(),
-                                        e
-                                    );
-                                    let _ = session.respond_error(401).await; // Unauthorized
+                        };
+                        if let Ok(decoding_key) = DecodingKey::from_jwk(&jwk) {
+                            match decode::<serde_json::Value>(id_token, &decoding_key, &validation) {
+                                Ok(token_data) => decoded_token = Some(token_data),
+                                Err(e) => {
+                                    // If the specified key fails for any reason, the token is invalid. No fallback.
+                                    warn!("[{}] [{}] ID token validation failed for specified kid '{}': {}", ctx.request_id, self.name(), t_kid, e);
+                                    let _ = session.respond_error(401).await;
                                     return Ok(true);
+                                }
+                            }
+                        }
+                    } else {
+                        warn!(
+                            "[{}] [{}] ID token specifies kid '{}' but no matching key found in JWKS.",
+                            ctx.request_id,
+                            self.name(),
+                            t_kid
+                        );
+                        let _ = session.respond_error(401).await;
+                        return Ok(true);
+                    }
+
+                } else {
+                    // No Key ID in header. Try all available keys.
+                    info!("[{}] [{}] ID token has no kid. Trying all available keys.", ctx.request_id, self.name());
+                    for jwk_value in &jwks.keys {
+                        let jwk: jsonwebtoken::jwk::Jwk = match serde_json::from_value(jwk_value.clone()) {
+                            Ok(jwk) => jwk,
+                            Err(_) => continue, // Skip malformed JWK entries.
+                        };
+
+                        if let Ok(decoding_key) = DecodingKey::from_jwk(&jwk) {
+                            match decode::<serde_json::Value>(id_token, &decoding_key, &validation) {
+                                Ok(token_data) => {
+                                    decoded_token = Some(token_data);
+                                    break;
+                                }
+                                Err(e) => {
+                                    // Only continue if it's a signature/alg error. Other errors are fatal.
+                                    if e.kind() != &jsonwebtoken::errors::ErrorKind::InvalidSignature
+                                        && e.kind() != &jsonwebtoken::errors::ErrorKind::InvalidAlgorithm
+                                    {
+                                        warn!("[{}] [{}] ID token validation failed with non-signature error: {}", ctx.request_id, self.name(), e);
+                                        let _ = session.respond_error(401).await; // Unauthorized
+                                        return Ok(true);
+                                    }
                                 }
                             }
                         }
