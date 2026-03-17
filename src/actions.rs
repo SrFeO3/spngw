@@ -1157,50 +1157,84 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
 
         if !is_authenticated {
             // The user is not authenticated. This block handles two potential scenarios:
-            // 1. A new user accessing a protected resource for the first time (initiate login).
-            // 2. A user returning from the OIDC provider after authentication (handle callback).
+            // 1. A new user accessing a protected resource -> Initiate OIDC login flow.
+            // 2. A user returning from the OIDC provider -> Handle the callback (success or error).
 
-            // First, determine if this is an OIDC callback request.
-            // A callback is identified by the presence of 'code' and 'state' query parameters
-            // AND the request path matching the configured `oidc_redirect_url`.
+            // First, determine if this is an OIDC callback request from an unauthenticated user.
+            // A callback is identified by the presence of 'code' and 'state' query parameters,
+            // and the request path must match the configured `oidc_redirect_url`.
             let mut oidc_code = None;
             let mut oidc_state = None;
+            let mut oidc_error = None;
+            let mut oidc_error_description = None;
             if let Some(query) = session.req_header().uri.query() {
                 for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
                     match key.as_ref() {
                         "code" => oidc_code = Some(value.into_owned()),
                         "state" => oidc_state = Some(value.into_owned()),
+                        "error" => oidc_error = Some(value.into_owned()),
+                        "error_description" => {
+                            oidc_error_description = Some(value.into_owned())
+                        }
                         _ => {}
-                    }
-                    if oidc_code.is_some() && oidc_state.is_some() {
-                        break;
                     }
                 }
             }
 
-            let is_callback_request = if oidc_code.is_some() && oidc_state.is_some() {
-                if let Ok(configured_redirect_url) = Url::parse(self.oidc_redirect_url) {
-                    if session.req_header().uri.path() == configured_redirect_url.path() {
-                        true
-                    } else {
-                        warn!(
-                            "[{}] [{}] OIDC callback parameters detected on an unexpected path. Expected: '{}', Actual: '{}'. Ignoring callback and initiating new login.",
-                            ctx.request_id,
-                            self.name(),
-                            configured_redirect_url.path(),
-                            session.req_header().uri.path()
-                        );
-                        false
-                    }
+            // Handle OIDC error response from the provider. This takes precedence over a successful code exchange.
+            if let Some(error_code) = oidc_error {
+                warn!(
+                    "[{}] [{}] Received error from OIDC provider: {} (Description: {})",
+                    ctx.request_id,
+                    self.name(),
+                    error_code,
+                    oidc_error_description.as_deref().unwrap_or("N/A")
+                );
+                // Sanitize the error code to prevent XSS.
+                // We limit the length to prevent potential DoS or layout-breaking issues.
+                let sanitized_error_code = &error_code[..error_code.len().min(64)];
+                let escaped_error_code = html_escape::encode_text(sanitized_error_code);
+                let body = format!(
+                    "Authentication failed: {}. Please try again or contact support if the problem persists.",
+                    escaped_error_code
+                );
+                let body_bytes = Bytes::from(body);
+                let mut header = ResponseHeader::build(401, None)?;
+                header.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                header.insert_header("Content-Length", body_bytes.len().to_string())?;
+                header.insert_header("Strict-Transport-Security", HSTS_HEADER_VALUE)?;
+                header.insert_header("Connection", "close")?;
+
+                session.write_response_header(Box::new(header), false).await?;
+                session.write_response_body(Some(body_bytes), true).await?;
+                return Ok(true); // Stop the pipeline.
+            }
+
+            // A request is considered a successful OIDC callback only if it has both 'code' and 'state'
+            // and is on the correct redirect URI path.
+            let is_successful_callback = if let (Some(_), Some(_)) = (&oidc_code, &oidc_state) {
+                let configured_redirect_path = Url::parse(self.oidc_redirect_url)
+                    .map(|url| url.path().to_string())
+                    .unwrap_or_else(|_| {
+                        warn!("[{}] [{}] Invalid oidc_redirect_url in configuration: {}. Cannot process callback.", ctx.request_id, self.name(), self.oidc_redirect_url);
+                        String::new()
+                    });
+
+                let request_path = session.req_header().uri.path();
+                if request_path == configured_redirect_path {
+                    true
                 } else {
-                    warn!("[{}] [{}] Invalid oidc_redirect_url in configuration: {}. Cannot process callback.", ctx.request_id, self.name(), self.oidc_redirect_url);
+                    warn!(
+                        "[{}] [{}] OIDC callback parameters detected on an unexpected path. Expected: '{}', Actual: '{}'. Ignoring callback.",
+                        ctx.request_id, self.name(), configured_redirect_path, request_path
+                    );
                     false
                 }
             } else {
                 false
             };
 
-            if is_callback_request {
+            if is_successful_callback {
                 // --- Scenario 2: Handle OIDC Callback ---
                 // This block is executed when the user is redirected back from the OIDC provider.
                 // It validates the response and exchanges the authorization code for tokens.

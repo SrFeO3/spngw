@@ -1,6 +1,6 @@
 [package]
 name = "spngw"
-version = "0.5.14"
+version = "0.5.15"
 edition = "2024"
 
 [dependencies]
@@ -13,6 +13,7 @@ chrono = "0.4"
 dashmap = "6"
 env_logger = "0.11"
 futures = "0.3"
+html-escape = "0.2"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 log = "0.4"
 pingora = { version = "0.6", features = [ "lb", "boringssl" ] }
