@@ -1694,8 +1694,12 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
             let state: String = general_purpose::URL_SAFE_NO_PAD.encode(bytes);
             app_session.oidc_state = Some(state.clone());
 
-            // 1-5. Save the original request URL to the session so we can redirect back later.
-            app_session.auth_original_destination = Some(session.req_header().uri.to_string());
+            // 1-5. Save the original request path and query to the session to redirect back later.
+            // We strictly avoid storing the full URL to prevent open redirect vulnerabilities.
+            let original_path = session.req_header().uri.path_and_query()
+                .map(|p| p.as_str())
+                .unwrap_or("/");
+            app_session.auth_original_destination = Some(original_path.to_string());
 
             // 1-6. Update the session in the central store with the new OIDC values.
             session_store.insert(app_session.session_id.clone(), Arc::new(app_session));

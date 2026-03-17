@@ -174,7 +174,7 @@ impl ProxyHttp for GatewayRouter {
             .and_then(|h| h.to_str().ok())
             .map(|h| h.split(':').next().unwrap_or(h));
 
-        if host_header_val != Some(front_sni_name.as_str()) {
+        if !host_header_val.map_or(false, |h| h.eq_ignore_ascii_case(&front_sni_name)) {
             warn!(
                 "[{}] Host header ({:?}) does not match SNI ({}). Rejecting request.",
                 ctx.request_id,
@@ -708,29 +708,43 @@ impl ProxyHttp for HttpRedirectRouter {
     fn new_ctx(&self) -> Self::CTX {}
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
-        let valid_host = session
+        let host_header = session
             .get_header("Host")
-            .and_then(|v| v.to_str().ok())
-            .map(|h| h.split(':').next().unwrap_or(h))
-            .filter(|h| self.realm_map.load().map.contains_key(*h))
-            .map(String::from);
+            .and_then(|v| v.to_str().ok());
 
-        if let Some(host) = valid_host {
-            let path = session
-                .req_header()
-                .uri
-                .path_and_query()
-                .map(|p| p.as_str())
-                .unwrap_or("/");
-            let location = format!("https://{}:{}{}", host, self.tls_port, path);
+        if let Some(host_str) = host_header {
+            let hostname = host_str.split(':').next().unwrap_or(host_str);
 
-            info!("HTTP request. Redirecting to {}", location);
-            let mut resp = ResponseHeader::build(301, None)?;
-            resp.insert_header("Location", location)?;
-            resp.insert_header("Connection", "Close")?;
-            resp.insert_header("Content-Length", "0")?;
-            session.write_response_header(Box::new(resp), true).await?;
-            return Ok(true);
+            if let Some(entry) = self.realm_map.load().map.get(hostname) {
+                let canonical_host = entry.key();
+                let path = session
+                    .req_header()
+                    .uri
+                    .path_and_query()
+                    .map(|p| p.as_str())
+                    .unwrap_or("/");
+
+                // Per RFC 7230 Section 5.3, the request-target (origin-form) must begin with a '/'.
+                // While path_and_query() returning None is acceptable (we treat it as "/"),
+                // a non-empty path that doesn't start with '/' is a malformed request.
+                if path != "/" && !path.starts_with('/') {
+                    warn!("HTTP request for {} rejected: invalid path '{}' does not start with '/'.", hostname, path);
+                    let mut resp = ResponseHeader::build(400, None)?;
+                    resp.insert_header("Connection", "Close")?;
+                    resp.insert_header("Content-Length", "0")?;
+                    session.write_response_header(Box::new(resp), true).await?;
+                    return Ok(true);
+                }
+                let location = format!("https://{}:{}{}", canonical_host, self.tls_port, path);
+
+                info!("HTTP request for {}. Redirecting to {}", hostname, location);
+                let mut resp = ResponseHeader::build(301, None)?;
+                resp.insert_header("Location", location)?;
+                resp.insert_header("Connection", "Close")?;
+                resp.insert_header("Content-Length", "0")?;
+                session.write_response_header(Box::new(resp), true).await?;
+                return Ok(true);
+            }
         }
 
         warn!("HTTP request rejected: missing or unknown Host header.");
