@@ -230,16 +230,8 @@ impl ProxyHttp for GatewayRouter {
                     .iter()
                     .find(|vh| &vh.hostname == sni)
                 {
-                    for zone in &realm_config.zones {
-                        if let Some(subdomain) =
-                            zone.subdomains.iter().find(|sd| sd.urn == vhost.subdomain)
-                        {
-                            if subdomain.share_cookie {
-                                ctx.cookie_domain = Some(subdomain.fqdn.clone());
-                            }
-                            break;
-                        }
-                    }
+                    // The cookie_domain is pre-resolved during config load.
+                    ctx.cookie_domain = vhost.cookie_domain.clone();
                 }
             }
         } else {

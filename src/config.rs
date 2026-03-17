@@ -118,6 +118,8 @@ pub struct VirtualHostConfig {
     pub subdomain: String,
     #[serde(rename = "certificate")]
     pub certificate_pem: String,
+    #[serde(skip)]
+    pub cookie_domain: Option<String>,
     #[serde(rename = "key")]
     pub private_key_pem: String,
     #[serde(default)]
@@ -174,16 +176,23 @@ pub struct AppConfig {
 impl AppConfig {
     pub fn resolve_hostnames(&mut self) -> Result<(), String> {
         for realm in &mut self.realms {
-            let mut urn_to_fqdn = std::collections::HashMap::new();
+            let mut urn_to_subdomain_config = std::collections::HashMap::new();
             for zone in &realm.zones {
                 for subdomain in &zone.subdomains {
-                    urn_to_fqdn.insert(subdomain.urn.clone(), subdomain.fqdn.clone());
+                    urn_to_subdomain_config.insert(&subdomain.urn, subdomain);
                 }
             }
 
             for vhost in &mut realm.virtual_hosts {
-                if let Some(fqdn) = urn_to_fqdn.get(&vhost.subdomain) {
-                    vhost.hostname = fqdn.clone();
+                if let Some(subdomain_config) = urn_to_subdomain_config.get(&vhost.subdomain) {
+                    vhost.hostname = subdomain_config.fqdn.clone();
+                    info!(
+                        "[ConfigLoad] VirtualHost '{}' in realm '{}' resolved: URN='{}', share_cookie={}",
+                        vhost.name, realm.name, vhost.subdomain, subdomain_config.share_cookie
+                    );
+                    if subdomain_config.share_cookie {
+                        vhost.cookie_domain = Some(subdomain_config.fqdn.clone());
+                    }
                 } else {
                     return Err(format!(
                         "Realm '{}': VirtualHost subdomain URN '{}' not found in zones configuration.",
@@ -792,7 +801,10 @@ impl SignalReloadService {
         let result = load_config_from_source(&self.config_path).await;
 
         let (new_config, current_content) = match result {
-            Ok(res) => res,
+            Ok(res) => {
+                info!("[ConfigReload] Successfully loaded new configuration from {}.", &self.config_path);
+                res
+            }
             Err(e) => {
                 warn!("[ConfigReload] Failed to load new configuration: {}. Continuing with the old configuration.", e);
                 return;

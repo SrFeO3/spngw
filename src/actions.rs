@@ -36,8 +36,7 @@ use jsonwebtoken::{DecodingKey, Header, Validation, decode, encode};
 use log::{info, warn};
 use pingora::http::ResponseHeader;
 use pingora::prelude::*;
-use rand::distr::Alphanumeric;
-use rand::{Rng, RngCore};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -1110,11 +1109,9 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 ctx.request_id,
                 self.name()
             );
-            let new_session_id: String = rand::rng()
-                .sample_iter(&Alphanumeric)
-                .take(32)
-                .map(char::from)
-                .collect();
+            let mut bytes = [0u8; 32];
+            rand::rng().fill_bytes(&mut bytes);
+            let new_session_id: String = general_purpose::URL_SAFE_NO_PAD.encode(bytes);
 
             let new_app_session = ApplicationSession {
                 session_id: new_session_id.clone(),
@@ -1545,11 +1542,9 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 let old_session_id = ctx.action_state_app_session.as_ref().unwrap().session_id.clone();
 
                 // 2-5-2. Generate a new, cryptographically secure session ID.
-                let new_session_id: String = rand::rng()
-                    .sample_iter(&Alphanumeric)
-                    .take(32)
-                    .map(char::from)
-                    .collect();
+                let mut bytes = [0u8; 32];
+                rand::rng().fill_bytes(&mut bytes);
+                let new_session_id: String = general_purpose::URL_SAFE_NO_PAD.encode(bytes);
                 info!(
                     "[{}] [{}] Regenerating session ID to prevent fixation: {} -> {}",
                     ctx.request_id,
@@ -1675,19 +1670,15 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
             };
 
             // 1-1. Generate and store a 'nonce' for replay attack protection.
-            let nonce: String = rand::rng()
-                .sample_iter(&Alphanumeric)
-                .take(32)
-                .map(char::from)
-                .collect();
+            let mut bytes = [0u8; 16];
+            rand::rng().fill_bytes(&mut bytes);
+            let nonce: String = general_purpose::URL_SAFE_NO_PAD.encode(bytes);
             app_session.oidc_nonce = Some(nonce.clone());
 
             // 1-2. Generate and store a 'code_verifier' for PKCE.
-            let code_verifier: String = rand::rng()
-                .sample_iter(&Alphanumeric)
-                .take(64)
-                .map(char::from)
-                .collect();
+            let mut bytes = [0u8; 32];
+            rand::rng().fill_bytes(&mut bytes);
+            let code_verifier: String = general_purpose::URL_SAFE_NO_PAD.encode(bytes);
             app_session.oidc_pkce_verifier = Some(code_verifier.clone());
 
             // 1-3. Create the 'code_challenge' from the verifier.
@@ -1698,11 +1689,9 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
             // The result is Base64-URL encoded with no padding, as required by the PKCE spec (RFC 7636).
 
             // 1-4. Generate a 'state' parameter for CSRF protection.
-            let state: String = rand::rng()
-                .sample_iter(&Alphanumeric)
-                .take(16)
-                .map(char::from)
-                .collect();
+            let mut bytes = [0u8; 16];
+            rand::rng().fill_bytes(&mut bytes);
+            let state: String = general_purpose::URL_SAFE_NO_PAD.encode(bytes);
             app_session.oidc_state = Some(state.clone());
 
             // 1-5. Save the original request URL to the session so we can redirect back later.
