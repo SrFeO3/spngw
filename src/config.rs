@@ -649,7 +649,10 @@ async fn fetch_config_from_url(url: &str) -> Result<(AppConfig, String), Box<dyn
     }
 
     let base_url = url.trim_end_matches('/');
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
     let realms_url = format!("{}/realms", base_url);
     let api_realms: Vec<ApiRealm> = fetch_and_deserialize(&client, &realms_url).await?;
 

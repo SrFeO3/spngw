@@ -939,8 +939,12 @@ fn main() -> pingora::Result<()> {
     let session_cleanup_service = background_services::SessionCleanupService::new();
     my_server.add_service(background_service("Session Cleaner", session_cleanup_service));
 
-    // Initialize a shared HTTP client for the gateway
-    let http_client = reqwest::Client::new();
+    // Initialize a shared HTTP client for outbound requests (e.g., OIDC).
+    // This enables connection pooling to reduce TLS handshake overhead.
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .expect("Failed to build HTTP client");
 
     let gw = GatewayRouter {
         upstream_peer_cache: upstream_peer_swapper,
