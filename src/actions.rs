@@ -456,14 +456,14 @@ async fn inject_authorization_header_and_token_refresh(
                                             // For temporary errors (e.g., IdP 5xx), we keep the session to allow retries.
                                             // However, we MUST NOT forward the request if the current token is already expired.
                                             // It is the BFF's responsibility to only send valid tokens to the backend.
-                                            if let Some(current_expires_at) = app_session.access_token_expires_at {
-                                                if now >= current_expires_at {
-                                                    warn!("[{}] [{}] Token refresh failed temporarily, and the current token is now expired. Blocking upstream request to ensure backend only receives valid tokens.", ctx.request_id, action_name);
-                                                    is_token_valid = false; // Signal failure to the caller.
-                                                } else {
-                                                    warn!("[{}] [{}] Token refresh failed temporarily, but current token is still valid for {}s. Proceeding with old token for this request.", ctx.request_id, action_name, current_expires_at - now);
-                                                    // is_token_valid remains true, the old token will be used.
-                                                }
+                                            // If the current token is already expired when a temporary refresh error occurs,
+                                            // we must block the request. The caller will then decide how to respond.
+                                            if app_session.access_token_expires_at.map_or(true, |exp| now >= exp) {
+                                                warn!("[{}] [{}] Token refresh failed temporarily, and the current token is expired. Blocking upstream request.", ctx.request_id, action_name);
+                                                is_token_valid = false; // Signal failure to the caller.
+                                            } else {
+                                                warn!("[{}] [{}] Token refresh failed temporarily, but current token is still valid. Proceeding with old token.", ctx.request_id, action_name);
+                                                // is_token_valid remains true, the old token will be used for this single request.
                                             }
                                         }
                                     }
@@ -1882,32 +1882,22 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
         .await;
 
         if !is_token_valid {
+            // If the access token is invalid (e.g., expired and refresh failed), do not proxy the request.
+            // Return 401 Unauthorized instead of a 302 redirect to prevent redirect loops and POST data loss,
+            // allowing client-side applications (like SPAs) to handle re-authentication gracefully.
             warn!(
-                "[{}] [{}] Token refresh failed. Redirecting to self to trigger re-login flow.",
+                "[{}] [{}] Token is invalid and refresh failed. Responding with 401 Unauthorized.",
                 ctx.request_id,
                 self.name()
             );
-            // Respond with a 302 redirect to the current URL.
-            // This forces the client to reload, which will hit the `request_filter` with an unauthenticated session,
-            // triggering the standard OIDC login flow.
-            let self_path = session
-                .req_header()
-                .uri
-                .path_and_query()
-                .map(|p| p.as_str())
-                .unwrap_or("/");
-            let mut header = ResponseHeader::build(302, None).unwrap();
-            header.insert_header("Location", self_path).unwrap();
-            header.insert_header("Content-Length", "0").unwrap();
-            header
-                .insert_header("Strict-Transport-Security", HSTS_HEADER_VALUE)
-                .unwrap();
-            header.insert_header("Connection", "close").unwrap();
-            session
-                .write_response_header(Box::new(header), false)
-                .await?;
+            let mut resp = ResponseHeader::build(401, None)?;
+            resp.insert_header("Content-Length", "0")?;
+            resp.insert_header("Connection", "close")?;
+            session.write_response_header(Box::new(resp), true).await?;
+
+            // Return a custom error to signal that we've handled the response and to stop further processing.
             return Err(Error::new(ErrorType::Custom(
-                "Token refresh failed, redirected to self".into(),
+                "Token invalid, responded with 401".into(),
             )));
         }
 
