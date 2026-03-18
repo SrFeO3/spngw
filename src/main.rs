@@ -938,8 +938,8 @@ fn main() -> pingora::Result<()> {
     my_server.add_service(background_service("Config Reloader", signal_reload_service));
 
     // Create and add the session cleanup service.
-    let session_cleanup_service = background_services::SessionCleanupService::new();
-    my_server.add_service(background_service("Session Cleaner", session_cleanup_service));
+    let cleanup_service = background_services::SessionAndOidcCacheCleanupService::new();
+    my_server.add_service(background_service("Session and OIDC Cache Cleaner", cleanup_service));
 
     // Initialize a shared HTTP client for outbound requests (e.g., OIDC).
     // This enables connection pooling to reduce TLS handshake overhead.

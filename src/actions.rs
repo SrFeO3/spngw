@@ -345,6 +345,19 @@ async fn fetch_oidc_keys(
     Ok((oidc_config, jwks))
 }
 
+/// Performs maintenance on the OIDC metadata cache, removing expired entries.
+/// This is intended to be called periodically by a background service.
+pub fn cleanup_oidc_metadata_cache() {
+    if let Some(cache) = OIDC_METADATA_CACHE.get() {
+        let start_len = cache.len();
+        cache.retain(|_, v| v.expires_at > std::time::Instant::now());
+        let removed = start_len - cache.len();
+        if removed > 0 {
+            info!("[CacheCleanup] Removed {} expired OIDC metadata entries.", removed);
+        }
+    }
+}
+
 // Helper function to inject the Authorization header into the upstream request.
 // It ensures the access token is fresh by refreshing it if necessary.
 // Returns `true` if the token is valid (or if no session exists), and `false` if the token refresh failed.

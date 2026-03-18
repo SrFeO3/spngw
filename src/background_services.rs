@@ -10,24 +10,24 @@ use crate::actions;
 
 const CLEANUP_INTERVAL_SECONDS: u64 = 60;
 
-/// A background service that periodically cleans up expired application sessions.
-pub struct SessionCleanupService {
+/// A background service that periodically cleans up expired application sessions and OIDC metadata cache.
+pub struct SessionAndOidcCacheCleanupService {
     cleanup_interval: Duration,
 }
 
-impl SessionCleanupService {
+impl SessionAndOidcCacheCleanupService {
     pub fn new() -> Self {
-        SessionCleanupService {
+        SessionAndOidcCacheCleanupService {
             cleanup_interval: Duration::from_secs(CLEANUP_INTERVAL_SECONDS),
         }
     }
 }
 
 #[async_trait]
-impl BackgroundService for SessionCleanupService {
+impl BackgroundService for SessionAndOidcCacheCleanupService {
     async fn start(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         info!(
-            "Session Cleanup Service started. Checking for expired sessions every {} seconds.",
+            "Session and OIDC Cache Cleanup Service started. Checking for expired items every {} seconds.",
             self.cleanup_interval.as_secs()
         );
         let mut interval = tokio::time::interval(self.cleanup_interval);
@@ -35,10 +35,10 @@ impl BackgroundService for SessionCleanupService {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    self.cleanup_sessions().await;
+                    self.cleanup_sessions_and_oidc_metadata().await;
                 }
                 _ = shutdown.changed() => {
-                    info!("[SessionCleanup] Shutdown signal received, terminating session cleanup service.");
+                    info!("[SessionAndOidcCacheCleanup] Shutdown signal received, terminating service.");
                     break;
                 }
             }
@@ -46,9 +46,9 @@ impl BackgroundService for SessionCleanupService {
     }
 }
 
-impl SessionCleanupService {
-    async fn cleanup_sessions(&self) {
-        info!("[SessionCleanup] Starting expired session cleanup task.");
+impl SessionAndOidcCacheCleanupService {
+    async fn cleanup_sessions_and_oidc_metadata(&self) {
+        info!("[SessionAndOidcCacheCleanup] Starting cleanup task.");
         let now = Utc::now().timestamp() as u64;
         let mut total_removed_count = 0;
 
@@ -79,15 +79,18 @@ impl SessionCleanupService {
             }
 
             if removed_count_in_scope > 0 {
-                info!("[SessionCleanup] Removed {} expired sessions from scope '{}'.", removed_count_in_scope, realm_scope_key);
+                info!("[SessionAndOidcCacheCleanup] Removed {} expired sessions from scope '{}'.", removed_count_in_scope, realm_scope_key);
                 total_removed_count += removed_count_in_scope;
             }
         }
 
         if total_removed_count > 0 {
-            info!("[SessionCleanup] Finished cleanup task. Total expired sessions removed: {}.", total_removed_count);
+            info!("[SessionAndOidcCacheCleanup] Finished cleanup task. Total expired sessions removed: {}.", total_removed_count);
         } else {
-            info!("[SessionCleanup] Finished cleanup task. No expired sessions found.");
+            info!("[SessionAndOidcCacheCleanup] Finished cleanup task. No expired sessions found.");
         }
+
+        // Also cleanup OIDC metadata cache
+        actions::cleanup_oidc_metadata_cache();
     }
 }
