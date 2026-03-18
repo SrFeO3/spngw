@@ -25,7 +25,7 @@
 /// These are complex, multi-step workflows encapsulated into a single action.
 /// - `RequireAuthentication`: An action for paths that require OIDC authentication. It manages
 ///   the redirect-based login flow. (Note: Callback handling is not yet implemented).
-use std::sync::{Arc, OnceLock};
+use std::sync::{atomic::{AtomicU64, Ordering}, Arc, OnceLock};
 
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose};
@@ -45,6 +45,7 @@ use crate::GatewayCtx;
 
 pub const HSTS_HEADER_VALUE: &str = "max-age=31536000; includeSubDomains; preload";
 const DEVICE_COOKIE_MAX_AGE: u64 = 60 * 60 * 24 * 365; // 1 year
+const SESSION_REFRESH_WINDOW_SECONDS: u64 = 300; // 5 minutes
 
 /// A type alias for a session store, which is a thread-safe map from session IDs to ApplicationSession objects.
 pub type SessionStore = Arc<DashMap<String, Arc<ApplicationSession>>>;
@@ -92,7 +93,7 @@ pub struct ApplicationSession {
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
     pub access_token_expires_at: Option<u64>, // Unix timestamp
-    pub expires_at: u64,                      // Unix timestamp for the session itself
+    pub expires_at: Arc<AtomicU64>,           // Unix timestamp for the session itself
     pub oidc_nonce: Option<String>,
     pub oidc_pkce_verifier: Option<String>,
     pub oidc_state: Option<String>,
@@ -102,7 +103,7 @@ pub struct ApplicationSession {
     pub auth_scope_name: Option<String>,
     pub auth_original_destination: Option<String>,
     // Timestamp of the last token refresh attempt to mitigate dog-piling.
-    pub last_refresh_attempt_at: u64,
+    pub last_refresh_attempt_at: Arc<AtomicU64>,
 }
 
 /// Device context for JWT cookie
@@ -362,17 +363,30 @@ async fn inject_authorization_header_and_token_refresh(
                     let scope_to_use = app_session.auth_scope_name.as_deref().or(fallback_auth_scope_name);
                     if let Some(scope) = scope_to_use {
                         if let Some(store) = get_auth_session_store(&ctx.realm_name, scope) {
-                            if let Some(mut entry) = store.get_mut(&app_session.session_id) {
-                                if now > entry.value().last_refresh_attempt_at.saturating_add(REFRESH_COOLDOWN_SECONDS) {
-                                    // This request wins the race. Update the timestamp in the shared store immediately.
-                                    let mut new_session = entry.value().as_ref().clone();
-                                    new_session.last_refresh_attempt_at = now;
-                                    *entry.value_mut() = Arc::new(new_session);
-                                    should_refresh = true;
+                            let session_arc = if let Some(entry) = store.get(&app_session.session_id) {
+                                let last_attempt_atomic = &entry.value().last_refresh_attempt_at;
+                                let last_attempt = last_attempt_atomic.load(Ordering::Relaxed);
+                                if now > last_attempt.saturating_add(REFRESH_COOLDOWN_SECONDS) {
+                                    // This request attempts to win the race.
+                                    // Use compare_exchange to ensure only one thread enters the refresh block.
+                                    if last_attempt_atomic.compare_exchange(
+                                        last_attempt,
+                                        now,
+                                        Ordering::Relaxed,
+                                        Ordering::Relaxed
+                                    ).is_ok() {
+                                        should_refresh = true;
+                                    }
                                 }
+                                Some(entry.value().clone())
+                            } else {
+                                None
+                            };
+
+                            if let Some(arc) = session_arc {
                                 // In either case (win or lose), sync our local session with the latest from the store.
                                 // This ensures we have the latest timestamp and potentially a new token if we lost the race.
-                                *app_session = entry.value().as_ref().clone();
+                                *app_session = arc.as_ref().clone();
                             }
                         }
                     }
@@ -1058,14 +1072,13 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                                 session_id
                             );
 
-                            // Clone the session from the store to release the read lock from `get()`
-                            // before attempting a write operation (`insert()` or `remove()`) to prevent a deadlock.
+                            // Retrieve session to check/extend; clone to release lock immediately.
                             let session_from_store = session_store.get(&session_id).map(|r| r.value().clone());
 
-                            if let Some(app_session_arc) = session_from_store {
-                                let mut app_session = app_session_arc.as_ref().clone();
+                            if let Some(app_session) = session_from_store {
+                                let current_expiry = app_session.expires_at.load(Ordering::Relaxed);
                                 // Check if session is expired
-                                if app_session.expires_at < now {
+                                if current_expiry < now {
                                     warn!(
                                         "[{}] [{}] Session {} for user {} has expired. Removing.",
                                         ctx.request_id,
@@ -1082,10 +1095,24 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                                         self.name(),
                                         app_session.user_id
                                     );
-                                    // Extend session lifetime
-                                    app_session.expires_at = now + ctx.session_timeout;
-                                    session_store.insert(session_id, Arc::new(app_session.clone())); // Safe to write now
-                                    app_session_opt = Some(app_session);
+
+                                    // Only refresh if within the refresh window of expiry to reduce Set-Cookie noise
+                                    if current_expiry.saturating_sub(now) <= SESSION_REFRESH_WINDOW_SECONDS {
+                                        // Extend session lifetime
+                                        app_session.expires_at.store(now + ctx.session_timeout, Ordering::Relaxed);
+
+                                        // Extend cookie lifetime by signaling response_filter to issue Set-Cookie
+                                        ctx.action_state_new_app_session_cookie =
+                                            Some((session_id.clone(), self.auth_scope_name.to_string()));
+
+                                        info!(
+                                            "[{}] [{}] Session expiring soon. Extended lifetime and refreshing cookie.",
+                                            ctx.request_id,
+                                            self.name()
+                                        );
+                                    }
+
+                                    app_session_opt = Some(app_session.as_ref().clone());
                                     session_found = true;
                                 }
                             } else {
@@ -1121,7 +1148,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 access_token: None,
                 refresh_token: None,
                 access_token_expires_at: None,
-                expires_at: now + crate::UNAUTHENTICATED_SESSION_TIMEOUT_SECONDS, // Short expiry for unauthenticated sessions
+                expires_at: Arc::new(AtomicU64::new(now + crate::UNAUTHENTICATED_SESSION_TIMEOUT_SECONDS)), // Short expiry for unauthenticated sessions
                 oidc_nonce: None,
                 oidc_pkce_verifier: None,
                 oidc_state: None,
@@ -1130,7 +1157,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 oidc_client_secret: self.oidc_client_secret.to_string(),
                 auth_scope_name: Some(self.auth_scope_name.to_string()),
                 auth_original_destination: None,
-                last_refresh_attempt_at: 0,
+                last_refresh_attempt_at: Arc::new(AtomicU64::new(0)),
             };
 
             session_store.insert(new_session_id.clone(), Arc::new(new_app_session.clone()));
@@ -1636,7 +1663,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 let app_session = ctx.action_state_app_session.as_mut().unwrap(); // We know it exists and is mutable
                 app_session.is_authenticated = true;
                 // Now that the user is authenticated, extend the session lifetime to the full duration.
-                app_session.expires_at = Utc::now().timestamp() as u64 + ctx.session_timeout;
+                app_session.expires_at.store(Utc::now().timestamp() as u64 + ctx.session_timeout, Ordering::Relaxed);
 
                 app_session.access_token = Some(tokens.access_token);
                 app_session.access_token_expires_at =
@@ -1890,6 +1917,20 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
             header
                 .insert_header("Strict-Transport-Security", HSTS_HEADER_VALUE)
                 .unwrap();
+
+            // Inject Set-Cookie if the session was extended during this request.
+            if let Some((new_cookie_value, scope_name)) = &ctx.action_state_new_app_session_cookie {
+                let cookie_name = format!("CHIPIN_SESSION_ID_{}", scope_name.to_uppercase());
+                let mut cookie_value = format!(
+                    "{}={}; Path=/; Max-Age={}; HttpOnly; Secure; SameSite=Lax",
+                    cookie_name, new_cookie_value, ctx.session_timeout
+                );
+                if let Some(domain) = &ctx.cookie_domain {
+                    cookie_value.push_str(&format!("; Domain={}", domain));
+                }
+                header.append_header("Set-Cookie", cookie_value).unwrap();
+            }
+
             session
                 .write_response_header(Box::new(header), false)
                 .await?;
@@ -1945,6 +1986,9 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
         ctx: &mut GatewayCtx,
     ) -> Result<()> {
         if let Some((new_cookie_value, scope_name)) = &ctx.action_state_new_app_session_cookie {
+            if scope_name != self.auth_scope_name {
+                return Ok(());
+            }
             info!(
                 "[{}] [{}] Setting new CHIPIN_SESSION_ID in response.",
                 ctx.request_id,

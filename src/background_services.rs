@@ -1,4 +1,5 @@
 use std::time::Duration;
+use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -58,15 +59,24 @@ impl SessionCleanupService {
             let session_store = store_entry.value();
             let mut removed_count_in_scope = 0;
 
-            // `retain` is the most efficient way to remove multiple items from a DashMap.
-            session_store.retain(|_session_id, app_session| {
-                if app_session.expires_at < now {
+            // Phase 1: Collect expired keys using read-only iteration.
+            // This minimizes the duration of locks held on the map shards compared to `retain`.
+            let expired_keys: Vec<String> = session_store
+                .iter()
+                .filter(|entry| entry.value().expires_at.load(Ordering::Relaxed) < now)
+                .map(|entry| entry.key().clone())
+                .collect();
+
+            // Phase 2: Remove keys individually.
+            // We use `remove_if` to atomically re-check the expiry condition under a write lock.
+            // This prevents race conditions where a session might be refreshed between Phase 1 and 2.
+            for key in expired_keys {
+                if session_store.remove_if(&key, |_, session| {
+                    session.expires_at.load(Ordering::Relaxed) < now
+                }).is_some() {
                     removed_count_in_scope += 1;
-                    false // Remove the session
-                } else {
-                    true // Keep the session
                 }
-            });
+            }
 
             if removed_count_in_scope > 0 {
                 info!("[SessionCleanup] Removed {} expired sessions from scope '{}'.", removed_count_in_scope, realm_scope_key);
