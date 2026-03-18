@@ -9,15 +9,9 @@ Supports JWS (Signed) and JWE (Encrypted) tokens.
 
 # --- OIDC Configuration ---
 # Select the provider by commenting/uncommenting the desired section.
-
 # OIDC Configuration for OKTA
 OIDC_ISSUER_URL = "https://xxx/oauth2/default"
 OIDC_AUDIENCE = "https://procyon.test.example.com:8443/"
-
-# OIDC Configuration for Auth0
-# OIDC_ISSUER_URL = "https://xxx/"
-# OIDC_AUDIENCE = "https://procyon.test.example.com:8443"
-
 
 # If you expect JWE (Encrypted Tokens), set the decryption key here.
 # For 'alg: dir', this is the shared secret. For RSA, this is the PEM private key.
@@ -29,6 +23,7 @@ from datetime import datetime
 import re
 import requests
 from jose import jwt, jwk
+from jose.exceptions import JWTClaimsError
 from bottle import Bottle, request, response, ServerAdapter
 
 # --- Boilerplate for multi-threaded server ---
@@ -85,6 +80,7 @@ def enable_cors():
 
 @app.route('/api/add/<x:int>/<y:int>', method=['GET', 'OPTIONS'])
 @app.route('/protected/api/add/<x:int>/<y:int>', method=['GET', 'OPTIONS'])
+@app.route('/protected2/api/add/<x:int>/<y:int>', method=['GET', 'OPTIONS'])
 def add_api(x, y):
     """
     Protected API adding two numbers. Requires Bearer token.
@@ -111,6 +107,9 @@ def add_api(x, y):
         try:
             # A JWE has 5 parts, a JWS has 3.
             token_parts = token.split('.')
+            token_category = "Unknown"
+            validation_result = "Unknown"
+
             if len(token_parts) == 5:
                 # Handle as JWE (Encrypted)
                 print(f" > Token appears to be JWE (5 parts). Attempting decryption...")
@@ -126,6 +125,8 @@ def add_api(x, y):
                     audience=OIDC_AUDIENCE,
                     issuer=OIDC_ISSUER_URL
                 )
+                token_category = "JWE"
+                validation_result = "Decrypted & Validated"
             elif len(token_parts) == 3:
                 # Handle as JWS (Signed)
                 print(f" > Token appears to be JWS (3 parts). Verifying signature...")
@@ -165,16 +166,30 @@ def add_api(x, y):
                     )
                 except Exception as e:
                     print(f" > VALIDATION FAILED: {e.__class__.__name__} - {e}")
+                    if isinstance(e, JWTClaimsError):
+                        print(f" > EXPECTED: issuer={OIDC_ISSUER_URL}, audience={OIDC_AUDIENCE}")
+                        try:
+                            claims = jwt.get_unverified_claims(token)
+                            print(f" > RECEIVED: issuer={claims.get('iss')}, audience={claims.get('aud')}")
+                        except Exception:
+                            pass
                     raise e
+                token_category = "JWT"
+                validation_result = "Signature Verified"
             else:
-                raise Exception(f"Invalid token format. Expected 3 (JWS) or 5 (JWE) parts, got {len(token_parts)}.")
+                # Treat formats other than JWT/JWE as Opaque Tokens and consider validation successful
+                print(f" > Token parts count is {len(token_parts)}. Treating as Opaque Token and skipping validation.")
+                payload = {'sub': 'opaque-user', 'name': 'Opaque User', 'scope': 'unknown'}
+                token_category = "Opaque"
+                validation_result = "Skipped"
 
-            print(f" > JWT signature, expiration, issuer, and audience are all valid.")
-            print(f" > Decision: Authenticated (JWT validation successful).")
+            print(f" > Decision: Authenticated.")
             print(f" > Payload: {payload}")
 
             result = x + y
-            return {'result': result}
+
+            bff_user = request.headers.get('X-BFF-IDToken-Sub', 'None')
+            return {'result': result, 'comment': f"Key: {token_category}, Validation: {validation_result}", 'user': bff_user}
 
         except Exception as e:
             print(f" > Decision: Not Authenticated (JWT validation failed: {e.__class__.__name__}: {e})")

@@ -12,8 +12,6 @@ Contrast this with appserver_spa.py (Pure SPA).
 # External BFF URL: https://www.test.example.com:8443
 # This server runs on: http://localhost:7445 (Upstream for BFF)
 
-PROTECTED_MOUNT_POINT = "/protected"
-
 from datetime import datetime
 from bottle import Bottle, request, response, ServerAdapter
 
@@ -35,11 +33,13 @@ class MultiThreadedServer(ServerAdapter):
 
 app = Bottle()
 
-@app.get(PROTECTED_MOUNT_POINT + '/')
+@app.get(['/protected/', '/protected2/'])
 def index():
     """
     Main page. Serves the SPA.
     """
+
+    mount_point = "/protected2" if request.path.startswith('/protected2') else "/protected"
 
     print(f"\n[{datetime.now().strftime('%H:%M:%S')}] {request.method} {request.url}")
     print(f" > Host: {request.headers.get('Host')}")
@@ -69,18 +69,20 @@ def index():
                   Login: Navigate to a protected route.
                   spngw will intercept and redirect to OIDC if not authenticated.
                 -->
-                <button onclick="window.location.href='{PROTECTED_MOUNT_POINT}/login'">Login (via BFF)</button>
+                <button onclick="window.location.href='{mount_point}/login'">Login (via BFF)</button>
                 <!--
                   Logout: Navigate to logout endpoint.
                 -->
-                <button onclick="window.location.href='{PROTECTED_MOUNT_POINT}/logout'">Logout</button>
+                <button onclick="window.location.href='{mount_point}/logout'">Logout</button>
             </div>
 
             <div class="box">
                 <h3>2. API Call</h3>
-                <p>Target: <code>{PROTECTED_MOUNT_POINT}/api/add/1/2</code> (Proxied by BFF)</p>
+                <p>Target: <code>{mount_point}/api/add/1/2</code> (Proxied by BFF)</p>
                 <button onclick="callApi()">Call API (1 + 2)</button>
                 <p>Result: <span id="api-result" style="font-weight: bold;">...</span></p>
+                <p>Comment: <span id="api-comment">...</span></p>
+                <p>User (from BFF): <span id="api-user">...</span></p>
             </div>
 
             <script>
@@ -88,7 +90,7 @@ def index():
                 // spngw provides /api/me for this purpose.
                 async function checkAuth() {{
                     try {{
-                        const res = await fetch('{PROTECTED_MOUNT_POINT}/api/me');
+                        const res = await fetch('{mount_point}/api/me');
                         if (res.ok) {{
                             const data = await res.json();
                             document.getElementById('auth-status').textContent = "Logged In";
@@ -107,9 +109,13 @@ def index():
                 function callApi() {{
                     // No Authorization header needed! The BFF attaches it.
                     // We call the API relative to the BFF root.
-                    fetch('{PROTECTED_MOUNT_POINT}/api/add/1/2')
+                    fetch('{mount_point}/api/add/1/2')
                         .then(res => res.ok ? res.json() : {{ error: res.status + " " + res.statusText }})
-                        .then(data => document.getElementById('api-result').textContent = data.result || data.error)
+                        .then(data => {{
+                            document.getElementById('api-result').textContent = data.result || data.error;
+                            document.getElementById('api-comment').textContent = data.comment || "";
+                            document.getElementById('api-user').textContent = data.user || "";
+                        }})
                         .catch(err => document.getElementById('api-result').textContent = "Error: " + err);
                 }}
 
@@ -120,7 +126,7 @@ def index():
         </html>
         """
 
-@app.route(PROTECTED_MOUNT_POINT + '/login')
+@app.route(['/protected/login', '/protected2/login'])
 def login():
     """
     Dummy login route.
@@ -128,18 +134,20 @@ def login():
     When accessed, spngw triggers OIDC login.
     After login, spngw passes the request here, and we redirect to home.
     """
+    mount_point = "/protected2" if request.path.startswith('/protected2') else "/protected"
     response.status = 302
-    response.set_header('Location', PROTECTED_MOUNT_POINT + '/')
+    response.set_header('Location', mount_point + '/')
     return "Redirecting..."
 
-@app.route(PROTECTED_MOUNT_POINT + '/logout')
+@app.route(['/protected/logout', '/protected2/logout'])
 def logout():
     """
     Dummy logout route.
     In a real scenario, this would clear the session cookie.
     """
+    mount_point = "/protected2" if request.path.startswith('/protected2') else "/protected"
     response.status = 302
-    response.set_header('Location', PROTECTED_MOUNT_POINT + '/')
+    response.set_header('Location', mount_point + '/')
     return "Redirecting..."
 
 # --- Main execution ---
