@@ -47,6 +47,7 @@ pub const HSTS_HEADER_VALUE: &str = "max-age=31536000; includeSubDomains; preloa
 pub const BFF_USER_SUB_HEADER: &str = "X-BFF-IDToken-Sub";
 const DEVICE_COOKIE_MAX_AGE: u64 = 60 * 60 * 24 * 365; // 1 year
 const SESSION_REFRESH_WINDOW_SECONDS: u64 = 300; // 5 minutes
+const OIDC_METADATA_CACHE_TTL_SECONDS: u64 = 3600; // 1 hour
 
 /// A type alias for a session store, which is a thread-safe map from session IDs to ApplicationSession objects.
 pub type SessionStore = Arc<DashMap<String, Arc<ApplicationSession>>>;
@@ -169,6 +170,14 @@ struct Jwks {
     keys: Vec<serde_json::Value>, // Use serde_json::Value to parse individual keys
 }
 
+#[derive(Clone)]
+struct CachedOidcMetadata {
+    discovery: OidcDiscovery,
+    jwks: Jwks,
+    expires_at: std::time::Instant,
+}
+static OIDC_METADATA_CACHE: OnceLock<DashMap<String, CachedOidcMetadata>> = OnceLock::new();
+
 // Define a trait for all route-specific logic.
 #[async_trait]
 pub trait RouteLogic: Send + Sync {
@@ -244,6 +253,20 @@ async fn fetch_oidc_keys(
     request_id: &str,
     action_name: &str,
 ) -> Result<(OidcDiscovery, Jwks), Error> {
+    // Check cache first
+    let cache_key = format!("{}|{:?}", oidc_token_endpoint, oidc_dialect);
+    let cache = OIDC_METADATA_CACHE.get_or_init(DashMap::new);
+
+    if let Some(entry) = cache.get(&cache_key) {
+        if entry.expires_at > std::time::Instant::now() {
+            info!(
+                "[{}] [{}] OIDC metadata found in cache for {}",
+                request_id, action_name, oidc_token_endpoint
+            );
+            return Ok((entry.discovery.clone(), entry.jwks.clone()));
+        }
+    }
+
     // Fetch OIDC configuration (Discovery) to get JWKS URI and Issuer.
     // We attempt to find the discovery document relative to the token endpoint.
     // Heuristic: Assume the token endpoint is something like `.../token`, go up one level, and look for `.well-known/openid-configuration`.
@@ -311,6 +334,13 @@ async fn fetch_oidc_keys(
         warn!("[{}] [{}] Failed to parse JWKS: {}", request_id, action_name, e);
         *Error::explain(ErrorType::InternalError, "Failed to parse JWKS")
     })?;
+
+    // Update cache
+    cache.insert(cache_key, CachedOidcMetadata {
+        discovery: oidc_config.clone(),
+        jwks: jwks.clone(),
+        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(OIDC_METADATA_CACHE_TTL_SECONDS),
+    });
 
     Ok((oidc_config, jwks))
 }

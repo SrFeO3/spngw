@@ -11,7 +11,6 @@
 // TODO:
 // - Consider making the default certificate configurable instead of using the first one found.
 // - Implement `/api/logout` endpoint to invalidate sessions and tokens
-// - Implement a locking mechanism for token refresh to prevent the dog-piling effect.
 
 use std::sync::Arc;
 use std::time::Instant;
