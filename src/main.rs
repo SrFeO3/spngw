@@ -494,6 +494,9 @@ impl ProxyHttp for GatewayRouter {
         upstream_request: &mut RequestHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()> {
+        // Remove internal headers to prevent spoofing
+        upstream_request.remove_header(actions::BFF_USER_SUB_HEADER);
+
         // Dispatch to the correct upstream request filter logic.
         // Loop through the pipeline to apply all relevant filters.
         let pipeline = std::mem::take(&mut ctx.action_pipeline);

@@ -44,6 +44,7 @@ use url::Url;
 use crate::GatewayCtx;
 
 pub const HSTS_HEADER_VALUE: &str = "max-age=31536000; includeSubDomains; preload";
+pub const BFF_USER_SUB_HEADER: &str = "X-BFF-IDToken-Sub";
 const DEVICE_COOKIE_MAX_AGE: u64 = 60 * 60 * 24 * 365; // 1 year
 const SESSION_REFRESH_WINDOW_SECONDS: u64 = 300; // 5 minutes
 
@@ -515,22 +516,13 @@ async fn inject_authorization_header_and_token_refresh(
                     ctx.request_id, action_name
                 );
                 let auth_header_value = format!("Bearer {}", access_token);
-                // Pass the original Access Token to the upstream
-                // Remove existing Authorization header to avoid duplication/conflict
-                upstream_request.remove_header("Authorization");
+                // Pass the original Access Token to the upstream (upsert)
                 upstream_request
                     .insert_header("Authorization", auth_header_value)
                     .unwrap();
-                // Inject BFF metadata headers
-                // Remove existing headers to prevent spoofing from the client
-                upstream_request.remove_header("X-BFF-Auth-Status");
+                // Inject BFF metadata headers (upsert)
                 upstream_request
-                    .insert_header("X-BFF-Auth-Status", "verified")
-                    .unwrap();
-
-                upstream_request.remove_header("X-BFF-User-Sub");
-                upstream_request
-                    .insert_header("X-BFF-User-Sub", &app_session.user_id)
+                    .insert_header(BFF_USER_SUB_HEADER, &app_session.user_id)
                     .unwrap();
             }
         }
