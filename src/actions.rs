@@ -834,64 +834,83 @@ impl RouteLogic for IssueDeviceCookieRoute {
             };
             let validation = Validation::new(jsonwebtoken::Algorithm::RS256);
 
-            match decode::<DeviceContext>(&token, &key.decoding_key, &validation) {
-                Ok(token_data) => {
-                    let claims = token_data.claims;
-                    info!(
-                        "[{}] [{}] Successfully validated CHIPIN_DEVICE_CONTEXT JWT. iss: {}, sub: {}, cn: {}, iat: {}, exp: {}",
-                        ctx.request_id,
-                        self.name(),
-                        claims.iss,
-                        claims.sub,
-                        claims.cn,
-                        claims.iat,
-                        claims.exp
-                    );
+            let token_string = token.to_string();
+            let key_clone = key.clone();
+            let request_id = ctx.request_id.clone();
+            let action_name = self.name().to_string();
 
-                    // Check if the cookie needs to be refreshed (50% of life passed)
-                    let now_ts = Utc::now().timestamp() as u64;
-                    let total_duration = claims.exp.saturating_sub(claims.iat);
-                    let elapsed = now_ts.saturating_sub(claims.iat);
-
-                    if elapsed > total_duration / 2 {
+            // Offload heavy RSA signature validation to blocking thread
+            let task_result = tokio::task::spawn_blocking(move || {
+                match decode::<DeviceContext>(&token_string, &key_clone.decoding_key, &validation) {
+                    Ok(token_data) => {
+                        let claims = token_data.claims;
                         info!(
-                            "[{}] [{}] CHIPIN_DEVICE_CONTEXT passed 50% of life ({}s / {}s). Refreshing.",
-                            ctx.request_id,
-                            self.name(),
-                            elapsed,
-                            total_duration
+                            "[{}] [{}] Successfully validated CHIPIN_DEVICE_CONTEXT JWT. iss: {}, sub: {}, cn: {}, iat: {}, exp: {}",
+                            request_id,
+                            action_name,
+                            claims.iss,
+                            claims.sub,
+                            claims.cn,
+                            claims.iat,
+                            claims.exp
                         );
 
-                        let new_claims = DeviceContext {
-                            iss: claims.iss,
-                            sub: claims.sub,
-                            cn: claims.cn,
-                            iat: now_ts,
-                            exp: now_ts + DEVICE_COOKIE_MAX_AGE,
-                        };
+                        // Check if the cookie needs to be refreshed (50% of life passed)
+                        let now_ts = Utc::now().timestamp() as u64;
+                        let total_duration = claims.exp.saturating_sub(claims.iat);
+                        let elapsed = now_ts.saturating_sub(claims.iat);
+                        let mut new_token_opt = None;
 
-                        match encode(
-                            &Header::new(jsonwebtoken::Algorithm::RS256),
-                            &new_claims,
-                            &key.encoding_key,
-                        ) {
-                            Ok(new_token) => {
-                                ctx.action_state_new_dev_cookie = Some(new_token);
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "[{}] [{}] Failed to refresh device cookie: {}",
-                                    ctx.request_id,
-                                    self.name(),
-                                    e
-                                );
+                        if elapsed > total_duration / 2 {
+                            info!(
+                                "[{}] [{}] CHIPIN_DEVICE_CONTEXT passed 50% of life ({}s / {}s). Refreshing.",
+                                request_id,
+                                action_name,
+                                elapsed,
+                                total_duration
+                            );
+
+                            let new_claims = DeviceContext {
+                                iss: claims.iss,
+                                sub: claims.sub,
+                                cn: claims.cn,
+                                iat: now_ts,
+                                exp: now_ts + DEVICE_COOKIE_MAX_AGE,
+                            };
+
+                            // Signing is also heavy
+                            match encode(
+                                &Header::new(jsonwebtoken::Algorithm::RS256),
+                                &new_claims,
+                                &key_clone.encoding_key,
+                            ) {
+                                Ok(new_token) => {
+                                    new_token_opt = Some(new_token);
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "[{}] [{}] Failed to refresh device cookie: {}",
+                                        request_id,
+                                        action_name,
+                                        e
+                                    );
+                                }
                             }
                         }
+                        Ok(new_token_opt)
                     }
+                    Err(e) => Err(e),
+                }
+            }).await;
 
+            match task_result {
+                Ok(Ok(new_token_opt)) => {
+                    if let Some(new_token) = new_token_opt {
+                        ctx.action_state_new_dev_cookie = Some(new_token);
+                    }
                     true // The cookie is valid.
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     warn!(
                         "[{}] [{}] Failed to validate CHIPIN_DEVICE_CONTEXT JWT: {}. A new cookie will be issued.",
                         ctx.request_id,
@@ -899,6 +918,15 @@ impl RouteLogic for IssueDeviceCookieRoute {
                         e
                     );
                     false // The cookie is invalid.
+                }
+                Err(e) => {
+                    warn!(
+                        "[{}] [{}] Blocking task failed during validation: {}",
+                        ctx.request_id,
+                        self.name(),
+                        e
+                    );
+                    false
                 }
             }
         } else {
@@ -917,14 +945,8 @@ impl RouteLogic for IssueDeviceCookieRoute {
             rand::rng().fill_bytes(&mut sub_bytes);
             let sub = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sub_bytes);
             let now_ts = Utc::now().timestamp() as u64;
-            let issuer = ctx.front_sni_name.as_deref().unwrap_or_default();
-            let claims = DeviceContext {
-                iss: issuer.to_string(),
-                sub,
-                cn: "My New Device".to_string(),
-                iat: now_ts,
-                exp: now_ts + DEVICE_COOKIE_MAX_AGE,
-            };
+            let issuer = ctx.front_sni_name.as_deref().unwrap_or_default().to_string();
+
             // Use the key corresponding to the current realm for signing.
             let key = match ctx.jwt_keys.keys_by_realm.get(&ctx.realm_name) {
                 Some(entry) => entry.value().clone(),
@@ -939,17 +961,39 @@ impl RouteLogic for IssueDeviceCookieRoute {
                     return Err(err);
                 }
             };
-            let token = encode(
-                &Header::new(jsonwebtoken::Algorithm::RS256),
-                &claims,
-                &key.encoding_key,
-            )
-            .map_err(|e| {
-                let mut err = Error::new(ErrorType::InternalError);
-                err.context = Some(format!("Failed to create JWT: {}", e).into());
-                err
-            })?;
-            ctx.action_state_new_dev_cookie = Some(token);
+
+            let key_clone = key.clone();
+            // Offload heavy RSA signing to blocking thread
+            let task_result = tokio::task::spawn_blocking(move || {
+                let claims = DeviceContext {
+                    iss: issuer,
+                    sub,
+                    cn: "Device-000".to_string(),
+                    iat: now_ts,
+                    exp: now_ts + DEVICE_COOKIE_MAX_AGE,
+                };
+                encode(
+                    &Header::new(jsonwebtoken::Algorithm::RS256),
+                    &claims,
+                    &key_clone.encoding_key,
+                )
+            }).await;
+
+            match task_result {
+                Ok(Ok(token)) => {
+                    ctx.action_state_new_dev_cookie = Some(token);
+                }
+                Ok(Err(e)) => {
+                    let mut err = Error::new(ErrorType::InternalError);
+                    err.context = Some(format!("Failed to create JWT: {}", e).into());
+                    return Err(err);
+                }
+                Err(e) => {
+                    let mut err = Error::new(ErrorType::InternalError);
+                    err.context = Some(format!("Blocking task failed during signing: {}", e).into());
+                    return Err(err);
+                }
+            }
         }
 
         Ok(false) // Continue the pipeline
@@ -1619,44 +1663,34 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                             // not this client (the BFF). So we skip the audience check here.
                             at_validation.validate_aud = false;
 
-                            let mut at_valid = false;
-                            let mut last_error: Option<jsonwebtoken::errors::Error> = None;
-                            for jwk_value in &jwks.keys {
+                            let validation_result = if let Some(jwk_value) = jwks.keys.iter().find(|k| k.get("kid").and_then(|v| v.as_str()) == Some(&kid)) {
                                 let jwk: jsonwebtoken::jwk::Jwk = match serde_json::from_value(jwk_value.clone()) {
                                     Ok(j) => j,
-                                    Err(_) => continue,
-                                };
-
-                                // Find the key that matches the token's 'kid'
-                                if jwk.common.key_id.as_deref() == Some(&kid) {
-                                    if let Ok(decoding_key) = DecodingKey::from_jwk(&jwk) {
-                                        match decode::<serde_json::Value>(access_token, &decoding_key, &at_validation) {
-                                            Ok(_) => {
-                                                at_valid = true;
-                                                last_error = None; // Clear error on success
-                                                break; // Found a valid key and signature
-                                            }
-                                            Err(e) => {
-                                                // Store the error. It's useful for debugging if no key works.
-                                                // This will capture issues like "ExpiredSignature", "InvalidAudience", etc.
-                                                last_error = Some(e);
-                                            }
-                                        }
+                                    Err(e) => {
+                                        warn!("[{}] [{}] Failed to parse matching JWK for access token kid '{}': {}. Rejecting.", ctx.request_id, self.name(), kid, e);
+                                        let _ = session.respond_error(401).await;
+                                        return Ok(true);
                                     }
-                                }
-                            }
+                                };
+                                DecodingKey::from_jwk(&jwk)
+                                    .and_then(|key| decode::<serde_json::Value>(access_token, &key, &at_validation))
+                            } else {
+                                // No matching key found in JWKS
+                                Err(jsonwebtoken::errors::ErrorKind::InvalidKeyFormat.into())
+                            };
 
-                            if !at_valid {
-                                let error_details = last_error.map_or_else(|| "No matching key found or key is invalid".to_string(), |e| e.to_string());
-                                warn!("[{}] [{}] Access Token validation failed. Rejecting authentication. Reason: {}", ctx.request_id, self.name(), error_details);
+                            if let Err(e) = validation_result {
+                                warn!("[{}] [{}] Access Token validation failed. Rejecting authentication. Reason: {}", ctx.request_id, self.name(), e);
                                 let _ = session.respond_error(401).await;
                                 return Ok(true);
                             }
+
                             info!(
                                 "[{}] [{}] Access Token successfully validated.",
                                 ctx.request_id,
                                 self.name()
                             );
+
                         } else {
                             warn!(
                                 "[{}] [{}] Access Token is a JWT but missing 'kid'. Rejecting.",
