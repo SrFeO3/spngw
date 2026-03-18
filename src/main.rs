@@ -890,8 +890,9 @@ fn main() -> pingora::Result<()> {
         map: DashMap::new(),
     };
 
-    // Populate all caches using the unified function
-    config::populate_caches_from_config(
+    // Create the actual initial caches by loading from the configuration.
+    // We pass the empty caches as the "current" state to reuse logic, though nothing will be reused initially.
+    let (initial_keys_cache, initial_certs, initial_upstream_cache, initial_realm_map) = config::create_caches_from_config(
         &app_config,
         &initial_keys_cache,
         &initial_certs,

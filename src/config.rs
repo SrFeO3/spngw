@@ -281,32 +281,31 @@ pub struct RealmMap {
 }
 
 impl JwtKeysCache {
-    /// Performs a differential update of JWT key pairs from the configuration.
+    /// Creates a new JwtKeysCache from the configuration, reusing unchanged keys from the current cache.
     ///
-    /// This function is idempotent. It adds new keys, updates changed keys,
-    /// and removes obsolete keys, without affecting unchanged ones.
-    pub fn reload_from_config(app_config: &Arc<AppConfig>, current_cache: &Self) {
-        let new_realms: HashSet<String> =
-            app_config.realms.iter().map(|r| r.name.clone()).collect();
+    /// This ensures atomic updates of the cache map while preserving existing instances.
+    pub fn new_from_config(app_config: &Arc<AppConfig>, current_cache: &Self) -> Self {
+        let new_map = DashMap::new();
 
-        // Update existing or add new keys
         for realm in &app_config.realms {
             let public_key_pem = realm.jwt_key_pair.public_key_pem.as_bytes();
             let private_key_pem = realm.jwt_key_pair.private_key_pem.as_bytes();
 
-            // Check if the key is new or has changed.
-            let needs_update = match current_cache.keys_by_realm.get(&realm.name) {
-                // The realm exists. Check if the key material has changed.
-                Some(existing_keys) => {
-                    existing_keys.public_key_pem != public_key_pem
-                        || existing_keys.private_key_pem != private_key_pem
+            // Try to reuse existing key pair if it hasn't changed
+            let reuse = if let Some(existing) = current_cache.keys_by_realm.get(&realm.name) {
+                if existing.public_key_pem == public_key_pem && existing.private_key_pem == private_key_pem {
+                    Some(existing.clone())
+                } else {
+                    None
                 }
-                // The realm is new and not in the cache, so it needs to be added.
-                None => true,
+            } else {
+                None
             };
 
-            if needs_update {
-                // Parse keys only when update is needed
+            if let Some(existing_keys) = reuse {
+                new_map.insert(realm.name.clone(), existing_keys);
+            } else {
+                // Parse new keys
                 let encoding_key = match EncodingKey::from_rsa_pem(private_key_pem) {
                     Ok(k) => k,
                     Err(e) => {
@@ -333,60 +332,44 @@ impl JwtKeysCache {
                     "[ConfigReload] Updating JWT keys for realm: '{}'",
                     realm.name
                 );
-                current_cache
-                    .keys_by_realm
-                    .insert(realm.name.clone(), Arc::new(new_keys));
+                new_map.insert(realm.name.clone(), Arc::new(new_keys));
             }
         }
 
-        // Remove keys for realms that no longer exist
-        current_cache.keys_by_realm.retain(|realm_name, _| {
-            if !new_realms.contains(realm_name) {
-                info!(
-                    "[ConfigReload] Removing JWT keys for obsolete realm: '{}'",
-                    realm_name
-                );
-                false
-            } else {
-                true
-            }
-        });
+        JwtKeysCache { keys_by_realm: new_map }
     }
 }
 impl CertificateCache {
-    /// Performs a differential update of TLS certificates from the configuration.
+    /// Creates a new CertificateCache from the configuration, reusing unchanged certificates.
     ///
-    /// This function is idempotent and performs a differential update on the existing cache.
-    /// It adds new certificates, updates changed ones, and removes obsolete ones.
-    pub fn reload_from_config(app_config: &Arc<AppConfig>, current_cache: &Self) {
-        // 1. Collect all hostnames from the new config for easy lookup.
-        let new_hostnames: HashSet<_> = app_config
-            .realms
-            .iter()
-            .flat_map(|r| r.virtual_hosts.iter().map(|v| v.hostname.clone()))
-            .collect();
+    /// This ensures atomic updates of the cache map while preserving existing instances.
+    pub fn new_from_config(app_config: &Arc<AppConfig>, current_cache: &Self) -> Self {
+        let new_map = DashMap::new();
 
-        // 2. Iterate through new config to update or add certificates.
         for realm in &app_config.realms {
             for vhost in &realm.virtual_hosts {
                 let cert_pem = vhost.certificate_pem.as_bytes();
                 let key_pem = vhost.private_key_pem.as_bytes();
 
-                // Check if the certificate needs updating (either new or changed).
-                let needs_update = match current_cache.cert_map.get(&vhost.hostname) {
-                    // The host exists in the cache. Check if the underlying PEM content has changed.
+                // Check if we can reuse the existing certificate
+                let reuse = match current_cache.cert_map.get(&vhost.hostname) {
                     Some(old_cert) => {
                         let old_cert_pem = old_cert.cert.to_pem().unwrap_or_default();
                         let old_key_pem =
                             old_cert.key.private_key_to_pem_pkcs8().unwrap_or_default();
 
-                        old_cert_pem != cert_pem || old_key_pem != key_pem
+                        if old_cert_pem == cert_pem && old_key_pem == key_pem {
+                            Some(old_cert.clone())
+                        } else {
+                            None
+                        }
                     }
-                    // The host is not in the cache, so it's new.
-                    None => true,
+                    None => None,
                 };
 
-                if needs_update {
+                if let Some(cert_and_key) = reuse {
+                    new_map.insert(vhost.hostname.clone(), cert_and_key);
+                } else {
                     info!(
                         "[ConfigReload] Realm '{}': Updating certificate for host '{}'",
                         realm.name, &vhost.hostname
@@ -397,9 +380,7 @@ impl CertificateCache {
                     ) {
                         (Ok(cert), Ok(key)) => {
                             let cert_and_key = Arc::new(CertAndKey { cert, key });
-                            current_cache
-                                .cert_map
-                                .insert(vhost.hostname.clone(), cert_and_key);
+                            new_map.insert(vhost.hostname.clone(), cert_and_key);
                         }
                         (Err(e), _) => warn!(
                             "[ConfigReload] Failed to parse new certificate for {}: {}. Skipping update.",
@@ -414,50 +395,30 @@ impl CertificateCache {
             }
         }
 
-        // 3. Remove entries that are no longer in the new config.
-        current_cache.cert_map.retain(|hostname, _| {
-            if !new_hostnames.contains(hostname) {
-                info!(
-                    "[ConfigReload] Removing obsolete certificate for host: {}",
-                    hostname
-                );
-                false
-            } else {
-                true
-            }
-        });
+        CertificateCache { cert_map: new_map }
     }
 }
 
 impl RealmMap {
-    /// Performs a differential update of the hostname-to-realm mapping.
-    pub fn reload_from_config(app_config: &Arc<AppConfig>, current_map: &Self) {
-        let mut new_map = std::collections::HashMap::new();
+    /// Creates a new RealmMap from the configuration.
+    pub fn new_from_config(app_config: &Arc<AppConfig>, _current_map: &Self) -> Self {
+        let new_map = DashMap::new();
         for realm in &app_config.realms {
             for vhost in &realm.virtual_hosts {
                 new_map.insert(vhost.hostname.clone(), realm.name.clone());
             }
         }
-
-        // Update existing or insert new
-        for (host, realm) in &new_map {
-            current_map.map.insert(host.clone(), realm.clone());
-        }
-
-        // Remove obsolete
-        current_map.map.retain(|host, _| new_map.contains_key(host));
+        RealmMap { map: new_map }
     }
 }
 
 impl UpstreamCache {
-    /// Performs a differential update of upstream peers from the configuration.
+    /// Creates a new UpstreamCache from the configuration, reusing unchanged peers.
     ///
-    /// This function is idempotent. It adds new upstream peers and removes
-    /// obsolete ones. Note: It does not check for changes in existing peers.
-    pub fn reload_from_config(app_config: &Arc<AppConfig>, current_cache: &Self) {
-        let mut all_required_addrs = HashSet::new();
+    /// This ensures atomic updates of the cache map while preserving existing instances.
+    pub fn new_from_config(app_config: &Arc<AppConfig>, current_cache: &Self) -> Self {
+        let new_map = DashMap::new();
 
-        // 1. Add new peers that are not in the current cache, on a per-realm basis.
         for realm in &app_config.realms {
             let mut realm_addrs: HashSet<Arc<str>> = HashSet::new();
             for chain in &realm.routing_chains {
@@ -475,7 +436,10 @@ impl UpstreamCache {
             }
 
             for addr in &realm_addrs {
-                if !current_cache.peer_map.contains_key(addr) {
+                if let Some(peer) = current_cache.peer_map.get(addr) {
+                    // Reuse existing peer
+                    new_map.insert(addr.clone(), peer.clone());
+                } else {
                     info!(
                         "[ConfigReload] Realm '{}': Creating new upstream peer for '{}'",
                         realm.name, addr
@@ -483,21 +447,12 @@ impl UpstreamCache {
                     let addr_no_scheme = addr.strip_prefix("http://").unwrap_or(addr);
                     let is_tls = addr.starts_with("https://");
                     let peer = HttpPeer::new(addr_no_scheme, is_tls, "".to_string());
-                    current_cache.peer_map.insert(addr.clone(), Arc::new(peer));
+                    new_map.insert(addr.clone(), Arc::new(peer));
                 }
             }
-            all_required_addrs.extend(realm_addrs);
         }
 
-        // 2. Remove peers that are no longer in the new configuration.
-        current_cache.peer_map.retain(|addr, _| {
-            if !all_required_addrs.contains(addr) {
-                info!("[ConfigReload] Removing obsolete upstream peer: {}", addr);
-                false
-            } else {
-                true
-            }
-        });
+        UpstreamCache { peer_map: new_map }
     }
 }
 
@@ -555,23 +510,20 @@ impl AuthScopeRegistry {
     }
 }
 
-/// Populates or reloads all caches from a given application configuration.
-/// This function centralizes the cache update logic for both initial load and hot reloads.
-pub fn populate_caches_from_config(
+/// Creates new cache instances from a given application configuration.
+/// This function centralizes the cache creation logic for both initial load and hot reloads.
+pub fn create_caches_from_config(
     app_config: &Arc<AppConfig>,
-    keys_cache: &JwtKeysCache,
-    cert_cache: &CertificateCache,
-    upstream_cache: &UpstreamCache,
-    realm_map: &RealmMap,
-) {
-    // JWT Keys Reload
-    JwtKeysCache::reload_from_config(app_config, keys_cache);
-    // Certificate Cache Reload
-    CertificateCache::reload_from_config(app_config, cert_cache);
-    // Upstream Cache Reload
-    UpstreamCache::reload_from_config(app_config, upstream_cache);
-    // Realm Map Reload
-    RealmMap::reload_from_config(app_config, realm_map);
+    current_keys: &JwtKeysCache,
+    current_certs: &CertificateCache,
+    current_upstreams: &UpstreamCache,
+    current_realm_map: &RealmMap,
+) -> (JwtKeysCache, CertificateCache, UpstreamCache, RealmMap) {
+    let new_keys = JwtKeysCache::new_from_config(app_config, current_keys);
+    let new_certs = CertificateCache::new_from_config(app_config, current_certs);
+    let new_upstreams = UpstreamCache::new_from_config(app_config, current_upstreams);
+    let new_realm_map = RealmMap::new_from_config(app_config, current_realm_map);
+
     // Auth Scopes Reload
     AuthScopeRegistry::reload_from_config(app_config);
 
@@ -595,7 +547,8 @@ pub fn populate_caches_from_config(
         }
     }
 
-    info!("[Config] All caches have been populated from the configuration.");
+    info!("[Config] All caches have been created from the configuration.");
+    (new_keys, new_certs, new_upstreams, new_realm_map)
 }
 
 /// Loads configuration from a source specified by a path, which can be a URL or a file URI.
@@ -824,17 +777,23 @@ impl SignalReloadService {
 
         let new_config_arc = Arc::new(new_config);
 
-        // Atomically swap the main config first.
-        self.main_config_swapper.store(new_config_arc.clone());
-
-        // Use the unified function to reload all caches.
-        populate_caches_from_config(
+        // Create new caches from the new configuration, reusing existing instances where possible.
+        let (new_keys, new_certs, new_upstreams, new_realm_map) = create_caches_from_config(
             &new_config_arc,
             &self.keys_swapper.load(),
             &self.cert_swapper.load(),
             &self.upstream_swapper.load(),
             &self.realm_map_swapper.load(),
         );
+
+        // Atomically swap the main config and all caches.
+        // Note: The swap is atomic per-cache, ensuring readers always see a complete and consistent map.
+        self.main_config_swapper.store(new_config_arc.clone());
+        self.keys_swapper.store(Arc::new(new_keys));
+        self.cert_swapper.store(Arc::new(new_certs));
+        self.upstream_swapper.store(Arc::new(new_upstreams));
+        self.realm_map_swapper.store(Arc::new(new_realm_map));
+
         // Lock the mutex to safely update the last known content.
         let mut last_content = self.last_known_content.lock().unwrap();
         *last_content = current_content;
