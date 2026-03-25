@@ -1968,12 +1968,12 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 ctx.request_id,
                 self.name()
             );
-            let username = ctx
+            let (username, sub) = ctx
                 .action_state_app_session
                 .as_ref()
-                .map(|s| s.username.as_str())
-                .unwrap_or("Unknown");
-            let body_content = serde_json::json!({ "name": username }).to_string();
+                .map(|s| (s.username.as_str(), s.user_id.as_str()))
+                .unwrap_or(("Unknown", ""));
+            let body_content = serde_json::json!({ "name": username, "sub": sub }).to_string();
             let body = Bytes::from(body_content);
 
             let mut header = ResponseHeader::build(200, None).unwrap();
