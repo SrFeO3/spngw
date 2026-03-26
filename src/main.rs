@@ -848,10 +848,9 @@ fn main() -> pingora::Result<()> {
     let gateway_listen_addr = std::env::var("APIGW_TLS_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8443".to_string());
     let redirect_service_listen_addr = std::env::var("APIGW_HTTP_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     info!(
-        "Startup settings:\n\
-        APIGW_INVENTORY_URL (config path): {}\n\
-        APIGW_TLS_BIND_ADDRESS: {}\n\
-        APIGW_HTTP_BIND_ADDRESS: {}",
+        "SPN Gateway started (Version: {}, PID: {}) with config for: {}, {}, {}",
+        env!("CARGO_PKG_VERSION"),
+        std::process::id(),
         config_path, gateway_listen_addr, redirect_service_listen_addr
     );
 
