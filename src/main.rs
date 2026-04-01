@@ -737,7 +737,11 @@ impl ProxyHttp for HttpRedirectRouter {
                     session.write_response_header(Box::new(resp), true).await?;
                     return Ok(true);
                 }
-                let location = format!("https://{}:{}{}", canonical_host, self.tls_port, path);
+                let location = if self.tls_port == 443 {
+                    format!("https://{}{}", canonical_host, path)
+                } else {
+                    format!("https://{}:{}{}", canonical_host, self.tls_port, path)
+                };
 
                 info!("HTTP request for {}. Redirecting to {}", hostname, location);
                 let mut resp = ResponseHeader::build(301, None)?;
@@ -845,20 +849,19 @@ fn main() -> pingora::Result<()> {
     // Read environment variables
     let config_path = std::env::var("APIGW_INVENTORY_URL")
         .expect("APIGW_INVENTORY_URL must be set. Use 'file:///path/to/config.yaml' or 'http(s)://...'.");
-    let gateway_listen_addr = std::env::var("APIGW_TLS_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8443".to_string());
-    let redirect_service_listen_addr = std::env::var("APIGW_HTTP_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    let gateway_listen_addr = std::env::var("APIGW_TLS_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:443".to_string());
+    let redirect_service_listen_addr = std::env::var("APIGW_HTTP_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:80".to_string());
+    let redirect_tls_port = std::env::var("APIGW_TLS_REDIRECT_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(443);
+
     info!(
-        "SPN Gateway started (Version: {}, PID: {}) with config for: {}, {}, {}",
+        "SPN Gateway started (Version: {}, PID: {}) with config: {}, TLS Bind: {}, HTTP Bind: {}, HTTPS Redirect Port: {}",
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
-        config_path, gateway_listen_addr, redirect_service_listen_addr
+        config_path, gateway_listen_addr, redirect_service_listen_addr, redirect_tls_port
     );
-
-    let tls_port = gateway_listen_addr
-        .split(':')
-        .nth(1)
-        .and_then(|p| p.parse::<u16>().ok())
-        .expect("Invalid APIGW_TLS_BIND_ADDRESS format");
 
     let opt = Opt {
         conf: Some("conf/pinconfig.yaml".to_string()),
@@ -980,7 +983,7 @@ fn main() -> pingora::Result<()> {
 
     // Create a separate service for HTTP redirects
     let mut redirect_service = http_proxy_service(&my_server.configuration, HttpRedirectRouter {
-        tls_port,
+        tls_port: redirect_tls_port,
         realm_map: realm_map_swapper.clone(),
     });
     redirect_service.add_tcp(&redirect_service_listen_addr);
