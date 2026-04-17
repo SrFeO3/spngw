@@ -10,9 +10,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-      CC: musl-gcc
-      CXX: g++
-      LIBCLANG_PATH: /usr/lib/llvm-14/lib
+      CC: clang
+      CXX: clang++
+      AR: llvm-ar
     permissions:
       contents: write
 
@@ -32,6 +32,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools cmake perl build-essential nasm pkg-config clang llvm
+
+      - name: Set LIBCLANG_PATH
+        run: echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> $GITHUB_ENV
 
       - name: Build binaries
         run: cargo build -vv --target x86_64-unknown-linux-musl --release
