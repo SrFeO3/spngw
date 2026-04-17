@@ -10,6 +10,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      CC: musl-gcc
+      CXX: g++
+      LIBCLANG_PATH: /usr/lib/llvm-14/lib
     permissions:
       contents: write
 
@@ -28,10 +31,10 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools cmake perl build-essential nasm pkg-config
+          sudo apt-get install -y musl-tools cmake perl build-essential nasm pkg-config clang llvm
 
       - name: Build binaries
-        run: cargo build --target x86_64-unknown-linux-musl --release
+        run: cargo build -vv --target x86_64-unknown-linux-musl --release
 
       - name: Strip binary
         run: strip target/x86_64-unknown-linux-musl/release/spngw
