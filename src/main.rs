@@ -855,16 +855,17 @@ fn main() -> pingora::Result<()> {
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(443);
+    let pingora_conf_path = std::env::var("APIGW_PINGORA_CONF").unwrap_or_else(|_| "conf/pinconfig.yaml".to_string());
 
     info!(
-        "SPN Gateway started (Version: {}, PID: {}) with config: {}, TLS Bind: {}, HTTP Bind: {}, HTTPS Redirect Port: {}",
+        "SPN Gateway started (Version: {}, PID: {}) with inventory: {}, Pingora config: {}, TLS Bind: {}, HTTP Bind: {}, HTTPS Redirect Port: {}",
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
-        config_path, gateway_listen_addr, redirect_service_listen_addr, redirect_tls_port
+        config_path, pingora_conf_path, gateway_listen_addr, redirect_service_listen_addr, redirect_tls_port
     );
 
     let opt = Opt {
-        conf: Some("conf/pinconfig.yaml".to_string()),
+        conf: Some(pingora_conf_path),
         ..Default::default()
     };
 
