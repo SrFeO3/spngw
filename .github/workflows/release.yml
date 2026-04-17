@@ -8,6 +8,8 @@ on:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     permissions:
       contents: write
 
@@ -20,10 +22,13 @@ jobs:
         with:
           targets: x86_64-unknown-linux-musl
 
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools cmake perl build-essential
+          sudo apt-get install -y musl-tools cmake perl build-essential nasm pkg-config
 
       - name: Build binaries
         run: cargo build --target x86_64-unknown-linux-musl --release
