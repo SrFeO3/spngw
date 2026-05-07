@@ -8,13 +8,9 @@ on:
 jobs:
   release:
     runs-on: ubuntu-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-      CC: clang
-      CXX: clang++
-      AR: llvm-ar
     permissions:
       contents: write
+      packages: write
 
     steps:
       - name: Checkout code
@@ -33,11 +29,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools cmake perl build-essential nasm pkg-config clang llvm
 
-      - name: Set LIBCLANG_PATH
-        run: echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> $GITHUB_ENV
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild
 
       - name: Build binaries
-        run: cargo build -vv --target x86_64-unknown-linux-musl --release
+        run: |
+          CC="zig cc" \
+          CXX="zig c++" \
+          cargo zigbuild --target x86_64-unknown-linux-musl --release
 
       - name: Strip binary
         run: strip target/x86_64-unknown-linux-musl/release/spngw
@@ -46,6 +50,11 @@ jobs:
         run: |
           mkdir -p release-assets
           cp target/x86_64-unknown-linux-musl/release/spngw release-assets/spngw
+          cat <<EOF > release-assets/Dockerfile
+          FROM scratch
+          COPY spngw /spngw
+          ENTRYPOINT ["/spngw"]
+          EOF
 
       - name: Create or Update Release
         uses: softprops/action-gh-release@v2
@@ -58,3 +67,25 @@ jobs:
 
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: release-assets
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
