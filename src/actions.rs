@@ -35,7 +35,10 @@ use dashmap::DashMap;
 use jsonwebtoken::{DecodingKey, Header, Validation, decode, encode};
 use log::{info, warn};
 use pingora::http::ResponseHeader;
-use pingora::prelude::*;
+use pingora::{
+    Error, ErrorType, Result,
+    prelude::{RequestHeader, Session},
+};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

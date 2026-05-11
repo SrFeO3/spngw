@@ -22,7 +22,13 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use log::{info, warn};
 use pingora::http::ResponseHeader;
-use pingora::prelude::*;
+use pingora::{
+    Error, ErrorType, Result,
+    prelude::{
+        background_service, http_proxy_service, HttpPeer, Opt, ProxyHttp, RequestHeader, Server,
+        Session,
+    },
+};
 use pingora::tls::ssl::Ssl;
 
 mod actions;

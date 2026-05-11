@@ -35,7 +35,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::future::join_all;
 use log::{error, info, warn};
-use pingora::prelude::*;
+use pingora::prelude::HttpPeer;
 use pingora::services::background::BackgroundService;
 use pingora::tls::pkey::Private;
 use jsonwebtoken::{DecodingKey, EncodingKey};
