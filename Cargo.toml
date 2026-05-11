@@ -18,10 +18,10 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 log = "0.4"
 pingora = { version = "0.8", features = [ "lb", "boringssl" ] }
 rand = "0.10"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
+reqwest = { version = "0.13", default-features = false, features = ["form", "json", "rustls", "blocking"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1"
 serde_yaml = "0.9"
-sha2 = "0.10"
+sha2 = "0.11"
 tokio = { version = "1", features = ["sync", "time", "fs", "signal", "rt"] }
 url = "2.5"
