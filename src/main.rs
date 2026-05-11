@@ -448,7 +448,7 @@ impl ProxyHttp for GatewayRouter {
 
     async fn upstream_peer(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         // The upstream address is now determined during the request_filter_and_prepare_upstream_peer phase and stored in the context.
@@ -464,7 +464,8 @@ impl ProxyHttp for GatewayRouter {
                     "[{}] No upstream defined for this request and no default is set. Responding with 503.",
                     ctx.request_id
                 );
-                return Err(Error::new(pingora::ErrorType::HTTPStatus(503)));
+                let _ = session.respond_error(503).await;
+                return Err(Error::explain(pingora::ErrorType::InternalError, "No upstream defined"));
             }
         };
         info!(
@@ -693,6 +694,32 @@ impl ProxyHttp for GatewayRouter {
             ctx.request_start_time.elapsed()
         );
     }
+
+    /// Pingora 0.8 compliance: Retry policy for upstream connection failures
+    fn fail_to_connect(
+        &self,
+        _session: &mut Session,
+        _peer: &HttpPeer,
+        ctx: &mut Self::CTX,
+        mut e: Box<Error>,
+    ) -> Box<Error> {
+        warn!("[{}] Failed to connect to upstream: {}", ctx.request_id, e);
+        e.set_retry(false); // Explicitly disable retry to prevent unintended re-transmissions
+        e
+    }
+    /// Pingora 0.8 compliance: Policy for errors during proxying (e.g., timeouts)
+    fn error_while_proxy(
+        &self,
+        _peer: &HttpPeer,
+        _session: &mut Session,
+        mut e: Box<Error>,
+        ctx: &mut Self::CTX,
+        _reused: bool,
+    ) -> Box<Error> {
+        warn!("[{}] Error while proxying: {}", ctx.request_id, e);
+        e.set_retry(false); // Explicitly disable retry
+        e
+    }
 }
 
 //
@@ -829,14 +856,13 @@ impl pingora::listeners::TlsAccept for SniCertificateSelector {
             }
         };
 
-        // Apply the selected certificate and key to the SSL context.
-        if let Err(e) = pingora::tls::ext::ssl_use_certificate(ssl, &cert_and_key.cert) {
-            warn!("ssl_use_certificate failed: {}", e);
+        if let Err(e) = ssl.set_certificate(&cert_and_key.cert) {
+            warn!("ssl.set_certificate failed: {}", e);
             // The connection will be terminated by the TLS library.
             return;
         }
-        if let Err(e) = pingora::tls::ext::ssl_use_private_key(ssl, &cert_and_key.key) {
-            warn!("ssl_use_private_key failed: {}", e);
+        if let Err(e) = ssl.set_private_key(&cert_and_key.key) {
+            warn!("ssl.set_private_key failed: {}", e);
             // The connection will be terminated by the TLS library.
             return;
         }

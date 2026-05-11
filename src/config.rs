@@ -444,9 +444,20 @@ impl UpstreamCache {
                         "[ConfigReload] Realm '{}': Creating new upstream peer for '{}'",
                         realm.name, addr
                     );
-                    let addr_no_scheme = addr.strip_prefix("http://").unwrap_or(addr);
                     let is_tls = addr.starts_with("https://");
-                    let peer = HttpPeer::new(addr_no_scheme, is_tls, "".to_string());
+                    let addr_no_scheme = addr
+                        .strip_prefix("http://")
+                        .or_else(|| addr.strip_prefix("https://"))
+                        .unwrap_or(&addr);
+                    let sni = if is_tls {
+                        addr_no_scheme.split(':').next().unwrap_or(addr_no_scheme).to_string()
+                    } else {
+                        "".to_string()
+                    };
+                    let mut peer = HttpPeer::new(addr_no_scheme, is_tls, sni);
+
+                    peer.options.idle_timeout = Some(std::time::Duration::from_secs(60));
+
                     new_map.insert(addr.clone(), Arc::new(peer));
                 }
             }
@@ -732,7 +743,7 @@ impl SignalReloadService {
 
 #[async_trait]
 impl BackgroundService for SignalReloadService {
-    async fn start(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    async fn start(&self, mut shutdown: pingora::server::ShutdownWatch) {
         let mut sigusr1 = match signal(SignalKind::user_defined1()) { Ok(s) => s, Err(e) => { warn!("Failed to register SIGUSR1 handler: {}. Hot-reloading via signal will be disabled.", e); return; } };
         info!("Signal handler for SIGUSR1 registered. Send SIGUSR1 to this process to reload configuration.");
 

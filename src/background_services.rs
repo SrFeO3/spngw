@@ -25,7 +25,7 @@ impl SessionAndOidcCacheCleanupService {
 
 #[async_trait]
 impl BackgroundService for SessionAndOidcCacheCleanupService {
-    async fn start(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    async fn start(&self, mut shutdown: pingora::server::ShutdownWatch) {
         info!(
             "Session and OIDC Cache Cleanup Service started. Checking for expired items every {} seconds.",
             self.cleanup_interval.as_secs()

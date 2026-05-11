@@ -2040,9 +2040,10 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
             session.write_response_header(Box::new(resp), true).await?;
 
             // Return a custom error to signal that we've handled the response and to stop further processing.
-            return Err(Error::new(ErrorType::Custom(
-                "Token invalid, responded with 401".into(),
-            )));
+            return Err(Error::explain(
+                ErrorType::Custom("AuthFailed"),
+                "Token invalid, responded with 401"
+            ));
         }
 
         Ok(())
