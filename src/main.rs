@@ -197,15 +197,17 @@ impl ProxyHttp for GatewayRouter {
         }
         ctx.front_sni_name = Some(front_sni_name);
 
-        // Determine Realm for this request.
-        let app_config = self.main_config.load();
-        let realm_map = self.realm_map.load();
+        let app_config = self.main_config.load().clone();
         ctx.app_config = Some(app_config.clone());
 
-        let realm_name = ctx
-            .front_sni_name
-            .as_ref()
-            .and_then(|sni| realm_map.map.get(sni).map(|v| v.value().clone()));
+        let realm_name = {
+            let realm_map_arc = self.realm_map.load().clone();
+            ctx.front_sni_name
+                .as_ref()
+                .and_then(|sni| {
+                    realm_map_arc.map.get(sni).map(|v| v.value().clone())
+                })
+        };
 
         if let Some(name) = realm_name {
             ctx.realm_name = name.clone();
@@ -750,23 +752,24 @@ impl ProxyHttp for HttpRedirectRouter {
             .get_header("Host")
             .and_then(|v| v.to_str().ok());
 
-        if let Some(host_str) = host_header {
-            let hostname = host_str.split(':').next().unwrap_or(host_str);
+        let redirect_info = {
+            let realm_map_arc = self.realm_map.load().clone();
+            host_header.and_then(|host_str| {
+                let hostname = host_str.split(':').next().unwrap_or(host_str);
+                realm_map_arc.map.get(hostname).map(|entry| entry.key().to_string())
+            })
+        };
 
-            if let Some(entry) = self.realm_map.load().map.get(hostname) {
-                let canonical_host = entry.key();
-                let path = session
-                    .req_header()
-                    .uri
-                    .path_and_query()
-                    .map(|p| p.as_str())
-                    .unwrap_or("/");
+        if let Some(canonical_host) = redirect_info {
+            let path = session.req_header().uri.path_and_query()
+                .map(|p| p.as_str())
+                .unwrap_or("/");
 
                 // Per RFC 7230 Section 5.3, the request-target (origin-form) must begin with a '/'.
                 // While path_and_query() returning None is acceptable (we treat it as "/"),
                 // a non-empty path that doesn't start with '/' is a malformed request.
                 if path != "/" && !path.starts_with('/') {
-                    warn!("HTTP request for {} rejected: invalid path '{}' does not start with '/'.", hostname, path);
+                    warn!("HTTP request for {} rejected: invalid path '{}' does not start with '/'.", canonical_host, path);
                     let mut resp = ResponseHeader::build(400, None)?;
                     resp.insert_header("Connection", "Close")?;
                     resp.insert_header("Content-Length", "0")?;
@@ -779,14 +782,13 @@ impl ProxyHttp for HttpRedirectRouter {
                     format!("https://{}:{}{}", canonical_host, self.tls_port, path)
                 };
 
-                info!("HTTP request for {}. Redirecting to {}", hostname, location);
+                info!("HTTP request for {}. Redirecting to {}", canonical_host, location);
                 let mut resp = ResponseHeader::build(301, None)?;
                 resp.insert_header("Location", location)?;
                 resp.insert_header("Connection", "Close")?;
                 resp.insert_header("Content-Length", "0")?;
                 session.write_response_header(Box::new(resp), true).await?;
                 return Ok(true);
-            }
         }
 
         warn!("HTTP request rejected: missing or unknown Host header.");
