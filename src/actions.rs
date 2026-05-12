@@ -365,9 +365,8 @@ pub fn cleanup_oidc_metadata_cache() {
 // It ensures the access token is fresh by refreshing it if necessary.
 // Returns `true` if the token is valid (or if no session exists), and `false` if the token refresh failed.
 // This logic is shared between ProxyToRoute and RequireAuthenticationRoute.
-async fn inject_authorization_header_and_token_refresh(
+async fn ensure_valid_token_and_refresh(
     ctx: &mut GatewayCtx,
-    upstream_request: &mut RequestHeader,
     action_name: &str,
     fallback_auth_scope_name: Option<&str>,
 ) -> bool {
@@ -554,25 +553,6 @@ async fn inject_authorization_header_and_token_refresh(
             }
         }
 
-        // Inject the Authorization header if the session is authenticated and we have a valid token.
-        if app_session.is_authenticated && is_token_valid {
-            if let Some(access_token) = &app_session.access_token {
-                info!(
-                    "[{}] [{}] Attaching Authorization header to upstream request.",
-                    ctx.request_id, action_name
-                );
-                let auth_header_value = format!("Bearer {}", access_token);
-                // Pass the original Access Token to the upstream (upsert)
-                upstream_request
-                    .insert_header("Authorization", auth_header_value)
-                    .unwrap();
-                // Inject BFF metadata headers (upsert)
-                upstream_request
-                    .insert_header(BFF_USER_SUB_HEADER, &app_session.user_id)
-                    .unwrap();
-            }
-        }
-
         // Save updated session to store if refresh occurred
         if session_needs_update {
             // Determine scope name to find the store. Prefer the one in session, fallback to route config.
@@ -712,31 +692,17 @@ impl<'a> RouteLogic for ProxyToRoute<'a> {
 
     async fn request_filter_and_prepare_upstream_peer(
         &self,
-        _session: &mut Session,
+        session: &mut Session,
         ctx: &mut GatewayCtx,
     ) -> Result<bool> {
         info!(
-            "[{}] [{}] Setting upstream peer to {}",
+            "[{}] [{}] Executing request_filter_and_prepare_upstream_peer, setting upstream peer to {}",
             ctx.request_id,
             self.name(),
             self.upstream
         );
         // Overwrite the upstream peer address in the context.
         ctx.override_upstream_addr = Some(self.upstream.into());
-        Ok(false) // Continue the pipeline
-    }
-
-    async fn upstream_request_filter(
-        &self,
-        _session: &mut Session,
-        upstream_request: &mut RequestHeader,
-        ctx: &mut GatewayCtx,
-    ) -> Result<()> {
-        info!(
-            "[{}] [{}] Executing upstream_request_filter",
-            ctx.request_id,
-            self.name()
-        );
 
         // Retrieve session information from the CHIPIN_SESSION_ID cookie
         // in case RequireAuthentication has not been executed before this action.
@@ -752,7 +718,7 @@ impl<'a> RouteLogic for ProxyToRoute<'a> {
                 if let Some(session_store) = get_auth_session_store(&ctx.realm_name, scope_name) {
                     let cookie_name = format!("CHIPIN_SESSION_ID_{}", scope_name.to_uppercase());
                     // Extract the session ID from the cookie header.
-                    let app_session_opt = _session
+                    let app_session_opt = session
                         .req_header()
                         .headers
                         .get("Cookie")
@@ -775,13 +741,40 @@ impl<'a> RouteLogic for ProxyToRoute<'a> {
             }
         }
 
-        let _ = inject_authorization_header_and_token_refresh(
-            ctx,
-            upstream_request,
-            self.name(),
-            self.auth_scope_name.as_deref(),
-        )
-        .await;
+        // Ensure the token is valid and refresh if necessary before connecting to upstream.
+        let is_token_valid = ensure_valid_token_and_refresh(ctx, self.name(), self.auth_scope_name.as_deref()).await;
+        if !is_token_valid {
+            warn!("[{}] [{}] Token is invalid and refresh failed. Blocking upstream request.", ctx.request_id, self.name());
+            let _ = session.respond_error(401).await;
+            return Ok(true);
+        }
+
+        Ok(false) // Continue the pipeline
+    }
+
+    async fn upstream_request_filter(
+        &self,
+        _session: &mut Session,
+        upstream_request: &mut RequestHeader,
+        ctx: &mut GatewayCtx,
+    ) -> Result<()> {
+        info!(
+            "[{}] [{}] Executing upstream_request_filter",
+            ctx.request_id,
+            self.name()
+        );
+
+        // Inject headers from the session. Network communication was already handled in request_filter phase.
+        if let Some(app_session) = &ctx.action_state_app_session {
+            if app_session.is_authenticated {
+                if let Some(access_token) = &app_session.access_token {
+                    let auth_header_value = format!("Bearer {}", access_token);
+                    upstream_request.insert_header("Authorization", auth_header_value).unwrap();
+                    upstream_request.insert_header(BFF_USER_SUB_HEADER, &app_session.user_id).unwrap();
+                    info!("[{}] [{}] Injected Authorization header.", ctx.request_id, self.name());
+                }
+            }
+        }
 
         Ok(())
     }
@@ -2005,43 +1998,33 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
             return Ok(true);
         }
 
+        // Ensure the token is valid and refresh if necessary before connecting to upstream.
+        let is_token_valid = ensure_valid_token_and_refresh(ctx, self.name(), Some(self.auth_scope_name)).await;
+        if !is_token_valid {
+            warn!("[{}] [{}] Token is invalid and refresh failed. Blocking upstream request.", ctx.request_id, self.name());
+            let _ = session.respond_error(401).await;
+            return Ok(true);
+        }
+
         Ok(false) // Continue the pipeline
     }
 
     async fn upstream_request_filter(
         &self,
-        session: &mut Session,
+        _session: &mut Session,
         upstream_request: &mut RequestHeader,
         ctx: &mut GatewayCtx,
     ) -> Result<()> {
-        // Inject the Authorization header, checking and updating the access token to ensure it is fresh.
-        let is_token_valid = inject_authorization_header_and_token_refresh(
-            ctx,
-            upstream_request,
-            self.name(),
-            Some(self.auth_scope_name),
-        )
-        .await;
-
-        if !is_token_valid {
-            // If the access token is invalid (e.g., expired and refresh failed), do not proxy the request.
-            // Return 401 Unauthorized instead of a 302 redirect to prevent redirect loops and POST data loss,
-            // allowing client-side applications (like SPAs) to handle re-authentication gracefully.
-            warn!(
-                "[{}] [{}] Token is invalid and refresh failed. Responding with 401 Unauthorized.",
-                ctx.request_id,
-                self.name()
-            );
-            let mut resp = ResponseHeader::build(401, None)?;
-            resp.insert_header("Content-Length", "0")?;
-            resp.insert_header("Connection", "close")?;
-            session.write_response_header(Box::new(resp), true).await?;
-
-            // Return a custom error to signal that we've handled the response and to stop further processing.
-            return Err(Error::explain(
-                ErrorType::Custom("AuthFailed"),
-                "Token invalid, responded with 401"
-            ));
+        // Inject headers from the session. Network communication was already handled in request_filter phase.
+        if let Some(app_session) = &ctx.action_state_app_session {
+            if app_session.is_authenticated {
+                if let Some(access_token) = &app_session.access_token {
+                    let auth_header_value = format!("Bearer {}", access_token);
+                    upstream_request.insert_header("Authorization", auth_header_value).unwrap();
+                    upstream_request.insert_header(BFF_USER_SUB_HEADER, &app_session.user_id).unwrap();
+                    info!("[{}] [{}] Injected Authorization header.", ctx.request_id, self.name());
+                }
+            }
         }
 
         Ok(())
