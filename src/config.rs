@@ -30,18 +30,21 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+use crate::actions;
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::future::join_all;
+use jsonwebtoken::{DecodingKey, EncodingKey};
 use log::{error, info, warn};
 use pingora::prelude::HttpPeer;
 use pingora::services::background::BackgroundService;
 use pingora::tls::pkey::Private;
-use jsonwebtoken::{DecodingKey, EncodingKey};
 use serde::{Deserialize, Serialize};
-use crate::actions;
-use tokio::{self, signal::unix::{signal, SignalKind}};
+use tokio::{
+    self,
+    signal::unix::{SignalKind, signal},
+};
 
 /// Helper struct to deserialize the realm list from the inventory server.
 #[derive(Deserialize, Debug)]
@@ -221,7 +224,10 @@ where
     for realm in &mut realms {
         realm.virtual_hosts.retain(|vhost| {
             if vhost.disabled {
-                info!("[ConfigLoad] Skipping disabled virtual host: '{}'", vhost.name);
+                info!(
+                    "[ConfigLoad] Skipping disabled virtual host: '{}'",
+                    vhost.name
+                );
                 false
             } else {
                 true
@@ -293,7 +299,9 @@ impl JwtKeysCache {
 
             // Try to reuse existing key pair if it hasn't changed
             let reuse = if let Some(existing) = current_cache.keys_by_realm.get(&realm.name) {
-                if existing.public_key_pem == public_key_pem && existing.private_key_pem == private_key_pem {
+                if existing.public_key_pem == public_key_pem
+                    && existing.private_key_pem == private_key_pem
+                {
                     Some(existing.clone())
                 } else {
                     None
@@ -309,14 +317,20 @@ impl JwtKeysCache {
                 let encoding_key = match EncodingKey::from_rsa_pem(private_key_pem) {
                     Ok(k) => k,
                     Err(e) => {
-                        warn!("[ConfigReload] Failed to parse private key for realm '{}': {}", realm.name, e);
+                        warn!(
+                            "[ConfigReload] Failed to parse private key for realm '{}': {}",
+                            realm.name, e
+                        );
                         continue;
                     }
                 };
                 let decoding_key = match DecodingKey::from_rsa_pem(public_key_pem) {
                     Ok(k) => k,
                     Err(e) => {
-                        warn!("[ConfigReload] Failed to parse public key for realm '{}': {}", realm.name, e);
+                        warn!(
+                            "[ConfigReload] Failed to parse public key for realm '{}': {}",
+                            realm.name, e
+                        );
                         continue;
                     }
                 };
@@ -336,7 +350,9 @@ impl JwtKeysCache {
             }
         }
 
-        JwtKeysCache { keys_by_realm: new_map }
+        JwtKeysCache {
+            keys_by_realm: new_map,
+        }
     }
 }
 impl CertificateCache {
@@ -426,7 +442,8 @@ impl UpstreamCache {
                     if let Some(addr) = match rule.action.as_ref() {
                         actions::GatewayAction::ProxyTo { upstream, .. } => Some(upstream.clone()),
                         actions::GatewayAction::RequireAuthentication {
-                            protected_upstream, ..
+                            protected_upstream,
+                            ..
                         } => Some(protected_upstream.clone()),
                         _ => None,
                     } {
@@ -448,9 +465,13 @@ impl UpstreamCache {
                     let addr_no_scheme = addr
                         .strip_prefix("http://")
                         .or_else(|| addr.strip_prefix("https://"))
-                        .unwrap_or(&addr);
+                        .unwrap_or(addr);
                     let sni = if is_tls {
-                        addr_no_scheme.split(':').next().unwrap_or(addr_no_scheme).to_string()
+                        addr_no_scheme
+                            .split(':')
+                            .next()
+                            .unwrap_or(addr_no_scheme)
+                            .to_string()
                     } else {
                         "".to_string()
                     };
@@ -563,50 +584,87 @@ pub fn create_caches_from_config(
 }
 
 /// Loads configuration from a source specified by a path, which can be a URL or a file URI.
-async fn load_config_from_source(path: &str) -> Result<(AppConfig, String), Box<dyn std::error::Error + Send + Sync>> {
+async fn load_config_from_source(
+    path: &str,
+) -> Result<(AppConfig, String), Box<dyn std::error::Error + Send + Sync>> {
     if path.starts_with("http://") || path.starts_with("https://") {
-        info!("[ConfigLoad] Fetching configuration from repository: {}", path);
+        info!(
+            "[ConfigLoad] Fetching configuration from repository: {}",
+            path
+        );
         fetch_config_from_url(path).await
     } else if let Some(file_path) = path.strip_prefix("file://") {
-        info!("[ConfigLoad] Reading configuration from file: {}", file_path);
-        let content = tokio::fs::read_to_string(file_path).await
+        info!(
+            "[ConfigLoad] Reading configuration from file: {}",
+            file_path
+        );
+        let content = tokio::fs::read_to_string(file_path)
+            .await
             .map_err(|e| format!("Failed to read configuration from {}: {}", file_path, e))?;
         let mut config: AppConfig = serde_yaml::from_str(&content)
             .map_err(|e| format!("Failed to parse configuration from {}: {}", file_path, e))?;
         config.resolve_hostnames()?;
         Ok((config, content))
     } else {
-        Err(format!("Unsupported configuration source scheme in path: {}. Use 'file://' or 'http(s)://'.", path).into())
+        Err(format!(
+            "Unsupported configuration source scheme in path: {}. Use 'file://' or 'http(s)://'.",
+            path
+        )
+        .into())
     }
 }
 
 /// Fetches configuration from multiple repository API endpoints and constructs the AppConfig.
-async fn fetch_config_from_url(url: &str) -> Result<(AppConfig, String), Box<dyn std::error::Error + Send + Sync>> {
+async fn fetch_config_from_url(
+    url: &str,
+) -> Result<(AppConfig, String), Box<dyn std::error::Error + Send + Sync>> {
     // Helper to fetch and deserialize JSON from a URL, with enhanced error reporting.
-    async fn fetch_and_deserialize<T: serde::de::DeserializeOwned + Default>(client: &reqwest::Client, url: &str) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
+    async fn fetch_and_deserialize<T: serde::de::DeserializeOwned + Default>(
+        client: &reqwest::Client,
+        url: &str,
+    ) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
         info!("Fetching from {}", url);
-        let response = client.get(url).send().await.map_err(|e| format!("Network error while fetching from {}: {}", url, e))?;
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("Network error while fetching from {}: {}", url, e))?;
         // Handle 404 Not Found gracefully by returning a default (empty) value.
         if response.status() == reqwest::StatusCode::NOT_FOUND {
-            warn!("API endpoint not found (404): {}. Assuming empty collection.", url);
+            warn!(
+                "API endpoint not found (404): {}. Assuming empty collection.",
+                url
+            );
             return Ok(T::default());
         }
         let status = response.status();
         if !status.is_success() {
-            let body_text = response.text().await.unwrap_or_else(|_| "<failed to read body>".to_string());
-            error!("API at {} returned error status {}: {}", url, status, &body_text);
-            return Err(format!("API error for {}: status {}" , url, status).into());
+            let body_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<failed to read body>".to_string());
+            error!(
+                "API at {} returned error status {}: {}",
+                url, status, &body_text
+            );
+            return Err(format!("API error for {}: status {}", url, status).into());
         }
 
         // Read body as text first to handle cases where the API might return an empty body for an empty list.
         let body_text = response.text().await?;
         if body_text.is_empty() {
-            info!("Received empty body from {}, defaulting to empty collection.", url);
+            info!(
+                "Received empty body from {}, defaulting to empty collection.",
+                url
+            );
             return Ok(T::default());
         }
 
         serde_json::from_str(&body_text).map_err(|e| {
-            let err_msg = format!("Failed to deserialize JSON from {}: {}. Body: '{}'", url, e, body_text);
+            let err_msg = format!(
+                "Failed to deserialize JSON from {}: {}. Body: '{}'",
+                url, e, body_text
+            );
             error!("{}", &err_msg);
             err_msg.into()
         })
@@ -620,65 +678,79 @@ async fn fetch_config_from_url(url: &str) -> Result<(AppConfig, String), Box<dyn
     let realms_url = format!("{}/realms", base_url);
     let api_realms: Vec<ApiRealm> = fetch_and_deserialize(&client, &realms_url).await?;
 
-    let realm_tasks = api_realms.into_iter().filter(|r| !r.disabled).map(|api_realm| {
-        let client = client.clone();
-        let base_url = base_url.to_string();
-        async move {
-            let realm_name = api_realm.name.clone();
+    let realm_tasks = api_realms
+        .into_iter()
+        .filter(|r| !r.disabled)
+        .map(|api_realm| {
+            let client = client.clone();
+            let base_url = base_url.to_string();
+            async move {
+                let realm_name = api_realm.name.clone();
 
-            let vhosts_url = format!("{}/realms/{}/virtual-hosts", base_url, realm_name);
-            let chains_url = format!("{}/realms/{}/routing-chains", base_url, realm_name);
-            let zones_url = format!("{}/realms/{}/zones", base_url, realm_name);
+                let vhosts_url = format!("{}/realms/{}/virtual-hosts", base_url, realm_name);
+                let chains_url = format!("{}/realms/{}/routing-chains", base_url, realm_name);
+                let zones_url = format!("{}/realms/{}/zones", base_url, realm_name);
 
-            let vhosts_future = fetch_and_deserialize::<Vec<VirtualHostConfig>>(&client, &vhosts_url);
-            let chains_future = fetch_and_deserialize::<Vec<RoutingChainConfig>>(&client, &chains_url);
-            let zones_future = async {
-                let zones: Vec<ZoneConfig> = fetch_and_deserialize(&client, &zones_url).await?;
-                let zone_tasks = zones.into_iter().map(|mut zone| {
-                    let client = client.clone();
-                    let base_url = base_url.clone();
-                    let realm_name = realm_name.clone();
-                    async move {
-                        let subdomains_url = format!("{}/realms/{}/zones/{}/subdomains", base_url, realm_name, zone._name);
-                        let subdomains: Vec<SubdomainConfig> = fetch_and_deserialize(&client, &subdomains_url).await?;
-                        zone.subdomains = subdomains;
-                        Ok(zone)
-                    }
-                });
-                join_all(zone_tasks).await.into_iter().collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()
-            };
+                let vhosts_future =
+                    fetch_and_deserialize::<Vec<VirtualHostConfig>>(&client, &vhosts_url);
+                let chains_future =
+                    fetch_and_deserialize::<Vec<RoutingChainConfig>>(&client, &chains_url);
+                let zones_future = async {
+                    let zones: Vec<ZoneConfig> = fetch_and_deserialize(&client, &zones_url).await?;
+                    let zone_tasks = zones.into_iter().map(|mut zone| {
+                        let client = client.clone();
+                        let base_url = base_url.clone();
+                        let realm_name = realm_name.clone();
+                        async move {
+                            let subdomains_url = format!(
+                                "{}/realms/{}/zones/{}/subdomains",
+                                base_url, realm_name, zone._name
+                            );
+                            let subdomains: Vec<SubdomainConfig> =
+                                fetch_and_deserialize(&client, &subdomains_url).await?;
+                            zone.subdomains = subdomains;
+                            Ok(zone)
+                        }
+                    });
+                    join_all(zone_tasks)
+                        .await
+                        .into_iter()
+                        .collect::<Result<Vec<_>, Box<dyn std::error::Error + Send + Sync>>>()
+                };
 
-            let (vhosts_res, chains_res, zones_res) = tokio::join!(vhosts_future, chains_future, zones_future);
+                let (vhosts_res, chains_res, zones_res) =
+                    tokio::join!(vhosts_future, chains_future, zones_future);
 
-            let virtual_hosts = vhosts_res?;
-            let zones = zones_res?;
-            let routing_chains = chains_res?;
+                let virtual_hosts = vhosts_res?;
+                let zones = zones_res?;
+                let routing_chains = chains_res?;
 
-            let realm_config = RealmConfig {
-                name: api_realm.name,
-                jwt_key_pair: JwtKeyPairConfig {
-                    public_key_pem: api_realm.public_key_pem,
-                    private_key_pem: api_realm.private_key_pem,
-                },
-                virtual_hosts,
-                routing_chains,
-                zones,
-                disabled: api_realm.disabled,
-                session_timeout: api_realm.session_timeout,
-                // Assume these fields are not provided by the API and set defaults.
-                _urn: String::new(),
-                _title: String::new(),
-                _description: String::new(),
-                _cacert: String::new(),
-                _administrators: Vec::new(),
-                _expired_at: String::new(),
-                _hubs: Vec::new(),
-            };
+                let realm_config = RealmConfig {
+                    name: api_realm.name,
+                    jwt_key_pair: JwtKeyPairConfig {
+                        public_key_pem: api_realm.public_key_pem,
+                        private_key_pem: api_realm.private_key_pem,
+                    },
+                    virtual_hosts,
+                    routing_chains,
+                    zones,
+                    disabled: api_realm.disabled,
+                    session_timeout: api_realm.session_timeout,
+                    // Assume these fields are not provided by the API and set defaults.
+                    _urn: String::new(),
+                    _title: String::new(),
+                    _description: String::new(),
+                    _cacert: String::new(),
+                    _administrators: Vec::new(),
+                    _expired_at: String::new(),
+                    _hubs: Vec::new(),
+                };
 
-            let result: Result<RealmConfig, Box<dyn std::error::Error + Send + Sync>> = Ok(realm_config);
-            result
-        }
-    });
+                let result: Result<RealmConfig, Box<dyn std::error::Error + Send + Sync>> =
+                    Ok(realm_config);
+                result
+            }
+        });
 
     let realms: Vec<RealmConfig> = join_all(realm_tasks)
         .await
@@ -700,7 +772,8 @@ pub fn load_app_config(path: &str) -> (Arc<AppConfig>, String) {
         .build()
         .unwrap();
 
-    let (config, content) = rt.block_on(load_config_from_source(path))
+    let (config, content) = rt
+        .block_on(load_config_from_source(path))
         .unwrap_or_else(|e| panic!("Failed to load initial configuration from {}: {}", path, e));
 
     (Arc::new(config), content)
@@ -744,8 +817,19 @@ impl SignalReloadService {
 #[async_trait]
 impl BackgroundService for SignalReloadService {
     async fn start(&self, mut shutdown: pingora::server::ShutdownWatch) {
-        let mut sigusr1 = match signal(SignalKind::user_defined1()) { Ok(s) => s, Err(e) => { warn!("Failed to register SIGUSR1 handler: {}. Hot-reloading via signal will be disabled.", e); return; } };
-        info!("Signal handler for SIGUSR1 registered. Send SIGUSR1 to this process to reload configuration.");
+        let mut sigusr1 = match signal(SignalKind::user_defined1()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "Failed to register SIGUSR1 handler: {}. Hot-reloading via signal will be disabled.",
+                    e
+                );
+                return;
+            }
+        };
+        info!(
+            "Signal handler for SIGUSR1 registered. Send SIGUSR1 to this process to reload configuration."
+        );
 
         loop {
             tokio::select! {
@@ -762,18 +846,25 @@ impl BackgroundService for SignalReloadService {
 }
 
 impl SignalReloadService {
-    async fn reload_config(&self) { // This is now synchronous but fast enough.
+    async fn reload_config(&self) {
+        // This is now synchronous but fast enough.
         info!("[Signal] SIGUSR1 received. Triggering configuration reload.");
 
         let result = load_config_from_source(&self.config_path).await;
 
         let (new_config, current_content) = match result {
             Ok(res) => {
-                info!("[ConfigReload] Successfully loaded new configuration from {}.", &self.config_path);
+                info!(
+                    "[ConfigReload] Successfully loaded new configuration from {}.",
+                    &self.config_path
+                );
                 res
             }
             Err(e) => {
-                warn!("[ConfigReload] Failed to load new configuration: {}. Continuing with the old configuration.", e);
+                warn!(
+                    "[ConfigReload] Failed to load new configuration: {}. Continuing with the old configuration.",
+                    e
+                );
                 return;
             }
         };

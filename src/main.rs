@@ -22,22 +22,20 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use log::{info, warn};
 use pingora::http::ResponseHeader;
+use pingora::tls::ssl::Ssl;
 use pingora::{
     Error, ErrorType, Result,
     prelude::{
-        background_service, http_proxy_service, HttpPeer, Opt, ProxyHttp, RequestHeader, Server,
-        Session,
+        HttpPeer, Opt, ProxyHttp, RequestHeader, Server, Session, background_service,
+        http_proxy_service,
     },
 };
-use pingora::tls::ssl::Ssl;
 
 mod actions;
 use actions::{GatewayAction, RouteLogic};
 
 mod config;
-use crate::config::{
-    AppConfig, CertificateCache, JwtKeysCache, RealmMap, UpstreamCache,
-};
+use crate::config::{AppConfig, CertificateCache, JwtKeysCache, RealmMap, UpstreamCache};
 
 mod background_services;
 
@@ -179,7 +177,7 @@ impl ProxyHttp for GatewayRouter {
             .and_then(|h| h.to_str().ok())
             .map(|h| h.split(':').next().unwrap_or(h));
 
-        if !host_header_val.map_or(false, |h| h.eq_ignore_ascii_case(&front_sni_name)) {
+        if !host_header_val.is_some_and(|h| h.eq_ignore_ascii_case(&front_sni_name)) {
             warn!(
                 "[{}] Host header ({:?}) does not match SNI ({}). Rejecting request.",
                 ctx.request_id,
@@ -192,7 +190,9 @@ impl ProxyHttp for GatewayRouter {
             resp.insert_header("Content-Length", body.len().to_string())?;
             resp.insert_header("Connection", "Close")?;
             session.write_response_header(Box::new(resp), false).await?;
-            session.write_response_body(Some(Bytes::from(body)), true).await?;
+            session
+                .write_response_body(Some(Bytes::from(body)), true)
+                .await?;
             return Ok(true);
         }
         ctx.front_sni_name = Some(front_sni_name);
@@ -204,9 +204,7 @@ impl ProxyHttp for GatewayRouter {
             let realm_map_arc = self.realm_map.load().clone();
             ctx.front_sni_name
                 .as_ref()
-                .and_then(|sni| {
-                    realm_map_arc.map.get(sni).map(|v| v.value().clone())
-                })
+                .and_then(|sni| realm_map_arc.map.get(sni).map(|v| v.value().clone()))
         };
 
         if let Some(name) = realm_name {
@@ -221,25 +219,29 @@ impl ProxyHttp for GatewayRouter {
             // Get session timeout from realm config
             let realm_config = &app_config.realms[index];
             let session_timeout = if realm_config.session_timeout > 0 {
-                info!("[{}] Using session timeout from realm '{}': {} seconds", ctx.request_id, realm_config.name, realm_config.session_timeout);
+                info!(
+                    "[{}] Using session timeout from realm '{}': {} seconds",
+                    ctx.request_id, realm_config.name, realm_config.session_timeout
+                );
                 realm_config.session_timeout
             } else {
-                info!("[{}] Realm '{}' has no session timeout configured, using default: {} seconds", ctx.request_id, realm_config.name, DEFAULT_SESSION_TIMEOUT_SECONDS);
+                info!(
+                    "[{}] Realm '{}' has no session timeout configured, using default: {} seconds",
+                    ctx.request_id, realm_config.name, DEFAULT_SESSION_TIMEOUT_SECONDS
+                );
                 DEFAULT_SESSION_TIMEOUT_SECONDS
             };
             ctx.session_timeout = session_timeout;
 
-
-            // Resolve Cookie Domain if share_cookie is enabled
-            if let Some(sni) = &ctx.front_sni_name {
-                if let Some(vhost) = realm_config
+            // Resolve Cookie Domain if share_cookie is enabled.
+            // The cookie_domain is pre-resolved during config load.
+            if let Some(sni) = &ctx.front_sni_name
+                && let Some(vhost) = realm_config
                     .virtual_hosts
                     .iter()
                     .find(|vh| &vh.hostname == sni)
-                {
-                    // The cookie_domain is pre-resolved during config load.
-                    ctx.cookie_domain = vhost.cookie_domain.clone();
-                }
+            {
+                ctx.cookie_domain = vhost.cookie_domain.clone();
             }
         } else {
             warn!("[{}] No realm found", ctx.request_id);
@@ -265,28 +267,29 @@ impl ProxyHttp for GatewayRouter {
         ctx.action_pipeline.clear();
 
         // All for DeviceCookie
-        ctx.action_pipeline.push(Arc::new(GatewayAction::IssueDeviceCookie));
+        ctx.action_pipeline
+            .push(Arc::new(GatewayAction::IssueDeviceCookie));
 
         // Dynamically generate Action Pipelines from config
         let path = session.req_header().uri.path();
 
         /// Evaluates a single match expression against the request's hostname and path.
         fn evaluate_single_expr(expr: &str, hostname: &str, path: &str, request_id: &str) -> bool {
-            if let (Some(start_paren), Some(end_paren)) = (expr.find("('"), expr.rfind("')")) {
-                if start_paren < end_paren {
-                    let key = &expr[..start_paren];
-                    let value = &expr[start_paren + 2..end_paren];
+            if let (Some(start_paren), Some(end_paren)) = (expr.find("('"), expr.rfind("')"))
+                && start_paren < end_paren
+            {
+                let key = &expr[..start_paren];
+                let value = &expr[start_paren + 2..end_paren];
 
-                    return match key {
-                        "request.path.starts_with" => path.starts_with(value),
-                        "request.path.ends_with" => path.ends_with(value),
-                        "request.path.equals" => path == value,
-                        "hostname.starts_with" => hostname.starts_with(value),
-                        "hostname.ends_with" => hostname.ends_with(value),
-                        "hostname.equals" => hostname == value,
-                        _ => false,
-                    };
-                }
+                return match key {
+                    "request.path.starts_with" => path.starts_with(value),
+                    "request.path.ends_with" => path.ends_with(value),
+                    "request.path.equals" => path == value,
+                    "hostname.starts_with" => hostname.starts_with(value),
+                    "hostname.ends_with" => hostname.ends_with(value),
+                    "hostname.equals" => hostname == value,
+                    _ => false,
+                };
             }
 
             warn!(
@@ -298,7 +301,7 @@ impl ProxyHttp for GatewayRouter {
 
         if let (Some(app_config), Some(realm_index)) = (&ctx.app_config, ctx.realm_index) {
             let realm_config = &app_config.realms[realm_index];
-            if let Some(chain) = realm_config.routing_chains.get(0) {
+            if let Some(chain) = realm_config.routing_chains.first() {
                 info!(
                     "[{}] Using routing_chain '{}' for request",
                     ctx.request_id, chain.name
@@ -314,18 +317,10 @@ impl ProxyHttp for GatewayRouter {
 
                             // Evaluate both conditions. For simplicity, we assume one is hostname and one is path.
                             // A more robust solution would parse them regardless of order.
-                            let match1 = evaluate_single_expr(
-                                part1,
-                                sni_str,
-                                path,
-                                &ctx.request_id,
-                            );
-                            let match2 = evaluate_single_expr(
-                                part2,
-                                sni_str,
-                                path,
-                                &ctx.request_id,
-                            );
+                            let match1 =
+                                evaluate_single_expr(part1, sni_str, path, &ctx.request_id);
+                            let match2 =
+                                evaluate_single_expr(part2, sni_str, path, &ctx.request_id);
 
                             match1 && match2
                         } else {
@@ -337,12 +332,7 @@ impl ProxyHttp for GatewayRouter {
                         }
                     } else {
                         // Handle single conditions
-                        evaluate_single_expr(
-                            &rule.match_expr,
-                            sni_str,
-                            path,
-                            &ctx.request_id,
-                        )
+                        evaluate_single_expr(&rule.match_expr, sni_str, path, &ctx.request_id)
                     };
 
                     if is_match {
@@ -372,10 +362,7 @@ impl ProxyHttp for GatewayRouter {
             );
             // Pass the session stores to the dispatch macro so it can construct the full scope.
             let early_exit = match action.as_ref() {
-                GatewayAction::ReturnStaticText {
-                    content,
-                    status,
-                } => {
+                GatewayAction::ReturnStaticText { content, status } => {
                     let logic = actions::ReturnStaticTextRoute {
                         content,
                         status_code: *status,
@@ -473,7 +460,10 @@ impl ProxyHttp for GatewayRouter {
                     ctx.request_id
                 );
                 let _ = session.respond_error(503).await;
-                return Err(Error::explain(pingora::ErrorType::InternalError, "No upstream defined"));
+                return Err(Error::explain(
+                    pingora::ErrorType::InternalError,
+                    "No upstream defined",
+                ));
             }
         };
         info!(
@@ -494,7 +484,7 @@ impl ProxyHttp for GatewayRouter {
                 );
                 Error::explain(
                     pingora::ErrorType::HTTPStatus(502),
-                    format!("Upstream peer not found in cache: {}", upstream_addr)
+                    format!("Upstream peer not found in cache: {}", upstream_addr),
                 )
             })
     }
@@ -518,10 +508,7 @@ impl ProxyHttp for GatewayRouter {
             );
             // Use the dispatch macro to call the upstream_request_filter method.
             match action.as_ref() {
-                GatewayAction::ReturnStaticText {
-                    content,
-                    status,
-                } => {
+                GatewayAction::ReturnStaticText { content, status } => {
                     let logic = actions::ReturnStaticTextRoute {
                         content,
                         status_code: *status,
@@ -620,10 +607,7 @@ impl ProxyHttp for GatewayRouter {
             );
 
             match action.as_ref() {
-                GatewayAction::ReturnStaticText {
-                    content,
-                    status,
-                } => {
+                GatewayAction::ReturnStaticText { content, status } => {
                     let logic = actions::ReturnStaticTextRoute {
                         content,
                         status_code: *status,
@@ -631,17 +615,11 @@ impl ProxyHttp for GatewayRouter {
                     logic.response_filter(session, response, ctx).await
                 }
                 GatewayAction::SetUpstreamRequestHeader { name, value } => {
-                    let logic = actions::SetUpstreamRequestHeaderRoute {
-                        name,
-                        value,
-                    };
+                    let logic = actions::SetUpstreamRequestHeaderRoute { name, value };
                     logic.response_filter(session, response, ctx).await
                 }
                 GatewayAction::SetDownstreamResponseHeader { name, value } => {
-                    let logic = actions::SetDownstreamResponseHeaderRoute {
-                        name,
-                        value,
-                    };
+                    let logic = actions::SetDownstreamResponseHeaderRoute { name, value };
                     logic.response_filter(session, response, ctx).await
                 }
                 GatewayAction::RequireAuthentication {
@@ -748,47 +726,57 @@ impl ProxyHttp for HttpRedirectRouter {
     fn new_ctx(&self) -> Self::CTX {}
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
-        let host_header = session
-            .get_header("Host")
-            .and_then(|v| v.to_str().ok());
+        let host_header = session.get_header("Host").and_then(|v| v.to_str().ok());
 
         let redirect_info = {
             let realm_map_arc = self.realm_map.load().clone();
             host_header.and_then(|host_str| {
                 let hostname = host_str.split(':').next().unwrap_or(host_str);
-                realm_map_arc.map.get(hostname).map(|entry| entry.key().to_string())
+                realm_map_arc
+                    .map
+                    .get(hostname)
+                    .map(|entry| entry.key().to_string())
             })
         };
 
         if let Some(canonical_host) = redirect_info {
-            let path = session.req_header().uri.path_and_query()
+            let path = session
+                .req_header()
+                .uri
+                .path_and_query()
                 .map(|p| p.as_str())
                 .unwrap_or("/");
 
-                // Per RFC 7230 Section 5.3, the request-target (origin-form) must begin with a '/'.
-                // While path_and_query() returning None is acceptable (we treat it as "/"),
-                // a non-empty path that doesn't start with '/' is a malformed request.
-                if path != "/" && !path.starts_with('/') {
-                    warn!("HTTP request for {} rejected: invalid path '{}' does not start with '/'.", canonical_host, path);
-                    let mut resp = ResponseHeader::build(400, None)?;
-                    resp.insert_header("Connection", "Close")?;
-                    resp.insert_header("Content-Length", "0")?;
-                    session.write_response_header(Box::new(resp), true).await?;
-                    return Ok(true);
-                }
-                let location = if self.tls_port == 443 {
-                    format!("https://{}{}", canonical_host, path)
-                } else {
-                    format!("https://{}:{}{}", canonical_host, self.tls_port, path)
-                };
-
-                info!("HTTP request for {}. Redirecting to {}", canonical_host, location);
-                let mut resp = ResponseHeader::build(301, None)?;
-                resp.insert_header("Location", location)?;
+            // Per RFC 7230 Section 5.3, the request-target (origin-form) must begin with a '/'.
+            // While path_and_query() returning None is acceptable (we treat it as "/"),
+            // a non-empty path that doesn't start with '/' is a malformed request.
+            if path != "/" && !path.starts_with('/') {
+                warn!(
+                    "HTTP request for {} rejected: invalid path '{}' does not start with '/'.",
+                    canonical_host, path
+                );
+                let mut resp = ResponseHeader::build(400, None)?;
                 resp.insert_header("Connection", "Close")?;
                 resp.insert_header("Content-Length", "0")?;
                 session.write_response_header(Box::new(resp), true).await?;
                 return Ok(true);
+            }
+            let location = if self.tls_port == 443 {
+                format!("https://{}{}", canonical_host, path)
+            } else {
+                format!("https://{}:{}{}", canonical_host, self.tls_port, path)
+            };
+
+            info!(
+                "HTTP request for {}. Redirecting to {}",
+                canonical_host, location
+            );
+            let mut resp = ResponseHeader::build(301, None)?;
+            resp.insert_header("Location", location)?;
+            resp.insert_header("Connection", "Close")?;
+            resp.insert_header("Content-Length", "0")?;
+            session.write_response_header(Box::new(resp), true).await?;
+            return Ok(true);
         }
 
         warn!("HTTP request rejected: missing or unknown Host header.");
@@ -832,7 +820,7 @@ impl pingora::listeners::TlsAccept for SniCertificateSelector {
         // Check if the host is allowed (exists in RealmMap)
         let is_allowed = sni_opt_string
             .as_ref()
-            .map_or(false, |sni| self.realm_map.load().map.contains_key(sni));
+            .is_some_and(|sni| self.realm_map.load().map.contains_key(sni));
 
         if !is_allowed {
             warn!("Connection rejected: Hostname not found in configuration.");
@@ -884,21 +872,29 @@ fn main() -> pingora::Result<()> {
     env_logger::init();
 
     // Read environment variables
-    let config_path = std::env::var("APIGW_INVENTORY_URL")
-        .expect("APIGW_INVENTORY_URL must be set. Use 'file:///path/to/config.yaml' or 'http(s)://...'.");
-    let gateway_listen_addr = std::env::var("APIGW_TLS_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:443".to_string());
-    let redirect_service_listen_addr = std::env::var("APIGW_HTTP_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:80".to_string());
+    let config_path = std::env::var("APIGW_INVENTORY_URL").expect(
+        "APIGW_INVENTORY_URL must be set. Use 'file:///path/to/config.yaml' or 'http(s)://...'.",
+    );
+    let gateway_listen_addr =
+        std::env::var("APIGW_TLS_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:443".to_string());
+    let redirect_service_listen_addr =
+        std::env::var("APIGW_HTTP_BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0:80".to_string());
     let redirect_tls_port = std::env::var("APIGW_TLS_REDIRECT_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(443);
-    let pingora_conf_path = std::env::var("APIGW_PINGORA_CONF").unwrap_or_else(|_| "conf/pinconfig.yaml".to_string());
+    let pingora_conf_path =
+        std::env::var("APIGW_PINGORA_CONF").unwrap_or_else(|_| "conf/pinconfig.yaml".to_string());
 
     info!(
         "SPN Gateway started (Version: {}, PID: {}) with inventory: {}, Pingora config: {}, TLS Bind: {}, HTTP Bind: {}, HTTPS Redirect Port: {}",
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
-        config_path, pingora_conf_path, gateway_listen_addr, redirect_service_listen_addr, redirect_tls_port
+        config_path,
+        pingora_conf_path,
+        gateway_listen_addr,
+        redirect_service_listen_addr,
+        redirect_tls_port
     );
 
     let opt = Opt {
@@ -932,13 +928,14 @@ fn main() -> pingora::Result<()> {
 
     // Create the actual initial caches by loading from the configuration.
     // We pass the empty caches as the "current" state to reuse logic, though nothing will be reused initially.
-    let (initial_keys_cache, initial_certs, initial_upstream_cache, initial_realm_map) = config::create_caches_from_config(
-        &app_config,
-        &initial_keys_cache,
-        &initial_certs,
-        &initial_upstream_cache,
-        &initial_realm_map,
-    );
+    let (initial_keys_cache, initial_certs, initial_upstream_cache, initial_realm_map) =
+        config::create_caches_from_config(
+            &app_config,
+            &initial_keys_cache,
+            &initial_certs,
+            &initial_upstream_cache,
+            &initial_realm_map,
+        );
 
     let jwt_keys_cache_swapper = Arc::new(ArcSwap::new(Arc::new(initial_keys_cache)));
     let cert_cache_swapper = Arc::new(ArcSwap::new(Arc::new(initial_certs)));
@@ -962,7 +959,7 @@ fn main() -> pingora::Result<()> {
         Err(e) => {
             return Err(pingora::Error::explain(
                 pingora::ErrorType::InternalError,
-                format!("Failed to create SSL ex_data index: {}", e)
+                format!("Failed to create SSL ex_data index: {}", e),
             ));
         }
     };
@@ -981,7 +978,10 @@ fn main() -> pingora::Result<()> {
 
     // Create and add the session cleanup service.
     let cleanup_service = background_services::SessionAndOidcCacheCleanupService::new();
-    my_server.add_service(background_service("Session and OIDC Cache Cleaner", cleanup_service));
+    my_server.add_service(background_service(
+        "Session and OIDC Cache Cleaner",
+        cleanup_service,
+    ));
 
     // Initialize a shared HTTP client for outbound requests (e.g., OIDC).
     // This enables connection pooling to reduce TLS handshake overhead.
@@ -992,7 +992,7 @@ fn main() -> pingora::Result<()> {
 
     let gw = GatewayRouter {
         upstream_peer_cache: upstream_peer_swapper,
-        sni_ex_data_index: sni_ex_data_index.clone(),
+        sni_ex_data_index,
         jwt_keys_cache: jwt_keys_cache_swapper,
         realm_map: realm_map_swapper.clone(),
         main_config: main_config_swapper,
@@ -1002,7 +1002,7 @@ fn main() -> pingora::Result<()> {
 
     let mut gateway_service = http_proxy_service(&my_server.configuration, gw);
     let selector = SniCertificateSelector {
-        sni_ex_data_index: sni_ex_data_index.clone(),
+        sni_ex_data_index,
         cert_cache: cert_cache_swapper.clone(),
         realm_map: realm_map_swapper.clone(),
         default_cert,
@@ -1021,10 +1021,13 @@ fn main() -> pingora::Result<()> {
     );
 
     // Create a separate service for HTTP redirects
-    let mut redirect_service = http_proxy_service(&my_server.configuration, HttpRedirectRouter {
-        tls_port: redirect_tls_port,
-        realm_map: realm_map_swapper.clone(),
-    });
+    let mut redirect_service = http_proxy_service(
+        &my_server.configuration,
+        HttpRedirectRouter {
+            tls_port: redirect_tls_port,
+            realm_map: realm_map_swapper.clone(),
+        },
+    );
     redirect_service.add_tcp(&redirect_service_listen_addr);
     my_server.add_service(redirect_service);
     info!(

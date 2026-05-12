@@ -1,5 +1,5 @@
-use std::time::Duration;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -75,15 +75,21 @@ impl SessionAndOidcCacheCleanupService {
                 // We use `remove_if` to atomically re-check the expiry condition under a write lock.
                 // This prevents race conditions where a session might be refreshed between Phase 1 and 2.
                 for key in expired_keys {
-                    if session_store.remove_if(&key, |_, session| {
-                        session.expires_at.load(Ordering::Relaxed) < now
-                    }).is_some() {
+                    if session_store
+                        .remove_if(&key, |_, session| {
+                            session.expires_at.load(Ordering::Relaxed) < now
+                        })
+                        .is_some()
+                    {
                         removed_count_in_scope += 1;
                     }
                 }
 
                 if removed_count_in_scope > 0 {
-                    info!("[SessionAndOidcCacheCleanup] Removed {} expired sessions from scope '{}'.", removed_count_in_scope, realm_scope_key);
+                    info!(
+                        "[SessionAndOidcCacheCleanup] Removed {} expired sessions from scope '{}'.",
+                        removed_count_in_scope, realm_scope_key
+                    );
                     total_removed_count += removed_count_in_scope;
                 }
             }
@@ -92,10 +98,15 @@ impl SessionAndOidcCacheCleanupService {
             actions::cleanup_oidc_metadata_cache();
 
             total_removed_count
-        }).await.unwrap_or(0);
+        })
+        .await
+        .unwrap_or(0);
 
         if total_removed_count > 0 {
-            info!("[SessionAndOidcCacheCleanup] Finished cleanup task. Total expired sessions removed: {}.", total_removed_count);
+            info!(
+                "[SessionAndOidcCacheCleanup] Finished cleanup task. Total expired sessions removed: {}.",
+                total_removed_count
+            );
         } else {
             info!("[SessionAndOidcCacheCleanup] Finished cleanup task. No expired sessions found.");
         }

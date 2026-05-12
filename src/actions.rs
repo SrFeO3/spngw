@@ -25,7 +25,10 @@
 /// These are complex, multi-step workflows encapsulated into a single action.
 /// - `RequireAuthentication`: An action for paths that require OIDC authentication. It manages
 ///   the redirect-based login flow. (Note: Callback handling is not yet implemented).
-use std::sync::{atomic::{AtomicU64, Ordering}, Arc, OnceLock};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose};
@@ -123,7 +126,11 @@ struct DeviceContext {
 
 /// Set of possible actions that can be applied to a request in the pipeline.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum GatewayAction {
     // --- Terminal Actions: Mutually exclusive actions that define the final request handling. ---
     ReturnStaticText {
@@ -260,14 +267,14 @@ async fn fetch_oidc_keys(
     let cache_key = format!("{}|{:?}", oidc_token_endpoint, oidc_dialect);
     let cache = OIDC_METADATA_CACHE.get_or_init(DashMap::new);
 
-    if let Some(entry) = cache.get(&cache_key) {
-        if entry.expires_at > std::time::Instant::now() {
-            info!(
-                "[{}] [{}] OIDC metadata found in cache for {}",
-                request_id, action_name, oidc_token_endpoint
-            );
-            return Ok((entry.discovery.clone(), entry.jwks.clone()));
-        }
+    if let Some(entry) = cache.get(&cache_key)
+        && entry.expires_at > std::time::Instant::now()
+    {
+        info!(
+            "[{}] [{}] OIDC metadata found in cache for {}",
+            request_id, action_name, oidc_token_endpoint
+        );
+        return Ok((entry.discovery.clone(), entry.jwks.clone()));
     }
 
     // Fetch OIDC configuration (Discovery) to get JWKS URI and Issuer.
@@ -281,7 +288,10 @@ async fn fetch_oidc_keys(
                 "[{}] [{}] Failed to parse Google OIDC discovery URL: {}",
                 request_id, action_name, e
             );
-            Error::explain(ErrorType::InternalError, "Failed to parse Google OIDC discovery URL")
+            Error::explain(
+                ErrorType::InternalError,
+                "Failed to parse Google OIDC discovery URL",
+            )
         })?
     } else {
         let token_endpoint_url = Url::parse(oidc_token_endpoint).map_err(|e| {
@@ -299,7 +309,10 @@ async fn fetch_oidc_keys(
                     "[{}] [{}] Failed to construct OIDC discovery URL: {}",
                     request_id, action_name, e
                 );
-                Error::explain(ErrorType::InternalError, "Failed to construct OIDC discovery URL")
+                Error::explain(
+                    ErrorType::InternalError,
+                    "Failed to construct OIDC discovery URL",
+                )
             })?
     };
 
@@ -308,42 +321,60 @@ async fn fetch_oidc_keys(
         request_id, action_name, discovery_url
     );
 
-    let discovery_resp = client.get(discovery_url.clone()).send().await.map_err(|e| {
-        warn!(
-            "[{}] [{}] Failed to fetch OIDC discovery from {}: {}",
-            request_id, action_name, discovery_url, e
-        );
-        Error::explain(ErrorType::InternalError, "Failed to fetch OIDC discovery")
-    })?;
+    let discovery_resp = client
+        .get(discovery_url.clone())
+        .send()
+        .await
+        .map_err(|e| {
+            warn!(
+                "[{}] [{}] Failed to fetch OIDC discovery from {}: {}",
+                request_id, action_name, discovery_url, e
+            );
+            Error::explain(ErrorType::InternalError, "Failed to fetch OIDC discovery")
+        })?;
 
     let oidc_config: OidcDiscovery = discovery_resp.json().await.map_err(|e| {
         warn!(
             "[{}] [{}] Failed to parse OIDC discovery response: {}",
             request_id, action_name, e
         );
-        Error::explain(ErrorType::InternalError, "Failed to parse OIDC discovery response")
+        Error::explain(
+            ErrorType::InternalError,
+            "Failed to parse OIDC discovery response",
+        )
     })?;
 
     // Fetch JWKS using the URI from discovery
-    let jwks_response = client.get(&oidc_config.jwks_uri).send().await.map_err(|e| {
-        warn!(
-            "[{}] [{}] Failed to fetch JWKS from {}: {}",
-            request_id, action_name, oidc_config.jwks_uri, e
-        );
-        Error::explain(ErrorType::InternalError, "Failed to fetch JWKS")
-    })?;
+    let jwks_response = client
+        .get(&oidc_config.jwks_uri)
+        .send()
+        .await
+        .map_err(|e| {
+            warn!(
+                "[{}] [{}] Failed to fetch JWKS from {}: {}",
+                request_id, action_name, oidc_config.jwks_uri, e
+            );
+            Error::explain(ErrorType::InternalError, "Failed to fetch JWKS")
+        })?;
 
     let jwks: Jwks = jwks_response.json().await.map_err(|e| {
-        warn!("[{}] [{}] Failed to parse JWKS: {}", request_id, action_name, e);
+        warn!(
+            "[{}] [{}] Failed to parse JWKS: {}",
+            request_id, action_name, e
+        );
         Error::explain(ErrorType::InternalError, "Failed to parse JWKS")
     })?;
 
     // Update cache
-    cache.insert(cache_key, CachedOidcMetadata {
-        discovery: oidc_config.clone(),
-        jwks: jwks.clone(),
-        expires_at: std::time::Instant::now() + std::time::Duration::from_secs(OIDC_METADATA_CACHE_TTL_SECONDS),
-    });
+    cache.insert(
+        cache_key,
+        CachedOidcMetadata {
+            discovery: oidc_config.clone(),
+            jwks: jwks.clone(),
+            expires_at: std::time::Instant::now()
+                + std::time::Duration::from_secs(OIDC_METADATA_CACHE_TTL_SECONDS),
+        },
+    );
 
     Ok((oidc_config, jwks))
 }
@@ -356,7 +387,10 @@ pub fn cleanup_oidc_metadata_cache() {
         cache.retain(|_, v| v.expires_at > std::time::Instant::now());
         let removed = start_len - cache.len();
         if removed > 0 {
-            info!("[CacheCleanup] Removed {} expired OIDC metadata entries.", removed);
+            info!(
+                "[CacheCleanup] Removed {} expired OIDC metadata entries.",
+                removed
+            );
         }
     }
 }
@@ -374,14 +408,15 @@ async fn ensure_valid_token_and_refresh(
     if let Some(app_session) = &mut ctx.action_state_app_session {
         // Prevent mixing sessions from different scopes.
         // If the action specifies a scope, and the session has a scope, they must match.
-        if let (Some(req_scope), Some(session_scope)) = (fallback_auth_scope_name, &app_session.auth_scope_name) {
-            if req_scope != session_scope.as_str() {
-                warn!(
-                    "[{}] [{}] Scope mismatch: required='{}', found='{}'. Skipping token injection.",
-                    ctx.request_id, action_name, req_scope, session_scope
-                );
-                return true;
-            }
+        if let (Some(req_scope), Some(session_scope)) =
+            (fallback_auth_scope_name, &app_session.auth_scope_name)
+            && req_scope != session_scope.as_str()
+        {
+            warn!(
+                "[{}] [{}] Scope mismatch: required='{}', found='{}'. Skipping token injection.",
+                ctx.request_id, action_name, req_scope, session_scope
+            );
+            return true;
         }
 
         let mut session_needs_update = false;
@@ -406,34 +441,40 @@ async fn ensure_valid_token_and_refresh(
 
                     // Atomically check and update the cooldown timestamp in the shared store to prevent dog-piling.
                     // This lock is extremely short-lived (microseconds) and does not cover the network request.
-                    let scope_to_use = app_session.auth_scope_name.as_deref().or(fallback_auth_scope_name);
-                    if let Some(scope) = scope_to_use {
-                        if let Some(store) = get_auth_session_store(&ctx.realm_name, scope) {
-                            let session_arc = if let Some(entry) = store.get(&app_session.session_id) {
-                                let last_attempt_atomic = &entry.value().last_refresh_attempt_at;
-                                let last_attempt = last_attempt_atomic.load(Ordering::Relaxed);
-                                if now > last_attempt.saturating_add(REFRESH_COOLDOWN_SECONDS) {
-                                    // This request attempts to win the race.
-                                    // Use compare_exchange to ensure only one thread enters the refresh block.
-                                    if last_attempt_atomic.compare_exchange(
+                    let scope_to_use = app_session
+                        .auth_scope_name
+                        .as_deref()
+                        .or(fallback_auth_scope_name);
+                    if let Some(scope) = scope_to_use
+                        && let Some(store) = get_auth_session_store(&ctx.realm_name, scope)
+                    {
+                        let session_arc = if let Some(entry) = store.get(&app_session.session_id) {
+                            let last_attempt_atomic = &entry.value().last_refresh_attempt_at;
+                            let last_attempt = last_attempt_atomic.load(Ordering::Relaxed);
+                            if now > last_attempt.saturating_add(REFRESH_COOLDOWN_SECONDS) {
+                                // This request attempts to win the race.
+                                // Use compare_exchange to ensure only one thread enters the refresh block.
+                                if last_attempt_atomic
+                                    .compare_exchange(
                                         last_attempt,
                                         now,
                                         Ordering::Relaxed,
-                                        Ordering::Relaxed
-                                    ).is_ok() {
-                                        should_refresh = true;
-                                    }
+                                        Ordering::Relaxed,
+                                    )
+                                    .is_ok()
+                                {
+                                    should_refresh = true;
                                 }
-                                Some(entry.value().clone())
-                            } else {
-                                None
-                            };
-
-                            if let Some(arc) = session_arc {
-                                // In either case (win or lose), sync our local session with the latest from the store.
-                                // This ensures we have the latest timestamp and potentially a new token if we lost the race.
-                                *app_session = arc.as_ref().clone();
                             }
+                            Some(entry.value().clone())
+                        } else {
+                            None
+                        };
+
+                        if let Some(arc) = session_arc {
+                            // In either case (win or lose), sync our local session with the latest from the store.
+                            // This ensures we have the latest timestamp and potentially a new token if we lost the race.
+                            *app_session = arc.as_ref().clone();
                         }
                     }
 
@@ -490,25 +531,29 @@ async fn ensure_valid_token_and_refresh(
                                         struct ErrorResponse {
                                             error: Option<String>,
                                         }
-                                        let error_body: Option<ErrorResponse> = resp.json().await.ok();
+                                        let error_body: Option<ErrorResponse> =
+                                            resp.json().await.ok();
 
                                         warn!(
                                             "[{}] [{}] Token refresh failed. Status: {}, Parsed Error: {:?}",
-                                            ctx.request_id,
-                                            action_name,
-                                            status,
-                                            error_body
+                                            ctx.request_id, action_name, status, error_body
                                         );
 
                                         // Decide if the failure is permanent (e.g., token revoked) or temporary (e.g., network issue).
-                                        let is_permanent_error = if let Some(ErrorResponse { error: Some(err_code) }) = &error_body {
+                                        let is_permanent_error = if let Some(ErrorResponse {
+                                            error: Some(err_code),
+                                        }) = &error_body
+                                        {
                                             err_code == "invalid_grant"
                                         } else {
                                             status.is_client_error() // Treat all other 4xx as permanent.
                                         };
 
                                         if is_permanent_error {
-                                            info!("[{}] [{}] Token refresh failed with a permanent error (e.g., invalid_grant). Invalidating session.", ctx.request_id, action_name);
+                                            info!(
+                                                "[{}] [{}] Token refresh failed with a permanent error (e.g., invalid_grant). Invalidating session.",
+                                                ctx.request_id, action_name
+                                            );
                                             app_session.is_authenticated = false;
                                             session_needs_update = true;
                                             is_token_valid = false;
@@ -518,11 +563,20 @@ async fn ensure_valid_token_and_refresh(
                                             // It is the BFF's responsibility to only send valid tokens to the backend.
                                             // If the current token is already expired when a temporary refresh error occurs,
                                             // we must block the request. The caller will then decide how to respond.
-                                            if app_session.access_token_expires_at.map_or(true, |exp| now >= exp) {
-                                                warn!("[{}] [{}] Token refresh failed temporarily, and the current token is expired. Blocking upstream request.", ctx.request_id, action_name);
+                                            if app_session
+                                                .access_token_expires_at
+                                                .is_none_or(|exp| now >= exp)
+                                            {
+                                                warn!(
+                                                    "[{}] [{}] Token refresh failed temporarily, and the current token is expired. Blocking upstream request.",
+                                                    ctx.request_id, action_name
+                                                );
                                                 is_token_valid = false; // Signal failure to the caller.
                                             } else {
-                                                warn!("[{}] [{}] Token refresh failed temporarily, but current token is still valid. Proceeding with old token.", ctx.request_id, action_name);
+                                                warn!(
+                                                    "[{}] [{}] Token refresh failed temporarily, but current token is still valid. Proceeding with old token.",
+                                                    ctx.request_id, action_name
+                                                );
                                                 // is_token_valid remains true, the old token will be used for this single request.
                                             }
                                         }
@@ -618,17 +672,16 @@ impl<'a> RouteLogic for ReturnStaticTextRoute<'a> {
         // `session.respond_error_with_body` does not allow for header customization.
         let body = Bytes::from(self.content.as_bytes().to_vec());
         let mut header = ResponseHeader::build(self.status_code, None)?;
-        header
-            .insert_header("Content-Length", body.len().to_string())?;
+        header.insert_header("Content-Length", body.len().to_string())?;
         // It's good practice to set the Content-Type for static text.
-        header
-            .insert_header("Content-Type", "text/plain; charset=utf-8")?;
+        header.insert_header("Content-Type", "text/plain; charset=utf-8")?;
         // Add the HSTS header as this action terminates the request before the global response_filter.
-        header
-            .insert_header("Strict-Transport-Security", HSTS_HEADER_VALUE)?;
+        header.insert_header("Strict-Transport-Security", HSTS_HEADER_VALUE)?;
         header.insert_header("Connection", "close")?;
 
-        session.write_response_header(Box::new(header), false).await?;
+        session
+            .write_response_header(Box::new(header), false)
+            .await?;
         session.write_response_body(Some(body), true).await?;
         // Return true to stop the pipeline and send the response immediately.
         Ok(true)
@@ -662,7 +715,7 @@ impl<'a> RouteLogic for RedirectRoute<'a> {
 
         // Create a 302 Found response header.
         let mut header = ResponseHeader::build(302, None).unwrap();
-        header.insert_header("Location", &*self.url).unwrap();
+        header.insert_header("Location", self.url).unwrap();
         header
             .insert_header("Content-Length", body.len().to_string())
             .unwrap();
@@ -706,45 +759,50 @@ impl<'a> RouteLogic for ProxyToRoute<'a> {
 
         // Retrieve session information from the CHIPIN_SESSION_ID cookie
         // in case RequireAuthentication has not been executed before this action.
-        if ctx.action_state_app_session.is_none() {
-            if let Some(scope_name) = &self.auth_scope_name {
-                info!(
-                    "[{}] [{}] No app_session in context, attempting to load from CHIPIN_SESSION_ID for scope: {}",
-                    ctx.request_id,
-                    self.name(),
-                    scope_name
-                );
-                // Get the session store for the specified scope.
-                if let Some(session_store) = get_auth_session_store(&ctx.realm_name, scope_name) {
-                    let cookie_name = format!("CHIPIN_SESSION_ID_{}", scope_name.to_uppercase());
-                    // Extract the session ID from the cookie header.
-                    let app_session_opt = session
-                        .req_header()
-                        .headers
-                        .get("Cookie")
-                        .and_then(|cookie_header| cookie_header.to_str().ok())
-                        .and_then(|cookies_str| {
-                            cookies_str.split(';').find_map(|cookie| {
-                                cookie.trim().strip_prefix(&format!("{}=", cookie_name))
-                            })
+        if ctx.action_state_app_session.is_none()
+            && let Some(scope_name) = &self.auth_scope_name
+        {
+            info!(
+                "[{}] [{}] No app_session in context, attempting to load from CHIPIN_SESSION_ID for scope: {}",
+                ctx.request_id,
+                self.name(),
+                scope_name
+            );
+            // Get the session store for the specified scope.
+            if let Some(session_store) = get_auth_session_store(&ctx.realm_name, scope_name) {
+                let cookie_name = format!("CHIPIN_SESSION_ID_{}", scope_name.to_uppercase());
+                // Extract the session ID from the cookie header.
+                let app_session_opt = session
+                    .req_header()
+                    .headers
+                    .get("Cookie")
+                    .and_then(|cookie_header| cookie_header.to_str().ok())
+                    .and_then(|cookies_str| {
+                        cookies_str.split(';').find_map(|cookie| {
+                            cookie.trim().strip_prefix(&format!("{}=", cookie_name))
                         })
-                        .and_then(|session_id| {
-                            // Retrieve the session from the session store.
-                            session_store
-                                .get(session_id)
-                                .map(|app_session_ref| app_session_ref.value().as_ref().clone())
-                        });
+                    })
+                    .and_then(|session_id| {
+                        // Retrieve the session from the session store.
+                        session_store
+                            .get(session_id)
+                            .map(|app_session_ref| app_session_ref.value().as_ref().clone())
+                    });
 
-                    // Store the retrieved session in the context.
-                    ctx.action_state_app_session = app_session_opt;
-                }
+                // Store the retrieved session in the context.
+                ctx.action_state_app_session = app_session_opt;
             }
         }
 
         // Ensure the token is valid and refresh if necessary before connecting to upstream.
-        let is_token_valid = ensure_valid_token_and_refresh(ctx, self.name(), self.auth_scope_name.as_deref()).await;
+        let is_token_valid =
+            ensure_valid_token_and_refresh(ctx, self.name(), self.auth_scope_name).await;
         if !is_token_valid {
-            warn!("[{}] [{}] Token is invalid and refresh failed. Blocking upstream request.", ctx.request_id, self.name());
+            warn!(
+                "[{}] [{}] Token is invalid and refresh failed. Blocking upstream request.",
+                ctx.request_id,
+                self.name()
+            );
             let _ = session.respond_error(401).await;
             return Ok(true);
         }
@@ -765,15 +823,22 @@ impl<'a> RouteLogic for ProxyToRoute<'a> {
         );
 
         // Inject headers from the session. Network communication was already handled in request_filter phase.
-        if let Some(app_session) = &ctx.action_state_app_session {
-            if app_session.is_authenticated {
-                if let Some(access_token) = &app_session.access_token {
-                    let auth_header_value = format!("Bearer {}", access_token);
-                    upstream_request.insert_header("Authorization", auth_header_value).unwrap();
-                    upstream_request.insert_header(BFF_USER_SUB_HEADER, &app_session.user_id).unwrap();
-                    info!("[{}] [{}] Injected Authorization header.", ctx.request_id, self.name());
-                }
-            }
+        if let Some(app_session) = &ctx.action_state_app_session
+            && app_session.is_authenticated
+            && let Some(access_token) = &app_session.access_token
+        {
+            let auth_header_value = format!("Bearer {}", access_token);
+            upstream_request
+                .insert_header("Authorization", auth_header_value)
+                .unwrap();
+            upstream_request
+                .insert_header(BFF_USER_SUB_HEADER, &app_session.user_id)
+                .unwrap();
+            info!(
+                "[{}] [{}] Injected Authorization header.",
+                ctx.request_id,
+                self.name()
+            );
         }
 
         Ok(())
@@ -941,7 +1006,11 @@ impl RouteLogic for IssueDeviceCookieRoute {
             rand::rng().fill_bytes(&mut sub_bytes);
             let sub = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sub_bytes);
             let now_ts = Utc::now().timestamp() as u64;
-            let issuer = ctx.front_sni_name.as_deref().unwrap_or_default().to_string();
+            let issuer = ctx
+                .front_sni_name
+                .as_deref()
+                .unwrap_or_default()
+                .to_string();
 
             // Use the key corresponding to the current realm for signing.
             let key = match ctx.jwt_keys.keys_by_realm.get(&ctx.realm_name) {
@@ -953,7 +1022,10 @@ impl RouteLogic for IssueDeviceCookieRoute {
                         self.name(),
                         ctx.realm_name
                     );
-                    return Err(Error::explain(ErrorType::InternalError, "No JWT keys found in cache"));
+                    return Err(Error::explain(
+                        ErrorType::InternalError,
+                        "No JWT keys found in cache",
+                    ));
                 }
             };
 
@@ -972,17 +1044,24 @@ impl RouteLogic for IssueDeviceCookieRoute {
                     &claims,
                     &key_clone.encoding_key,
                 )
-            }).await;
+            })
+            .await;
 
             match task_result {
                 Ok(Ok(token)) => {
                     ctx.action_state_new_dev_cookie = Some(token);
                 }
                 Ok(Err(e)) => {
-                    return Err(Error::explain(ErrorType::InternalError, format!("Failed to create JWT: {}", e)));
+                    return Err(Error::explain(
+                        ErrorType::InternalError,
+                        format!("Failed to create JWT: {}", e),
+                    ));
                 }
                 Err(e) => {
-                    return Err(Error::explain(ErrorType::InternalError, format!("Blocking task failed during signing: {}", e)));
+                    return Err(Error::explain(
+                        ErrorType::InternalError,
+                        format!("Blocking task failed during signing: {}", e),
+                    ));
                 }
             }
         }
@@ -1045,12 +1124,9 @@ impl<'a> RouteLogic for SetUpstreamRequestHeaderRoute<'a> {
             self.value
         );
         // Then, replace our specific header by removing any existing ones first.
-        upstream_request.remove_header(&*self.name); // remove_header is fine with a reference
+        upstream_request.remove_header(self.name); // remove_header is fine with a reference
         upstream_request
-            .insert_header(
-                self.name.to_string(),
-                self.value.to_string(),
-            )
+            .insert_header(self.name.to_string(), self.value.to_string())
             .unwrap();
         Ok(())
     }
@@ -1081,12 +1157,9 @@ impl<'a> RouteLogic for SetDownstreamResponseHeaderRoute<'a> {
             self.value
         );
         // Then, replace our specific header by removing any existing ones first.
-        response.remove_header(&*self.name); // remove_header is fine with a reference
+        response.remove_header(self.name); // remove_header is fine with a reference
         response
-            .insert_header(
-                self.name.to_string(),
-                self.value.to_string(),
-            )
+            .insert_header(self.name.to_string(), self.value.to_string())
             .unwrap();
         Ok(())
     }
@@ -1119,7 +1192,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
         );
 
         // Retrieve the specific session store for this realm and scope using the helper function.
-        let session_store = get_auth_session_store(&ctx.realm_name, &self.auth_scope_name)
+        let session_store = get_auth_session_store(&ctx.realm_name, self.auth_scope_name)
             .unwrap_or_else(|| panic!("Authentication scope '{}' for realm '{}' not registered. Please call register_auth_scope at startup.", self.auth_scope_name, ctx.realm_name));
 
         ctx.override_upstream_addr = Some(self.protected_upstream.into());
@@ -1128,74 +1201,78 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
         let now = Utc::now().timestamp() as u64;
 
         let cookie_name = format!("CHIPIN_SESSION_ID_{}", self.auth_scope_name.to_uppercase());
-        if let Some(cookie_header) = session.req_header().headers.get("Cookie") {
-            if let Ok(cookies) = cookie_header.to_str() {
-                for cookie in cookies.split(';') {
-                    if let Some((name, value)) = cookie.trim().split_once('=') {
-                        if name == cookie_name {
-                            let session_id = value.to_string();
-                            info!(
-                                "[{}] [{}] Found {}: {}",
+        if let Some(cookie_header) = session.req_header().headers.get("Cookie")
+            && let Ok(cookies) = cookie_header.to_str()
+        {
+            for cookie in cookies.split(';') {
+                if let Some((name, value)) = cookie.trim().split_once('=')
+                    && name == cookie_name
+                {
+                    let session_id = value.to_string();
+                    info!(
+                        "[{}] [{}] Found {}: {}",
+                        ctx.request_id,
+                        self.name(),
+                        cookie_name,
+                        session_id
+                    );
+
+                    // Retrieve session to check/extend; clone to release lock immediately.
+                    let session_from_store =
+                        session_store.get(&session_id).map(|r| r.value().clone());
+
+                    if let Some(app_session) = session_from_store {
+                        let current_expiry = app_session.expires_at.load(Ordering::Relaxed);
+                        // Check if session is expired
+                        if current_expiry < now {
+                            warn!(
+                                "[{}] [{}] Session {} for user {} has expired. Removing.",
                                 ctx.request_id,
                                 self.name(),
-                                cookie_name,
-                                session_id
+                                app_session.session_id,
+                                app_session.user_id
+                            );
+                            session_store.remove(&session_id); // Safe to write now
+                            session_found = false;
+                        } else {
+                            info!(
+                                "[{}] [{}] Found active session for user: {}",
+                                ctx.request_id,
+                                self.name(),
+                                app_session.user_id
                             );
 
-                            // Retrieve session to check/extend; clone to release lock immediately.
-                            let session_from_store = session_store.get(&session_id).map(|r| r.value().clone());
+                            // Only refresh if within the refresh window of expiry to reduce Set-Cookie noise
+                            if current_expiry.saturating_sub(now) <= SESSION_REFRESH_WINDOW_SECONDS
+                            {
+                                // Extend session lifetime
+                                app_session
+                                    .expires_at
+                                    .store(now + ctx.session_timeout, Ordering::Relaxed);
 
-                            if let Some(app_session) = session_from_store {
-                                let current_expiry = app_session.expires_at.load(Ordering::Relaxed);
-                                // Check if session is expired
-                                if current_expiry < now {
-                                    warn!(
-                                        "[{}] [{}] Session {} for user {} has expired. Removing.",
-                                        ctx.request_id,
-                                        self.name(),
-                                        app_session.session_id,
-                                        app_session.user_id
-                                    );
-                                    session_store.remove(&session_id); // Safe to write now
-                                    session_found = false;
-                                } else {
-                                    info!(
-                                        "[{}] [{}] Found active session for user: {}",
-                                        ctx.request_id,
-                                        self.name(),
-                                        app_session.user_id
-                                    );
+                                // Extend cookie lifetime by signaling response_filter to issue Set-Cookie
+                                ctx.action_state_new_app_session_cookie =
+                                    Some((session_id.clone(), self.auth_scope_name.to_string()));
 
-                                    // Only refresh if within the refresh window of expiry to reduce Set-Cookie noise
-                                    if current_expiry.saturating_sub(now) <= SESSION_REFRESH_WINDOW_SECONDS {
-                                        // Extend session lifetime
-                                        app_session.expires_at.store(now + ctx.session_timeout, Ordering::Relaxed);
-
-                                        // Extend cookie lifetime by signaling response_filter to issue Set-Cookie
-                                        ctx.action_state_new_app_session_cookie =
-                                            Some((session_id.clone(), self.auth_scope_name.to_string()));
-
-                                        info!(
-                                            "[{}] [{}] Session expiring soon. Extended lifetime and refreshing cookie.",
-                                            ctx.request_id,
-                                            self.name()
-                                        );
-                                    }
-
-                                    app_session_opt = Some(app_session.as_ref().clone());
-                                    session_found = true;
-                                }
-                            } else {
-                                warn!(
-                                    "[{}] [{}] {} cookie found, but no active session in store.",
+                                info!(
+                                    "[{}] [{}] Session expiring soon. Extended lifetime and refreshing cookie.",
                                     ctx.request_id,
-                                    self.name(),
-                                    cookie_name
+                                    self.name()
                                 );
                             }
-                            break;
+
+                            app_session_opt = Some(app_session.as_ref().clone());
+                            session_found = true;
                         }
+                    } else {
+                        warn!(
+                            "[{}] [{}] {} cookie found, but no active session in store.",
+                            ctx.request_id,
+                            self.name(),
+                            cookie_name
+                        );
                     }
+                    break;
                 }
             }
         }
@@ -1218,7 +1295,9 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 access_token: None,
                 refresh_token: None,
                 access_token_expires_at: None,
-                expires_at: Arc::new(AtomicU64::new(now + crate::UNAUTHENTICATED_SESSION_TIMEOUT_SECONDS)), // Short expiry for unauthenticated sessions
+                expires_at: Arc::new(AtomicU64::new(
+                    now + crate::UNAUTHENTICATED_SESSION_TIMEOUT_SECONDS,
+                )), // Short expiry for unauthenticated sessions
                 oidc_nonce: None,
                 oidc_pkce_verifier: None,
                 oidc_state: None,
@@ -1250,7 +1329,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
         let is_authenticated = ctx
             .action_state_app_session
             .as_ref()
-            .map_or(false, |s| s.is_authenticated);
+            .is_some_and(|s| s.is_authenticated);
 
         if !is_authenticated {
             // The user is not authenticated. This block handles two potential scenarios:
@@ -1270,9 +1349,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                         "code" => oidc_code = Some(value.into_owned()),
                         "state" => oidc_state = Some(value.into_owned()),
                         "error" => oidc_error = Some(value.into_owned()),
-                        "error_description" => {
-                            oidc_error_description = Some(value.into_owned())
-                        }
+                        "error_description" => oidc_error_description = Some(value.into_owned()),
                         _ => {}
                     }
                 }
@@ -1302,7 +1379,9 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 header.insert_header("Strict-Transport-Security", HSTS_HEADER_VALUE)?;
                 header.insert_header("Connection", "close")?;
 
-                session.write_response_header(Box::new(header), false).await?;
+                session
+                    .write_response_header(Box::new(header), false)
+                    .await?;
                 session.write_response_body(Some(body_bytes), true).await?;
                 return Ok(true); // Stop the pipeline.
             }
@@ -1323,7 +1402,10 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 } else {
                     warn!(
                         "[{}] [{}] OIDC callback parameters detected on an unexpected path. Expected: '{}', Actual: '{}'. Ignoring callback.",
-                        ctx.request_id, self.name(), configured_redirect_path, request_path
+                        ctx.request_id,
+                        self.name(),
+                        configured_redirect_path,
+                        request_path
                     );
                     false
                 }
@@ -1380,16 +1462,18 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 // We send it to the token endpoint, where the OIDC provider validates it
                 // against the `code_challenge` from the initial request. This prevents
                 // authorization code interception attacks.
-                let pkce_verifier =
-                    ctx.action_state_app_session.as_ref()
-                        .and_then(|s| s.oidc_pkce_verifier.clone())
-                        .ok_or_else(|| {
-                            warn!(
-                                "[{}] [{}] No PKCE verifier found in session for token exchange.",
-                                ctx.request_id, self.name()
-                            );
-                            Error::new(ErrorType::HTTPStatus(400)) // Bad Request
-                        })?;
+                let pkce_verifier = ctx
+                    .action_state_app_session
+                    .as_ref()
+                    .and_then(|s| s.oidc_pkce_verifier.clone())
+                    .ok_or_else(|| {
+                        warn!(
+                            "[{}] [{}] No PKCE verifier found in session for token exchange.",
+                            ctx.request_id,
+                            self.name()
+                        );
+                        Error::new(ErrorType::HTTPStatus(400)) // Bad Request
+                    })?;
 
                 // 2-3. Exchange the authorization code for an access token and ID token.
                 // Define a struct to deserialize the token endpoint's response.
@@ -1530,22 +1614,44 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
 
                 if let Some(t_kid) = &target_kid {
                     // A Key ID is specified. Find the specific key and use only that one.
-                    info!("[{}] [{}] ID token has kid: '{}'. Searching for matching key.", ctx.request_id, self.name(), t_kid);
-                    if let Some(jwk_value) = jwks.keys.iter().find(|k| k.get("kid").and_then(|v| v.as_str()) == Some(t_kid.as_str())) {
-                        let jwk: jsonwebtoken::jwk::Jwk = match serde_json::from_value(jwk_value.clone()) {
-                            Ok(j) => j,
-                            Err(_) => {
-                                warn!("[{}] [{}] Failed to parse matching JWK for kid: {}", ctx.request_id, self.name(), t_kid);
-                                let _ = session.respond_error(401).await;
-                                return Ok(true);
-                            }
-                        };
+                    info!(
+                        "[{}] [{}] ID token has kid: '{}'. Searching for matching key.",
+                        ctx.request_id,
+                        self.name(),
+                        t_kid
+                    );
+                    if let Some(jwk_value) = jwks
+                        .keys
+                        .iter()
+                        .find(|k| k.get("kid").and_then(|v| v.as_str()) == Some(t_kid.as_str()))
+                    {
+                        let jwk: jsonwebtoken::jwk::Jwk =
+                            match serde_json::from_value(jwk_value.clone()) {
+                                Ok(j) => j,
+                                Err(_) => {
+                                    warn!(
+                                        "[{}] [{}] Failed to parse matching JWK for kid: {}",
+                                        ctx.request_id,
+                                        self.name(),
+                                        t_kid
+                                    );
+                                    let _ = session.respond_error(401).await;
+                                    return Ok(true);
+                                }
+                            };
                         if let Ok(decoding_key) = DecodingKey::from_jwk(&jwk) {
-                            match decode::<serde_json::Value>(id_token, &decoding_key, &validation) {
+                            match decode::<serde_json::Value>(id_token, &decoding_key, &validation)
+                            {
                                 Ok(token_data) => decoded_token = Some(token_data),
                                 Err(e) => {
                                     // If the specified key fails for any reason, the token is invalid. No fallback.
-                                    warn!("[{}] [{}] ID token validation failed for specified kid '{}': {}", ctx.request_id, self.name(), t_kid, e);
+                                    warn!(
+                                        "[{}] [{}] ID token validation failed for specified kid '{}': {}",
+                                        ctx.request_id,
+                                        self.name(),
+                                        t_kid,
+                                        e
+                                    );
                                     let _ = session.respond_error(401).await;
                                     return Ok(true);
                                 }
@@ -1561,28 +1667,40 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                         let _ = session.respond_error(401).await;
                         return Ok(true);
                     }
-
                 } else {
                     // No Key ID in header. Try all available keys.
-                    info!("[{}] [{}] ID token has no kid. Trying all available keys.", ctx.request_id, self.name());
+                    info!(
+                        "[{}] [{}] ID token has no kid. Trying all available keys.",
+                        ctx.request_id,
+                        self.name()
+                    );
                     for jwk_value in &jwks.keys {
-                        let jwk: jsonwebtoken::jwk::Jwk = match serde_json::from_value(jwk_value.clone()) {
-                            Ok(jwk) => jwk,
-                            Err(_) => continue, // Skip malformed JWK entries.
-                        };
+                        let jwk: jsonwebtoken::jwk::Jwk =
+                            match serde_json::from_value(jwk_value.clone()) {
+                                Ok(jwk) => jwk,
+                                Err(_) => continue, // Skip malformed JWK entries.
+                            };
 
                         if let Ok(decoding_key) = DecodingKey::from_jwk(&jwk) {
-                            match decode::<serde_json::Value>(id_token, &decoding_key, &validation) {
+                            match decode::<serde_json::Value>(id_token, &decoding_key, &validation)
+                            {
                                 Ok(token_data) => {
                                     decoded_token = Some(token_data);
                                     break;
                                 }
                                 Err(e) => {
                                     // Only continue if it's a signature/alg error. Other errors are fatal.
-                                    if e.kind() != &jsonwebtoken::errors::ErrorKind::InvalidSignature
-                                        && e.kind() != &jsonwebtoken::errors::ErrorKind::InvalidAlgorithm
+                                    if e.kind()
+                                        != &jsonwebtoken::errors::ErrorKind::InvalidSignature
+                                        && e.kind()
+                                            != &jsonwebtoken::errors::ErrorKind::InvalidAlgorithm
                                     {
-                                        warn!("[{}] [{}] ID token validation failed with non-signature error: {}", ctx.request_id, self.name(), e);
+                                        warn!(
+                                            "[{}] [{}] ID token validation failed with non-signature error: {}",
+                                            ctx.request_id,
+                                            self.name(),
+                                            e
+                                        );
                                         let _ = session.respond_error(401).await; // Unauthorized
                                         return Ok(true);
                                     }
@@ -1631,7 +1749,11 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                         return Ok(true);
                     }
                 }
-                info!("[{}] [{}] Nonce validation successful.", ctx.request_id, self.name());
+                info!(
+                    "[{}] [{}] Nonce validation successful.",
+                    ctx.request_id,
+                    self.name()
+                );
 
                 info!(
                     "[{}] [{}] ID Token successfully validated. Claims: {:?}",
@@ -1654,24 +1776,42 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                             // not this client (the BFF). So we skip the audience check here.
                             at_validation.validate_aud = false;
 
-                            let validation_result = if let Some(jwk_value) = jwks.keys.iter().find(|k| k.get("kid").and_then(|v| v.as_str()) == Some(&kid)) {
-                                let jwk: jsonwebtoken::jwk::Jwk = match serde_json::from_value(jwk_value.clone()) {
+                            let validation_result = if let Some(jwk_value) = jwks
+                                .keys
+                                .iter()
+                                .find(|k| k.get("kid").and_then(|v| v.as_str()) == Some(&kid))
+                            {
+                                let jwk: jsonwebtoken::jwk::Jwk = match serde_json::from_value(
+                                    jwk_value.clone(),
+                                ) {
                                     Ok(j) => j,
                                     Err(e) => {
-                                        warn!("[{}] [{}] Failed to parse matching JWK for access token kid '{}': {}. Rejecting.", ctx.request_id, self.name(), kid, e);
+                                        warn!(
+                                            "[{}] [{}] Failed to parse matching JWK for access token kid '{}': {}. Rejecting.",
+                                            ctx.request_id,
+                                            self.name(),
+                                            kid,
+                                            e
+                                        );
                                         let _ = session.respond_error(401).await;
                                         return Ok(true);
                                     }
                                 };
-                                DecodingKey::from_jwk(&jwk)
-                                    .and_then(|key| decode::<serde_json::Value>(access_token, &key, &at_validation))
+                                DecodingKey::from_jwk(&jwk).and_then(|key| {
+                                    decode::<serde_json::Value>(access_token, &key, &at_validation)
+                                })
                             } else {
                                 // No matching key found in JWKS
                                 Err(jsonwebtoken::errors::ErrorKind::InvalidKeyFormat.into())
                             };
 
                             if let Err(e) = validation_result {
-                                warn!("[{}] [{}] Access Token validation failed. Rejecting authentication. Reason: {}", ctx.request_id, self.name(), e);
+                                warn!(
+                                    "[{}] [{}] Access Token validation failed. Rejecting authentication. Reason: {}",
+                                    ctx.request_id,
+                                    self.name(),
+                                    e
+                                );
                                 let _ = session.respond_error(401).await;
                                 return Ok(true);
                             }
@@ -1681,7 +1821,6 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                                 ctx.request_id,
                                 self.name()
                             );
-
                         } else {
                             warn!(
                                 "[{}] [{}] Access Token is a JWT but missing 'kid'. Rejecting.",
@@ -1692,7 +1831,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                             return Ok(true);
                         }
                     } else {
-                         info!(
+                        info!(
                             "[{}] [{}] Access Token is not a valid JWT (could not decode header). Assuming opaque token and skipping validation.",
                             ctx.request_id,
                             self.name()
@@ -1705,7 +1844,12 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 // to prevent session fixation attacks.
 
                 // 2-5-1. Get the old session ID before we modify the session object.
-                let old_session_id = ctx.action_state_app_session.as_ref().unwrap().session_id.clone();
+                let old_session_id = ctx
+                    .action_state_app_session
+                    .as_ref()
+                    .unwrap()
+                    .session_id
+                    .clone();
 
                 // 2-5-2. Generate a new, cryptographically secure session ID.
                 let mut bytes = [0u8; 32];
@@ -1723,7 +1867,10 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 let app_session = ctx.action_state_app_session.as_mut().unwrap(); // We know it exists and is mutable
                 app_session.is_authenticated = true;
                 // Now that the user is authenticated, extend the session lifetime to the full duration.
-                app_session.expires_at.store(Utc::now().timestamp() as u64 + ctx.session_timeout, Ordering::Relaxed);
+                app_session.expires_at.store(
+                    Utc::now().timestamp() as u64 + ctx.session_timeout,
+                    Ordering::Relaxed,
+                );
 
                 app_session.access_token = Some(tokens.access_token);
                 app_session.access_token_expires_at =
@@ -1763,14 +1910,12 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 session_store.remove(&old_session_id);
 
                 // 2-5-6. Insert the newly authenticated session into the store under the new ID.
-                session_store.insert(
-                    new_session_id.clone(),
-                    Arc::new(app_session.clone()),
-                );
+                session_store.insert(new_session_id.clone(), Arc::new(app_session.clone()));
 
                 // 2-5-7. Prepare to issue the new session cookie to the client.
                 // This will overwrite the old session cookie.
-                ctx.action_state_new_app_session_cookie = Some((new_session_id, self.auth_scope_name.to_string()));
+                ctx.action_state_new_app_session_cookie =
+                    Some((new_session_id, self.auth_scope_name.to_string()));
 
                 // 2-6. Redirect the user back to their original destination.
                 // Retrieve the original destination from the session, or default to the root.
@@ -1862,7 +2007,10 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
 
             // 1-5. Save the original request path and query to the session to redirect back later.
             // We strictly avoid storing the full URL to prevent open redirect vulnerabilities.
-            let original_path = session.req_header().uri.path_and_query()
+            let original_path = session
+                .req_header()
+                .uri
+                .path_and_query()
                 .map(|p| p.as_str())
                 .unwrap_or("/");
             app_session.auth_original_destination = Some(original_path.to_string());
@@ -1878,8 +2026,8 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 let mut url_pairs = auth_url.query_pairs_mut();
                 url_pairs
                     .append_pair("response_type", "code")
-                    .append_pair("client_id", &self.oidc_client_id)
-                    .append_pair("redirect_uri", &self.oidc_redirect_url);
+                    .append_pair("client_id", self.oidc_client_id)
+                    .append_pair("redirect_uri", self.oidc_redirect_url);
 
                 if self.oidc_dialect == Some("google") {
                     // Google dialect: Requires 'access_type=offline' and 'prompt=consent' to obtain a refresh token.
@@ -1999,9 +2147,14 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
         }
 
         // Ensure the token is valid and refresh if necessary before connecting to upstream.
-        let is_token_valid = ensure_valid_token_and_refresh(ctx, self.name(), Some(self.auth_scope_name)).await;
+        let is_token_valid =
+            ensure_valid_token_and_refresh(ctx, self.name(), Some(self.auth_scope_name)).await;
         if !is_token_valid {
-            warn!("[{}] [{}] Token is invalid and refresh failed. Blocking upstream request.", ctx.request_id, self.name());
+            warn!(
+                "[{}] [{}] Token is invalid and refresh failed. Blocking upstream request.",
+                ctx.request_id,
+                self.name()
+            );
             let _ = session.respond_error(401).await;
             return Ok(true);
         }
@@ -2016,15 +2169,22 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
         ctx: &mut GatewayCtx,
     ) -> Result<()> {
         // Inject headers from the session. Network communication was already handled in request_filter phase.
-        if let Some(app_session) = &ctx.action_state_app_session {
-            if app_session.is_authenticated {
-                if let Some(access_token) = &app_session.access_token {
-                    let auth_header_value = format!("Bearer {}", access_token);
-                    upstream_request.insert_header("Authorization", auth_header_value).unwrap();
-                    upstream_request.insert_header(BFF_USER_SUB_HEADER, &app_session.user_id).unwrap();
-                    info!("[{}] [{}] Injected Authorization header.", ctx.request_id, self.name());
-                }
-            }
+        if let Some(app_session) = &ctx.action_state_app_session
+            && app_session.is_authenticated
+            && let Some(access_token) = &app_session.access_token
+        {
+            let auth_header_value = format!("Bearer {}", access_token);
+            upstream_request
+                .insert_header("Authorization", auth_header_value)
+                .unwrap();
+            upstream_request
+                .insert_header(BFF_USER_SUB_HEADER, &app_session.user_id)
+                .unwrap();
+            info!(
+                "[{}] [{}] Injected Authorization header.",
+                ctx.request_id,
+                self.name()
+            );
         }
 
         Ok(())
