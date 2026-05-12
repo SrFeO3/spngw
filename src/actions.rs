@@ -255,7 +255,7 @@ async fn fetch_oidc_keys(
     oidc_dialect: Option<&str>,
     request_id: &str,
     action_name: &str,
-) -> Result<(OidcDiscovery, Jwks), Error> {
+) -> Result<(OidcDiscovery, Jwks)> {
     // Check cache first
     let cache_key = format!("{}|{:?}", oidc_token_endpoint, oidc_dialect);
     let cache = OIDC_METADATA_CACHE.get_or_init(DashMap::new);
@@ -281,7 +281,7 @@ async fn fetch_oidc_keys(
                 "[{}] [{}] Failed to parse Google OIDC discovery URL: {}",
                 request_id, action_name, e
             );
-            *Error::explain(ErrorType::InternalError, "Failed to parse Google OIDC discovery URL")
+            Error::explain(ErrorType::InternalError, "Failed to parse Google OIDC discovery URL")
         })?
     } else {
         let token_endpoint_url = Url::parse(oidc_token_endpoint).map_err(|e| {
@@ -289,7 +289,7 @@ async fn fetch_oidc_keys(
                 "[{}] [{}] Invalid OIDC token endpoint URL: {}",
                 request_id, action_name, e
             );
-            *Error::explain(ErrorType::InternalError, "Invalid OIDC token endpoint URL")
+            Error::explain(ErrorType::InternalError, "Invalid OIDC token endpoint URL")
         })?;
 
         token_endpoint_url
@@ -299,7 +299,7 @@ async fn fetch_oidc_keys(
                     "[{}] [{}] Failed to construct OIDC discovery URL: {}",
                     request_id, action_name, e
                 );
-                *Error::explain(ErrorType::InternalError, "Failed to construct OIDC discovery URL")
+                Error::explain(ErrorType::InternalError, "Failed to construct OIDC discovery URL")
             })?
     };
 
@@ -313,7 +313,7 @@ async fn fetch_oidc_keys(
             "[{}] [{}] Failed to fetch OIDC discovery from {}: {}",
             request_id, action_name, discovery_url, e
         );
-        *Error::explain(ErrorType::InternalError, "Failed to fetch OIDC discovery")
+        Error::explain(ErrorType::InternalError, "Failed to fetch OIDC discovery")
     })?;
 
     let oidc_config: OidcDiscovery = discovery_resp.json().await.map_err(|e| {
@@ -321,7 +321,7 @@ async fn fetch_oidc_keys(
             "[{}] [{}] Failed to parse OIDC discovery response: {}",
             request_id, action_name, e
         );
-        *Error::explain(ErrorType::InternalError, "Failed to parse OIDC discovery response")
+        Error::explain(ErrorType::InternalError, "Failed to parse OIDC discovery response")
     })?;
 
     // Fetch JWKS using the URI from discovery
@@ -330,12 +330,12 @@ async fn fetch_oidc_keys(
             "[{}] [{}] Failed to fetch JWKS from {}: {}",
             request_id, action_name, oidc_config.jwks_uri, e
         );
-        *Error::explain(ErrorType::InternalError, "Failed to fetch JWKS")
+        Error::explain(ErrorType::InternalError, "Failed to fetch JWKS")
     })?;
 
     let jwks: Jwks = jwks_response.json().await.map_err(|e| {
         warn!("[{}] [{}] Failed to parse JWKS: {}", request_id, action_name, e);
-        *Error::explain(ErrorType::InternalError, "Failed to parse JWKS")
+        Error::explain(ErrorType::InternalError, "Failed to parse JWKS")
     })?;
 
     // Update cache
@@ -960,8 +960,7 @@ impl RouteLogic for IssueDeviceCookieRoute {
                         self.name(),
                         ctx.realm_name
                     );
-                    let err = Error::new(ErrorType::InternalError);
-                    return Err(err);
+                    return Err(Error::explain(ErrorType::InternalError, "No JWT keys found in cache"));
                 }
             };
 
@@ -987,14 +986,10 @@ impl RouteLogic for IssueDeviceCookieRoute {
                     ctx.action_state_new_dev_cookie = Some(token);
                 }
                 Ok(Err(e)) => {
-                    let mut err = Error::new(ErrorType::InternalError);
-                    err.context = Some(format!("Failed to create JWT: {}", e).into());
-                    return Err(err);
+                    return Err(Error::explain(ErrorType::InternalError, format!("Failed to create JWT: {}", e)));
                 }
                 Err(e) => {
-                    let mut err = Error::new(ErrorType::InternalError);
-                    err.context = Some(format!("Blocking task failed during signing: {}", e).into());
-                    return Err(err);
+                    return Err(Error::explain(ErrorType::InternalError, format!("Blocking task failed during signing: {}", e)));
                 }
             }
         }

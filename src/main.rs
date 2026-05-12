@@ -490,7 +490,10 @@ impl ProxyHttp for GatewayRouter {
                     "[{}] Upstream peer not found in cache for address: {}",
                     ctx.request_id, upstream_addr
                 );
-                Error::new(pingora::ErrorType::HTTPStatus(502))
+                Error::explain(
+                    pingora::ErrorType::HTTPStatus(502),
+                    format!("Upstream peer not found in cache: {}", upstream_addr)
+                )
             })
     }
 
@@ -955,9 +958,10 @@ fn main() -> pingora::Result<()> {
     let sni_ex_data_index = match Ssl::new_ex_index::<Option<String>>() {
         Ok(index) => index,
         Err(e) => {
-            let mut err = pingora::Error::new(pingora::ErrorType::InternalError);
-            err.set_cause(e);
-            return Err(err);
+            return Err(pingora::Error::explain(
+                pingora::ErrorType::InternalError,
+                format!("Failed to create SSL ex_data index: {}", e)
+            ));
         }
     };
 
