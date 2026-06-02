@@ -27,8 +27,8 @@
 ///   the redirect-based login flow. (Note: Callback handling is not yet implemented).
 use std::sync::{
     Arc, OnceLock,
-    atomic::{AtomicU64, Ordering},
 };
+use fred::prelude::*;
 
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose};
@@ -55,11 +55,68 @@ const DEVICE_COOKIE_MAX_AGE: u64 = 60 * 60 * 24 * 365; // 1 year
 const SESSION_REFRESH_WINDOW_SECONDS: u64 = 300; // 5 minutes
 const OIDC_METADATA_CACHE_TTL_SECONDS: u64 = 3600; // 1 hour
 
-/// A type alias for a session store, which is a thread-safe map from session IDs to ApplicationSession objects.
-pub type SessionStore = Arc<DashMap<String, Arc<ApplicationSession>>>;
+/// Global Redis connection pool
+static REDIS_POOL: OnceLock<fred::clients::Pool> = OnceLock::new();
 
-/// A global, thread-safe registry for authentication session stores, keyed by scope name.
-static AUTH_SESSION_STORES: OnceLock<DashMap<String, SessionStore>> = OnceLock::new();
+/// Initialize the global Redis pool
+pub async fn init_redis_pool(redis_url: &str) -> Result<()> {
+    let config = Config::from_url(redis_url).map_err(|e| {
+        Error::explain(ErrorType::InternalError, format!("Invalid Redis URL: {}", e))
+    })?;
+    // Design from redis.md: pool size 1, connect timeout 100ms, command timeout 50ms
+    let pool = Builder::from_config(config)
+        .build_pool(1)
+        .map_err(|e| Error::explain(ErrorType::InternalError, format!("Failed to build Redis pool: {}", e)))?;
+
+    pool.init().await.map_err(|e| {
+        Error::explain(ErrorType::InternalError, format!("Redis initialization failed: {}", e))
+    })?;
+    
+    REDIS_POOL.set(pool).map_err(|_| {
+        Error::explain(ErrorType::InternalError, "Redis pool already initialized")
+    })?;
+    Ok(())
+}
+
+#[derive(Clone)]
+pub struct SessionStore {
+    prefix: String,
+}
+
+impl SessionStore {
+    fn key(&self, session_id: &str) -> String {
+        format!("{}:{}", self.prefix, session_id)
+    }
+
+    pub async fn get(&self, session_id: &str) -> Result<Option<ApplicationSession>> {
+        let pool = REDIS_POOL.get().expect("Redis pool not initialized");
+        let val: Option<String> = pool.get(self.key(session_id)).await.map_err(|e| {
+            Error::explain(ErrorType::InternalError, format!("Redis GET failed: {}", e))
+        })?;
+        
+        Ok(val.as_deref().and_then(|s| serde_json::from_str::<ApplicationSession>(s).ok()))
+    }
+
+    pub async fn insert(&self, session_id: &str, session: &ApplicationSession, ttl: u64) -> Result<()> {
+        let pool = REDIS_POOL.get().expect("Redis pool not initialized");
+        let json = serde_json::to_string(session).map_err(|e| {
+            Error::explain(ErrorType::InternalError, format!("Session serialization failed: {}", e))
+        })?;
+        
+        pool.set::<(), _, _>(self.key(session_id), json, Some(Expiration::EX(ttl as i64)), None, false).await.map_err(|e| {
+            Error::explain(ErrorType::InternalError, format!("Redis SET failed: {}", e))
+        })?;
+        Ok(())
+    }
+
+    pub async fn remove(&self, session_id: &str) -> Result<()> {
+        let pool = REDIS_POOL.get().expect("Redis pool not initialized");
+        pool.del::<(), _>(self.key(session_id)).await.map_err(|e| {
+            Error::explain(ErrorType::InternalError, format!("Redis DEL failed: {}", e))
+        })?;
+        Ok(())
+    }
+}
 
 /// Generates a unique key for the session store from a realm and scope name.
 fn create_realm_scope_key(realm_name: &str, scope_name: &str) -> String {
@@ -67,32 +124,20 @@ fn create_realm_scope_key(realm_name: &str, scope_name: &str) -> String {
 }
 
 /// Registers a new authentication scope and initializes its session store.
-/// This function should be called at application startup for each required scope.
-/// It's idempotent; if a scope is already registered, it does nothing.
 pub fn register_auth_scope(realm_name: &str, scope_name: &str) {
-    let key = create_realm_scope_key(realm_name, scope_name);
-    AUTH_SESSION_STORES
-        .get_or_init(DashMap::new)
-        .entry(key)
-        .or_insert_with(|| Arc::new(DashMap::new()));
+    // Redis based store doesn't need explicit registration of DashMaps.
+    info!("Registered auth scope: {}_{}", realm_name, scope_name);
 }
 
 /// Retrieves the specific session store for a given realm and scope.
-pub fn get_auth_session_store(realm_name: &str, scope_name: &str) -> Option<SessionStore> {
-    let key = create_realm_scope_key(realm_name, scope_name);
-    AUTH_SESSION_STORES
-        .get_or_init(DashMap::new)
-        .get(&key)
-        .map(|store| store.value().clone())
-}
-
-/// Returns a reference to the entire map of session stores for internal cleanup operations.
-pub(crate) fn get_all_auth_session_stores() -> &'static DashMap<String, SessionStore> {
-    AUTH_SESSION_STORES.get_or_init(DashMap::new)
+pub fn get_auth_session_store(realm_name: &str, scope_name: &str) -> SessionStore {
+    SessionStore {
+        prefix: create_realm_scope_key(realm_name, scope_name),
+    }
 }
 
 /// ApplicationSession object, as it's a core data model for the gateway.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApplicationSession {
     pub session_id: String,
     pub user_id: String,
@@ -101,7 +146,7 @@ pub struct ApplicationSession {
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
     pub access_token_expires_at: Option<u64>, // Unix timestamp
-    pub expires_at: Arc<AtomicU64>,           // Unix timestamp for the session itself
+    pub expires_at: u64,                     // Unix timestamp for the session itself
     pub oidc_nonce: Option<String>,
     pub oidc_pkce_verifier: Option<String>,
     pub oidc_state: Option<String>,
@@ -110,8 +155,6 @@ pub struct ApplicationSession {
     pub oidc_client_secret: String,
     pub auth_scope_name: Option<String>,
     pub auth_original_destination: Option<String>,
-    // Timestamp of the last token refresh attempt to mitigate dog-piling.
-    pub last_refresh_attempt_at: Arc<AtomicU64>,
 }
 
 /// Device context for JWT cookie
@@ -435,46 +478,27 @@ async fn ensure_valid_token_and_refresh(
                 // Mitigate token refresh dog-piling: use a timestamp-based cooldown.
                 // This allows only one refresh attempt per short interval (e.g., 10s)
                 // to prevent a stampede of requests, without using a heavy lock.
-                const REFRESH_COOLDOWN_SECONDS: u64 = 10;
                 if now >= expires_at.saturating_sub(60) {
                     let mut should_refresh = false;
 
-                    // Atomically check and update the cooldown timestamp in the shared store to prevent dog-piling.
-                    // This lock is extremely short-lived (microseconds) and does not cover the network request.
                     let scope_to_use = app_session
                         .auth_scope_name
                         .as_deref()
                         .or(fallback_auth_scope_name);
-                    if let Some(scope) = scope_to_use
-                        && let Some(store) = get_auth_session_store(&ctx.realm_name, scope)
-                    {
-                        let session_arc = if let Some(entry) = store.get(&app_session.session_id) {
-                            let last_attempt_atomic = &entry.value().last_refresh_attempt_at;
-                            let last_attempt = last_attempt_atomic.load(Ordering::Relaxed);
-                            if now > last_attempt.saturating_add(REFRESH_COOLDOWN_SECONDS) {
-                                // This request attempts to win the race.
-                                // Use compare_exchange to ensure only one thread enters the refresh block.
-                                if last_attempt_atomic
-                                    .compare_exchange(
-                                        last_attempt,
-                                        now,
-                                        Ordering::Relaxed,
-                                        Ordering::Relaxed,
-                                    )
-                                    .is_ok()
-                                {
-                                    should_refresh = true;
-                                }
-                            }
-                            Some(entry.value().clone())
-                        } else {
-                            None
-                        };
 
-                        if let Some(arc) = session_arc {
-                            // In either case (win or lose), sync our local session with the latest from the store.
-                            // This ensures we have the latest timestamp and potentially a new token if we lost the race.
-                            *app_session = arc.as_ref().clone();
+                    if let Some(scope) = scope_to_use
+                    {
+                        let store = get_auth_session_store(&ctx.realm_name, scope);
+                        // Distributed refresh lock using Redis SET NX
+                        let lock_key = format!("lock:refresh:{}", app_session.session_id);
+                        let pool = REDIS_POOL.get().expect("Redis pool not initialized");
+                        if let Ok(true) = pool.set::<bool, _, _>(lock_key, "1", Some(Expiration::EX(10)), Some(SetOptions::NX), false).await {
+                            should_refresh = true;
+                        }
+
+                        // Sync with latest session state from Redis in case another instance refreshed it
+                        if let Ok(Some(latest_session)) = store.get(&app_session.session_id).await {
+                            *app_session = latest_session;
                         }
                     }
 
@@ -616,23 +640,19 @@ async fn ensure_valid_token_and_refresh(
                 .or(fallback_auth_scope_name);
 
             if let Some(scope) = scope_to_use {
-                if let Some(store) = get_auth_session_store(&ctx.realm_name, scope) {
-                    if is_token_valid {
-                        store.insert(
-                            app_session.session_id.clone(),
-                            Arc::new(app_session.clone()),
-                        );
-                        info!(
-                            "[{}] [{}] Updated session in store after refresh.",
-                            ctx.request_id, action_name
-                        );
-                    } else {
-                        store.remove(&app_session.session_id);
-                        info!(
-                            "[{}] [{}] Removed session from store due to invalid refresh token.",
-                            ctx.request_id, action_name
-                        );
-                    }
+                let store = get_auth_session_store(&ctx.realm_name, scope);
+                if is_token_valid {
+                    let _ = store.insert(&app_session.session_id, app_session, ctx.session_timeout).await;
+                    info!(
+                        "[{}] [{}] Updated session in store after refresh.",
+                        ctx.request_id, action_name
+                    );
+                } else {
+                    let _ = store.remove(&app_session.session_id).await;
+                    info!(
+                        "[{}] [{}] Removed session from store due to invalid refresh token.",
+                        ctx.request_id, action_name
+                    );
                 }
             } else {
                 warn!(
@@ -768,32 +788,26 @@ impl<'a> RouteLogic for ProxyToRoute<'a> {
                 self.name(),
                 scope_name
             );
-            // Get the session store for the specified scope.
-            if let Some(session_store) = get_auth_session_store(&ctx.realm_name, scope_name) {
-                let cookie_name = format!("CHIPIN_SESSION_ID_{}", scope_name.to_uppercase());
-                // Extract the session ID from the cookie header.
-                let app_session_opt = session
-                    .req_header()
-                    .headers
-                    .get("Cookie")
-                    .and_then(|cookie_header| cookie_header.to_str().ok())
-                    .and_then(|cookies_str| {
-                        cookies_str.split(';').find_map(|cookie| {
-                            cookie.trim().strip_prefix(&format!("{}=", cookie_name))
-                        })
+            
+            let session_store = get_auth_session_store(&ctx.realm_name, scope_name);
+            let cookie_name = format!("CHIPIN_SESSION_ID_{}", scope_name.to_uppercase());
+            
+            let session_id_opt = session
+                .req_header()
+                .headers
+                .get("Cookie")
+                .and_then(|cookie_header| cookie_header.to_str().ok())
+                .and_then(|cookies_str| {
+                    cookies_str.split(';').find_map(|cookie| {
+                        cookie.trim().strip_prefix(&format!("{}=", cookie_name))
                     })
-                    .and_then(|session_id| {
-                        // Retrieve the session from the session store.
-                        session_store
-                            .get(session_id)
-                            .map(|app_session_ref| app_session_ref.value().as_ref().clone())
-                    });
+                });
 
-                // Store the retrieved session in the context.
-                ctx.action_state_app_session = app_session_opt;
+            if let Some(sid) = session_id_opt {
+                ctx.action_state_app_session = session_store.get(sid).await.unwrap_or(None);
             }
         }
-
+        
         // Ensure the token is valid and refresh if necessary before connecting to upstream.
         let is_token_valid =
             ensure_valid_token_and_refresh(ctx, self.name(), self.auth_scope_name).await;
@@ -1192,8 +1206,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
         );
 
         // Retrieve the specific session store for this realm and scope using the helper function.
-        let session_store = get_auth_session_store(&ctx.realm_name, self.auth_scope_name)
-            .unwrap_or_else(|| panic!("Authentication scope '{}' for realm '{}' not registered. Please call register_auth_scope at startup.", self.auth_scope_name, ctx.realm_name));
+        let session_store = get_auth_session_store(&ctx.realm_name, self.auth_scope_name);
 
         ctx.override_upstream_addr = Some(self.protected_upstream.into());
         let mut session_found = false;
@@ -1217,12 +1230,10 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                         session_id
                     );
 
-                    // Retrieve session to check/extend; clone to release lock immediately.
-                    let session_from_store =
-                        session_store.get(&session_id).map(|r| r.value().clone());
+                    let session_from_store = session_store.get(&session_id).await.unwrap_or(None);
 
-                    if let Some(app_session) = session_from_store {
-                        let current_expiry = app_session.expires_at.load(Ordering::Relaxed);
+                    if let Some(mut app_session) = session_from_store {
+                        let current_expiry = app_session.expires_at;
                         // Check if session is expired
                         if current_expiry < now {
                             warn!(
@@ -1232,7 +1243,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                                 app_session.session_id,
                                 app_session.user_id
                             );
-                            session_store.remove(&session_id); // Safe to write now
+                            let _ = session_store.remove(&session_id).await;
                             session_found = false;
                         } else {
                             info!(
@@ -1246,9 +1257,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                             if current_expiry.saturating_sub(now) <= SESSION_REFRESH_WINDOW_SECONDS
                             {
                                 // Extend session lifetime
-                                app_session
-                                    .expires_at
-                                    .store(now + ctx.session_timeout, Ordering::Relaxed);
+                                app_session.expires_at = now + ctx.session_timeout;
 
                                 // Extend cookie lifetime by signaling response_filter to issue Set-Cookie
                                 ctx.action_state_new_app_session_cookie =
@@ -1261,7 +1270,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                                 );
                             }
 
-                            app_session_opt = Some(app_session.as_ref().clone());
+                            app_session_opt = Some(app_session);
                             session_found = true;
                         }
                     } else {
@@ -1295,9 +1304,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 access_token: None,
                 refresh_token: None,
                 access_token_expires_at: None,
-                expires_at: Arc::new(AtomicU64::new(
-                    now + crate::UNAUTHENTICATED_SESSION_TIMEOUT_SECONDS,
-                )), // Short expiry for unauthenticated sessions
+                expires_at: now + crate::UNAUTHENTICATED_SESSION_TIMEOUT_SECONDS, // Short expiry for unauthenticated sessions
                 oidc_nonce: None,
                 oidc_pkce_verifier: None,
                 oidc_state: None,
@@ -1306,10 +1313,10 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 oidc_client_secret: self.oidc_client_secret.to_string(),
                 auth_scope_name: Some(self.auth_scope_name.to_string()),
                 auth_original_destination: None,
-                last_refresh_attempt_at: Arc::new(AtomicU64::new(0)),
             };
 
-            session_store.insert(new_session_id.clone(), Arc::new(new_app_session.clone()));
+            let _ = session_store.insert(&new_session_id, &new_app_session, crate::UNAUTHENTICATED_SESSION_TIMEOUT_SECONDS).await;
+            
             info!(
                 "[{}] [{}] New session stored for user: {}",
                 ctx.request_id,
@@ -1866,16 +1873,12 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 // 2-5-3. Update the ApplicationSession with the new ID and authenticated state.
                 let app_session = ctx.action_state_app_session.as_mut().unwrap(); // We know it exists and is mutable
                 app_session.is_authenticated = true;
-                // Now that the user is authenticated, extend the session lifetime to the full duration.
-                app_session.expires_at.store(
-                    Utc::now().timestamp() as u64 + ctx.session_timeout,
-                    Ordering::Relaxed,
-                );
-
+                app_session.expires_at = Utc::now().timestamp() as u64 + ctx.session_timeout;
                 app_session.access_token = Some(tokens.access_token);
                 app_session.access_token_expires_at =
                     Some(Utc::now().timestamp() as u64 + tokens.expires_in);
                 app_session.refresh_token = tokens.refresh_token;
+                
                 // The 'sub' claim is REQUIRED by the OIDC spec. If it's missing, the token is invalid.
                 let sub = match token_data.claims.get("sub").and_then(|v| v.as_str()) {
                     Some(s) => s.to_string(),
@@ -1907,10 +1910,10 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 app_session.session_id = new_session_id.clone();
 
                 // 2-5-5. Remove the old, unauthenticated session from the store.
-                session_store.remove(&old_session_id);
+                let _ = session_store.remove(&old_session_id).await;
 
                 // 2-5-6. Insert the newly authenticated session into the store under the new ID.
-                session_store.insert(new_session_id.clone(), Arc::new(app_session.clone()));
+                let _ = session_store.insert(&new_session_id, &app_session, ctx.session_timeout).await;
 
                 // 2-5-7. Prepare to issue the new session cookie to the client.
                 // This will overwrite the old session cookie.
@@ -2016,7 +2019,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
             app_session.auth_original_destination = Some(original_path.to_string());
 
             // 1-6. Update the session in the central store with the new OIDC values.
-            session_store.insert(app_session.session_id.clone(), Arc::new(app_session));
+            let _ = session_store.insert(&app_session.session_id, &app_session, crate::UNAUTHENTICATED_SESSION_TIMEOUT_SECONDS).await;
 
             // 1-7. Build the OIDC authorization URL with all the necessary parameters.
             let mut auth_url =

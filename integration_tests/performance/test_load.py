@@ -1,3 +1,16 @@
+"""
+Test Overview:
+Verifies the performance and stability of the spngw gateway under load.
+It uses 'oha' to simulate multiple concurrent requests and measures 
+response reliability for various scenarios including latency simulation, 
+concurrency, and large payload handling.
+
+Required Domains:
+- check.test.example.com: Primary target for load and concurrency testing.
+
+Mock Servers:
+- Port 9000 (httpserver.py): Unified Echo Server for all upstream requests.
+"""
 import subprocess
 import json
 import pytest
@@ -11,9 +24,8 @@ OHA_CMD_BASE = [
     "--"
 ]
 
-# -------------------------------
-# Fixture: run_dir for performance logs
-# -------------------------------
+# --- Fixtures ---
+
 @pytest.fixture(scope="session")
 def perf_run_dir():
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -21,9 +33,8 @@ def perf_run_dir():
     path.mkdir(parents=True, exist_ok=True)
     return path
 
-# -------------------------------
-# Helper: run oha and save JSON
-# -------------------------------
+# --- Helpers ---
+
 def run_oha(url, num_requests, run_dir: Path, test_name: str, concurrency=None):
     cmd = [
         "oha",
@@ -56,9 +67,8 @@ def run_oha(url, num_requests, run_dir: Path, test_name: str, concurrency=None):
 
     return data
 
-# -------------------------------
-# Performance tests
-# -------------------------------
+# --- Performance Tests ---
+
 @pytest.mark.performance
 def test_smoke_load(perf_run_dir):
     """Low load / smoke test"""

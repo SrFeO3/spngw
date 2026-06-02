@@ -2,15 +2,16 @@
 # -*- coding: utf-8 -*-
 """
 Simple Web Server (multithreaded, multi-port) for test
-version 0.1
+v0.2: JSON response support.
+Run:   python httpserver.py --ports 8080
 
 Usage:
   1) Install dependency:
        pip install bottle
   2) Run the server on multiple ports (comma or space separated):
-       python server.py --ports 8000,8001,8080
+       python httpserver.py --ports 8000,8001,8080
        # or
-       python server.py --ports "8000 8001 8080" --host 127.0.0.1
+       python httpserver.py --ports "8000 8001 8080" --host 127.0.0.1
   3) Try the endpoints:
        curl -i http://localhost:8000/
        curl -i http://localhost:8001/hello
@@ -38,6 +39,7 @@ import time
 from datetime import datetime
 import threading
 import re
+import json
 
 from bottle import Bottle, request, response, ServerAdapter
 
@@ -75,7 +77,7 @@ def render_page(message: str, status: int | None = None) -> str:
     Common renderer for all responses.
     - Optionally set HTTP status.
     - Compute end time and elapsed processing time.
-    - Return consistent text/plain body across success and error paths.
+    - Return consistent JSON body for all responses.
     """
     if status is not None:
         response.status = int(status)
@@ -84,40 +86,30 @@ def render_page(message: str, status: int | None = None) -> str:
     start_perf = request.environ.get('req_start_perf')
     elapsed_ms = (time.perf_counter() - start_perf) * 1000 if start_perf is not None else None
 
-    status_line = str(response.status)  # e.g., "200 OK"
+    response.content_type = 'application/json'
 
-    lines = [
-        f"message: {message}",
-        f"page: {request.path}",
-        f"status: {status_line}",
-        f"start: {request.environ.get('req_start_dt')}",
-        f"end: {end_dt}",
-    ]
-    if elapsed_ms is not None:
-        lines.append(f"elapsed_ms: {elapsed_ms:.1f}")
+    # Build the full response data
+    data = {
+        "message": message,
+        "path": request.path,
+        "status": response.status,
+        "start": request.environ.get('req_start_dt'),
+        "end": end_dt,
+        "elapsed_ms": round(elapsed_ms, 1) if elapsed_ms is not None else None,
+        "request_headers": dict(request.headers),
+        "response_headers": dict(response.headers)
+    }
 
-    response.content_type = 'text/plain; charset=UTF-8'
-
-    lines.append("")
-    lines.append("--- Request Headers ---")
-    for k, v in request.headers.items():
-        lines.append(f"{k}: {v}")
-
-    lines.append("")
-    lines.append("--- Response Headers ---")
-    for k, v in response.headers.items():
-        lines.append(f"{k}: {v}")
-
-    body = "\n".join(lines) + "\n"
-    return body
-
+    return json.dumps(data, indent=2)
 
 # ---- Routes ----
 
-@app.get(['/', '/hello', '/fruit/orange/juice', '/fruit/apple/juice', '/api/test'])
+@app.route('<:re:.*>', method=['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'])
 def standard_pages():
-    """Return a standard 'hello' page with meta information for multiple routes."""
-    return render_page(f"hello from {request.path}")
+    """
+    Catch-all route that echoes headers and path.
+    """
+    return render_page(f"Echo response from {request.path}")
 
 @app.get('/sleep/<num:int>')
 def sleep(num: int):
@@ -137,27 +129,20 @@ def xsleep(x: int, y: int, z: int):
     # Step 1: Sleep before sending headers
     time.sleep(x)
 
-    # Step 2: Prepare headers
-    response.content_type = 'text/html'
+    response.content_type = 'application/json'
 
     def generate_body():
-        # Start of body
-        yield "<html><body>".encode()
-
-        # Sleep after headers
+        yield '{\n  "steps": [\n'.encode()
+        
+        # Step 2: Sleep after headers (first byte sent triggers header transmission)
         time.sleep(y)
-
-        # Body content part 1
-        yield f"Slept {x} seconds before headers<br>".encode()
-
-        # Sleep during body
+        yield f'    "slept {x}s before headers",\n'.encode()
+        
+        # Step 3: Sleep during body
         time.sleep(z)
-
-        # Body content part 2
-        yield f"Slept {y} seconds after headers and {z} seconds during body".encode()
-
-        # End of body
-        yield "</body></html>".encode()
+        yield f'    "slept {y}s after headers and {z}s during body"\n'.encode()
+        
+        yield '  ]\n}'.encode()
 
     return generate_body()
 

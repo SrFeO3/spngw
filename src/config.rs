@@ -495,7 +495,6 @@ impl AuthScopeRegistry {
     /// - Existing, unchanged scopes are not touched, preserving their session stores.
     pub fn reload_from_config(config: &Arc<AppConfig>) {
         let mut all_required_scopes = HashSet::new();
-        let stores = actions::get_all_auth_session_stores();
 
         // 1. Register all scopes from the new config, on a per-realm basis.
         // `register_auth_scope` is idempotent, so it's safe to call for existing scopes.
@@ -508,37 +507,16 @@ impl AuthScopeRegistry {
                     {
                         if all_required_scopes.insert((realm.name.clone(), auth_scope_name.clone()))
                         {
-                            // Only log if the scope is actually new (not in the global store).
-                            let key = format!("{}_{}", realm.name, auth_scope_name);
-                            if !stores.contains_key(&key) {
-                                info!(
-                                    "[ConfigReload] Realm '{}': Registering new auth scope: '{}'",
-                                    realm.name, auth_scope_name
-                                );
-                            }
+                            info!(
+                                "[ConfigReload] Realm '{}': Registering auth scope: '{}'",
+                                realm.name, auth_scope_name
+                            );
                         }
                         actions::register_auth_scope(&realm.name, auth_scope_name);
                     }
                 }
             }
         }
-
-        // 2. Remove scopes that are no longer in the new configuration.
-        stores.retain(|realm_scope_key, _| {
-            // Note: This is a simple check. It doesn't handle renaming gracefully.
-            if !all_required_scopes
-                .iter()
-                .any(|(r, s)| format!("{}_{}", r, s) == *realm_scope_key)
-            {
-                info!(
-                    "[ConfigReload] Unregistering obsolete authentication scope: '{}'",
-                    realm_scope_key
-                );
-                false
-            } else {
-                true
-            }
-        });
     }
 }
 

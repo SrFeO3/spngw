@@ -1,3 +1,18 @@
+"""
+Test Overview:
+Verifies basic routing rules and actions of the spngw gateway.
+This includes testing static text responses, upstream proxying, URL redirects,
+and downstream response header manipulation based on match expressions.
+
+Required Domains:
+- www.test.example.com: Used for path-based routing and redirect tests.
+- auth.test.example.com: Used for hostname-based proxy tests.
+- check.test.example.com: Used for hostname-based proxy tests.
+- betelgeuse.test.example.com: Used to verify 503 behavior for unmatched routes.
+
+Mock Servers:
+- Port 9000 (httpserver.py): Unified Echo Server for all upstream requests.
+"""
 import pytest
 import requests
 
@@ -29,7 +44,7 @@ def test_proxy_www_root(resolve_to_localhost):
 def test_proxy_auth_host(resolve_to_localhost):
     """
     Rule: match: "hostname.equals('auth.test.example.com')"
-    Action: proxy upstream: "http://127.0.0.1:9001"
+    Action: proxy upstream: "http://127.0.0.1:9000"
     """
     url = "https://auth.test.example.com:8443/hello"
     r = requests.get(url, headers={"Host": "auth.test.example.com"}, verify=False, timeout=5)
@@ -39,7 +54,7 @@ def test_proxy_auth_host(resolve_to_localhost):
 def test_proxy_api_path(resolve_to_localhost):
     """
     Rule: match: "request.path.starts_with('/api/')"
-    Action: proxy upstream: "http://127.0.0.1:9002"
+    Action: proxy upstream: "http://127.0.0.1:9000"
     """
     url = "https://www.test.example.com:8443/api/test"
     r = requests.get(url, verify=False, timeout=5)
@@ -49,7 +64,7 @@ def test_proxy_api_path(resolve_to_localhost):
 def test_proxy_check_host(resolve_to_localhost):
     """
     Rule: match: "hostname.equals('check.test.example.com')"
-    Action: proxy upstream: "http://127.0.0.1:9003"
+    Action: proxy upstream: "http://127.0.0.1:9000"
     """
     url = "https://check.test.example.com:8443/hello"
     r = requests.get(url, headers={"Host": "check.test.example.com"}, verify=False, timeout=5)

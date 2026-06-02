@@ -886,6 +886,11 @@ fn main() -> pingora::Result<()> {
     let pingora_conf_path =
         std::env::var("APIGW_PINGORA_CONF").unwrap_or_else(|_| "conf/pinconfig.yaml".to_string());
 
+    // Redis setup
+    let redis_url = std::env::var("APIGW_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(actions::init_redis_pool(&redis_url))?;
+
     info!(
         "SPN Gateway started (Version: {}, PID: {}) with inventory: {}, Pingora config: {}, TLS Bind: {}, HTTP Bind: {}, HTTPS Redirect Port: {}",
         env!("CARGO_PKG_VERSION"),
