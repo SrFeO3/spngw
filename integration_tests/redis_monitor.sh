@@ -11,8 +11,8 @@ while true; do
     echo "Interval: ${INTERVAL}s | Keys: $(redis-cli KEYS "*" | wc -l)"
     echo "----------------------------------------------------------------"
 
-    # Iterate through keys
-    keys=$(redis-cli --raw KEYS "*")
+    # Iterate through keys using SCAN for safety
+    keys=$(redis-cli --raw SCAN 0 | tail -n +2)
     if [ -z "$keys" ]; then
         echo "(No keys found)"
     else
