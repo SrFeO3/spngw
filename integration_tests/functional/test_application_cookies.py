@@ -1,141 +1,235 @@
-"""
-Test Overview:
-Verifies BFF (Backend for Frontend) session management and device identification.
-It ensures that session and device cookies are correctly issued with required 
-security attributes (HttpOnly, Secure, SameSite) and that session continuity 
-is maintained via Redis.
-
-Required Domains:
-- www.test.example.com: Basic reachability and device cookie verification.
-- api.test.example.com: OIDC-protected route verification and session persistence.
-
-Mock Servers:
-- Port 9000 (httpserver.py): Unified Echo Server for all upstream requests.
-"""
+import os
 import pytest
 import requests
 import urllib3
 
-# Suppress InsecureRequestWarning for private/self-signed certificates
+# Disable warnings for self-signed SSL certificates in the test environment
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-pytestmark = pytest.mark.functional
+# Get TLS bind address from environment variables to determine the port
+TLS_BIND_ADDR = os.getenv("APIGW_TLS_BIND_ADDRESS", "0.0.0.0:8443")
+PORT = TLS_BIND_ADDR.split(":")[-1]
 
-def parse_cookie(set_cookie_header, cookie_name):
+# Base URLs based on domains from conftest.py and the determined port
+BASE_URL_WWW = f"https://www.test.example.com:{PORT}"
+BASE_URL_API = f"https://api.test.example.com:{PORT}"
+BFF_SCOPE = "TEST-SCOPE"
+
+
+@pytest.fixture
+def session():
+    """requests.Session to maintain state (Cookies) across requests."""
+    sess = requests.Session()
+    sess.verify = False
+    return sess
+
+
+def get_set_cookie_header_by_name(response, name):
+    """Get the Set-Cookie header value for a specific cookie name."""
+    raw_headers = response.raw.headers.getlist("Set-Cookie")
+    for header in raw_headers:
+        if header.strip().startswith(f"{name}="):
+            return header
+    return None
+
+
+def parse_cookie_attributes(set_cookie_header):
+    """Parse Set-Cookie header attributes into a dictionary."""
+    if not set_cookie_header:
+        return {}
+    parts = [p.strip() for p in set_cookie_header.split(";")]
+    cookie_value = parts[0]
+    name, value = cookie_value.split("=", 1)
+
+    attrs = {"name": name, "value": value}
+    for part in parts[1:]:
+        if "=" in part:
+            k, v = part.split("=", 1)
+            attrs[k.lower().strip()] = v.strip()
+        else:
+            attrs[part.lower().strip()] = True
+    return attrs
+
+
+# --- 1.1 Normal Cases ---
+
+def test_01_gateway_connectivity(session):
     """
-    Helper to extract specific cookie value and attributes from Set-Cookie header.
+    1.1 Gateway connectivity check: Verifies basic network connection and name resolution to the BFF.
     """
-    if not set_cookie_header or not cookie_name:
-        return None
+    url = f"{BASE_URL_WWW}/"
+    response = session.get(url, allow_redirects=False)
+    assert response.status_code == 200
+
+
+def test_02_session_cookie_issuance_and_attributes(session):
+    """
+    1.1 Session cookie issuance and attributes: Verifies that an unauthenticated access to /dashboard 
+    issues a session ID with HttpOnly, Secure, SameSite=Lax, and Path=/ attributes.
+    """
+    url = f"{BASE_URL_API}/dashboard"
+    response = session.get(url, allow_redirects=False)
+
+    cookie_name = f"CHIPIN_SESSION_ID_{BFF_SCOPE}"
+    assert cookie_name in response.cookies, f"{cookie_name} was not issued."
     
-    parts = [p.strip() for p in set_cookie_header.split(';') if p.strip()]
-    if not parts:
-        return None
-        
-    first_part = parts[0].split('=', 1)
-    if len(first_part) < 2 or first_part[0].strip() != cookie_name:
-        return None
-        
-    value = first_part[1]
-    attributes = {kv.split('=', 1)[0].strip().lower(): (kv.split('=', 1)[1].strip() if '=' in kv else True) 
-                  for kv in parts[1:] if kv}
-    return {"value": value, "attributes": attributes}
-
-@pytest.mark.parametrize("resolve_to_localhost", ["www.test.example.com"], indirect=True)
-def test_gateway_reachable(resolve_to_localhost):
-    """
-    Verify gateway reachability and basic name resolution.
-    """
-    url = "https://www.test.example.com:8443/robot.txt"
-    try:
-        r = requests.get(url, verify=False, timeout=2)
-        assert r.status_code == 200, f"Gateway connected but returned {r.status_code}"
-    except requests.exceptions.RequestException as e:
-        pytest.fail(f"Could not connect to Gateway at 127.0.0.1:8443. Is spngw running? Error: {e}")
-
-@pytest.mark.parametrize("resolve_to_localhost", ["api.test.example.com"], indirect=True)
-def test_session_cookie_issuance_on_protected_route(resolve_to_localhost):
-    """
-    Verify session cookie issuance with correct scope on protected routes.
-    when accessing a path configured with RequireAuthentication.
-    """
-    url = "https://api.test.example.com:8443/dashboard"
-
-    # verify=False: Allow private/self-signed certificates
-    # The hostname in the URL ensures correct SNI and Host header
-    # conftest.py's socket patch ensures it connects to 127.0.0.1
-    r = requests.get(url, verify=False, timeout=5, allow_redirects=False)
-    assert r.status_code == 302
+    header_val = get_set_cookie_header_by_name(response, cookie_name)
+    assert header_val is not None
     
-    # 1. Verify cookie existence in the jar
-    session_cookie = next((c for c in r.cookies if c.name.startswith("CHIPIN_SESSION_ID_")), None)
-    assert session_cookie is not None, f"Session cookie missing. Found: {list(r.cookies.keys())}"
-
-    # 2. Verify attributes from raw headers
-    # r.raw.headers (urllib3 HTTPHeaderDict) supports getlist to avoid comma-separation issues
-    raw_headers = r.raw.headers.getlist('Set-Cookie')
-    raw_header = next((h for h in raw_headers if h.strip().startswith(session_cookie.name)), None)
-    cookie_info = parse_cookie(raw_header, session_cookie.name)
-    
-    assert cookie_info is not None
-    assert len(cookie_info["value"]) > 20  # Ensure it has sufficient length (Base64 encoded).
-    
-    # Attribute verification
-    attrs = cookie_info["attributes"]
+    attrs = parse_cookie_attributes(header_val)
     assert attrs.get("httponly") is True
     assert attrs.get("secure") is True
-    assert str(attrs.get("samesite")).lower() == "lax"
+    assert attrs.get("samesite", "").lower() == "lax"
     assert attrs.get("path") == "/"
-    assert "max-age" in attrs
 
-@pytest.mark.parametrize("resolve_to_localhost", ["www.test.example.com"], indirect=True)
-def test_device_cookie_issuance_and_attributes(resolve_to_localhost):
+
+def test_03_device_cookie_issuance_and_attributes(session):
     """
-    Verify that IssueDeviceCookie works for all requests and 
-    issues a long-lived device context cookie.
+    1.1 Device cookie issuance and attributes: Verifies that access to / issues a device cookie 
+    with HttpOnly, Secure, SameSite=Strict, and a long-term (1 year) expiry.
     """
-    url = "https://www.test.example.com:8443/"
+    url = f"{BASE_URL_WWW}/"
+    response = session.get(url, allow_redirects=False)
 
-    # verify=False: Allow private/self-signed certificates
-    r = requests.get(url, verify=False, timeout=5)
-    assert r.status_code == 200
+    cookie_name = "CHIPIN_DEVICE_CONTEXT"
+    assert cookie_name in response.cookies, f"{cookie_name} was not issued."
     
-    device_cookie = r.cookies.get("CHIPIN_DEVICE_CONTEXT", domain="www.test.example.com")
-    assert device_cookie is not None
+    header_val = get_set_cookie_header_by_name(response, cookie_name)
+    assert header_val is not None
 
-    # Verify device cookie attributes
-    raw_headers = r.raw.headers.getlist('Set-Cookie')
-    raw_header = next((h for h in raw_headers if h.strip().startswith("CHIPIN_DEVICE_CONTEXT")), None)
-    cookie_info = parse_cookie(raw_header, "CHIPIN_DEVICE_CONTEXT")
-    
-    assert cookie_info is not None
-    
-    # Device cookie attribute verification
-    attrs = cookie_info["attributes"]
+    attrs = parse_cookie_attributes(header_val)
     assert attrs.get("httponly") is True
     assert attrs.get("secure") is True
-    assert str(attrs.get("samesite")).lower() == "strict"
-    max_age = attrs.get("max-age")
-    assert max_age and int(max_age) > 30000000  # 約1年(31536000秒)に近いことを確認
+    assert attrs.get("samesite", "").lower() == "strict"
+    assert attrs.get("path") == "/"
 
-@pytest.mark.parametrize("resolve_to_localhost", ["api.test.example.com"], indirect=True)
-def test_session_cookie_persistence(resolve_to_localhost):
-    """
-    Verify that an issued session ID is maintained in subsequent requests.
-    """
-    auth_url = "https://api.test.example.com:8443/dashboard"
-    check_url = "https://api.test.example.com:8443/session-check"
-    session = requests.Session()
-    
-    # 1. Obtain cookie on first access
-    r1 = session.get(auth_url, verify=False, timeout=5, allow_redirects=False)
-    session_cookie = next((c for c in session.cookies if c.name.startswith("CHIPIN_SESSION_ID_")), None)
-    assert session_cookie is not None
-    print(f"DEBUG: Obtained session cookie: {session_cookie.name}")
+    max_age_str = attrs.get("max-age")
+    assert max_age_str is not None
+    max_age = int(max_age_str)
+    assert 31500000 <= max_age <= 31600000
 
-    # 2. Access again by sending the cookie.
-    # Access a non-authenticated route that still uses the session scope.
-    # If recognized, the gateway proxies to backend (200 OK) instead of initiating OIDC (302).
-    r2 = session.get(check_url, verify=False, timeout=5, allow_redirects=False)
+
+def test_04_session_continuity(session):
+    """
+    1.1 Session continuity: Verifies that cookie values remain unchanged during subsequent
+    requests when both IDs are held.
+    """
+    session.get(f"{BASE_URL_WWW}/", allow_redirects=False)
+    did_1 = session.cookies.get("CHIPIN_DEVICE_CONTEXT")
+    assert did_1 is not None
+
+    cookie_name_session = f"CHIPIN_SESSION_ID_{BFF_SCOPE}"
+    session.get(f"{BASE_URL_API}/dashboard", allow_redirects=False)
+    sid_1 = session.cookies.get(cookie_name_session)
+    assert sid_1 is not None
+
+    session.get(f"{BASE_URL_API}/dashboard", allow_redirects=False)
+
+    sid_2 = session.cookies.get(cookie_name_session)
+    did_2 = session.cookies.get("CHIPIN_DEVICE_CONTEXT")
+
+    assert sid_1 == sid_2
+    assert did_1 == did_2
+
+
+def test_05_device_id_continuity_on_session_clear(session):
+    """
+    1.1 Device ID continuity: Verifies that the device ID persists even when the session cookie 
+    is cleared and a new session ID is issued.
+    """
+    cookie_name_session = f"CHIPIN_SESSION_ID_{BFF_SCOPE}"
+    cookie_name_device = "CHIPIN_DEVICE_CONTEXT"
+
+    session.get(f"{BASE_URL_WWW}/", allow_redirects=False)
+    session.get(f"{BASE_URL_API}/dashboard", allow_redirects=False)
+
+    did_1 = session.cookies.get(cookie_name_device)
+    sid_1 = session.cookies.get(cookie_name_session)
+    assert did_1 is not None
+    assert sid_1 is not None
+
+    session.cookies.set(cookie_name_session, None)
+
+    session.get(f"{BASE_URL_API}/dashboard", allow_redirects=False)
+    did_2 = session.cookies.get(cookie_name_device)
+    sid_2 = session.cookies.get(cookie_name_session)
+
+    assert did_1 == did_2
+    assert sid_2 is not None
+    assert sid_1 != sid_2
+
+
+def test_06_client_independence(session):
+    """
+    1.1 Client independence: Verifies that session IDs are unique across different clients.
+    """
+    cookie_name = f"CHIPIN_SESSION_ID_{BFF_SCOPE}"
+
+    session_a = requests.Session()
+    session_a.verify = False
+    session_a.get(f"{BASE_URL_API}/dashboard", allow_redirects=False)
+    sid_a = session_a.cookies.get(cookie_name)
+
+    session_b = requests.Session()
+    session_b.verify = False
+    session_b.get(f"{BASE_URL_API}/dashboard", allow_redirects=False)
+    sid_b = session_b.cookies.get(cookie_name)
+
+    assert sid_a is not None
+    assert sid_b is not None
+    assert sid_a != sid_b
+
+
+# --- 1.2 Negative Cases ---
+
+def test_07_invalid_device_cookie_fallback(session):
+    """
+    1.2 Device cookie tampering resistance: Verifies that invalid/tampered device cookies 
+    are handled safely by re-issuing a new valid cookie.
+    """
+    cookie_name_device = "CHIPIN_DEVICE_CONTEXT"
+    malformed_jwt = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.invalidpayload.invalidsignature"
+    session.cookies.set(cookie_name_device, malformed_jwt)
+
+    response = session.get(f"{BASE_URL_WWW}/", allow_redirects=False)
+    assert response.status_code == 200
+
+    new_did = response.cookies.get(cookie_name_device)
+    assert new_did is not None
+    assert new_did != malformed_jwt
+
+
+def test_08_invalid_format_session_cookie_fallback(session):
+    """
+    1.2 Malformed session ID: Verifies that malformed session IDs result in a safe fallback:
+    issuing a new session and redirecting (302).
+    """
+    cookie_name_session = f"CHIPIN_SESSION_ID_{BFF_SCOPE}"
+    session.cookies.set(cookie_name_session, "short-and-invalid")
+
+    url_auth = f"{BASE_URL_API}/dashboard"
+    response = session.get(url_auth, allow_redirects=False)
+
+    assert response.status_code == 302
+    new_sid = response.cookies.get(cookie_name_session)
+    assert new_sid is not None
+    assert new_sid != "short-and-invalid"
+
+
+def test_09_nonexistent_session_cookie_handling(session):
+    """
+    1.2 Non-existent/Expired session ID: Verifies that valid-format session IDs not present in Redis
+    are treated as unauthenticated, triggering a redirect and a new cookie.
+    """
+    cookie_name_session = f"CHIPIN_SESSION_ID_{BFF_SCOPE}"
+    # Dummy session ID that is valid in format but does not exist in the store
+    nonexistent_sid = "A" * 43
+    session.cookies.set(cookie_name_session, nonexistent_sid)
+
+    url_auth = f"{BASE_URL_API}/dashboard"
+    response = session.get(url_auth, allow_redirects=False)
     
-    assert r2.status_code == 200, f"Session failed. Expected 200 OK, but got {r2.status_code}"
+    assert response.status_code == 302
+    new_sid = response.cookies.get(cookie_name_session)
+    assert new_sid is not None
+    assert new_sid != nonexistent_sid

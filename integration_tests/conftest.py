@@ -291,7 +291,8 @@ def apply_test_config():
             "match": "request.path.starts_with('/api/')",
             "action": {
                 "type": "proxy",
-                "upstream": "http://127.0.0.1:9000"
+                "upstream": "http://127.0.0.1:9000",
+                "authScopeName": "test-scope"
             }
         },
         {
@@ -322,7 +323,7 @@ def apply_test_config():
                 "authScopeName": "test-scope",
                 "oidcClientId": oidc_config.get("client_id", "test-client"),
                 "oidcClientSecret": oidc_config.get("client_secret", "secret"),
-                "oidcRedirectUrl": f"https://api.{zone_name}:8443/callback",
+                "oidcRedirectUrl": f"api.test.example.com:8443/dashboard",
                 "oidcAuthorizationEndpoint": f"{oidc_config.get('issuer')}/authorize",
                 "oidcTokenEndpoint": f"{oidc_config.get('issuer')}/token"
             }
