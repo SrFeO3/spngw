@@ -914,10 +914,11 @@ fn main() -> pingora::Result<()> {
     rt.block_on(actions::init_redis_pool(&redis_url))?;
 
     info!(
-        "SPN Gateway started (Version: {}, PID: {}) with inventory: {}, Pingora config: {}, TLS Bind: {}, HTTP Bind: {}, HTTPS Redirect Port: {}",
+        "SPN Gateway started (Version: {}, PID: {}) with inventory: {}, Redis: {}, Pingora config: {}, TLS Bind: {}, HTTP Bind: {}, HTTPS Redirect Port: {}",
         env!("CARGO_PKG_VERSION"),
         std::process::id(),
         config_path,
+        redis_url,
         pingora_conf_path,
         gateway_listen_addr,
         redirect_service_listen_addr,
@@ -1003,10 +1004,10 @@ fn main() -> pingora::Result<()> {
     );
     my_server.add_service(background_service("Config Reloader", signal_reload_service));
 
-    // Create and add the session cleanup service.
-    let cleanup_service = background_services::SessionAndOidcCacheCleanupService::new();
+    // Create and add the OIDC metadata cleanup service.
+    let cleanup_service = background_services::OidcMetadataCleanupService::new();
     my_server.add_service(background_service(
-        "Session and OIDC Cache Cleaner",
+        "OIDC Cache Cleaner",
         cleanup_service,
     ));
 

@@ -72,6 +72,11 @@ pub async fn init_redis_pool(redis_url: &str) -> Result<()> {
         Error::explain(ErrorType::InternalError, format!("Redis initialization failed: {}", e))
     })?;
     
+    // Perform a lightweight PING to ensure the server is ready to accept commands.
+    pool.ping::<()>(None).await.map_err(|e| {
+        Error::explain(ErrorType::InternalError, format!("Redis PING check failed: {}", e))
+    })?;
+
     REDIS_POOL.set(pool).map_err(|_| {
         Error::explain(ErrorType::InternalError, "Redis pool already initialized")
     })?;

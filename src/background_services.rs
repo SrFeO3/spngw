@@ -8,24 +8,24 @@ use crate::actions;
 
 const CLEANUP_INTERVAL_SECONDS: u64 = 60;
 
-/// A background service that periodically cleans up expired application sessions and OIDC metadata cache.
-pub struct SessionAndOidcCacheCleanupService {
+/// A background service that periodically cleans up the OIDC metadata cache.
+pub struct OidcMetadataCleanupService {
     cleanup_interval: Duration,
 }
 
-impl SessionAndOidcCacheCleanupService {
+impl OidcMetadataCleanupService {
     pub fn new() -> Self {
-        SessionAndOidcCacheCleanupService {
+        OidcMetadataCleanupService {
             cleanup_interval: Duration::from_secs(CLEANUP_INTERVAL_SECONDS),
         }
     }
 }
 
 #[async_trait]
-impl BackgroundService for SessionAndOidcCacheCleanupService {
+impl BackgroundService for OidcMetadataCleanupService {
     async fn start(&self, mut shutdown: pingora::server::ShutdownWatch) {
         info!(
-            "Session and OIDC Cache Cleanup Service started. Checking for expired items every {} seconds.",
+            "OIDC Metadata Cache Cleanup Service started. Checking for expired items every {} seconds.",
             self.cleanup_interval.as_secs()
         );
         let mut interval = tokio::time::interval(self.cleanup_interval);
@@ -33,10 +33,10 @@ impl BackgroundService for SessionAndOidcCacheCleanupService {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    self.cleanup_sessions_and_oidc_metadata().await;
+                    self.cleanup_oidc_metadata().await;
                 }
                 _ = shutdown.changed() => {
-                    info!("[SessionAndOidcCacheCleanup] Shutdown signal received, terminating service.");
+                    info!("[OidcMetadataCleanup] Shutdown signal received, terminating service.");
                     break;
                 }
             }
@@ -44,19 +44,18 @@ impl BackgroundService for SessionAndOidcCacheCleanupService {
     }
 }
 
-impl SessionAndOidcCacheCleanupService {
-    async fn cleanup_sessions_and_oidc_metadata(&self) {
-        info!("[SessionAndOidcCacheCleanup] Starting cleanup task.");
+impl OidcMetadataCleanupService {
+    async fn cleanup_oidc_metadata(&self) {
+        info!("[OidcMetadataCleanup] Starting cleanup task.");
 
         // Offload heavy cleanup logic to a dedicated blocking thread.
         // This ensures the main async worker threads are not blocked by large map iterations.
         tokio::task::spawn_blocking(|| {
-            // Also cleanup OIDC metadata cache (synchronous map operation)
             actions::cleanup_oidc_metadata_cache();
         })
         .await
         .unwrap_or(());
 
-        info!("[SessionAndOidcCacheCleanup] Finished cleanup task.");
+        info!("[OidcMetadataCleanup] Finished cleanup task.");
     }
 }
