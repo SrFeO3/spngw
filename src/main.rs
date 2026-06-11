@@ -143,6 +143,22 @@ impl ProxyHttp for GatewayRouter {
             session.req_header().uri.path()
         );
 
+        // Log TLS connection details (Protocol / Cipher / Key Exchange / (Auth) )
+        // Note: Handshake authentication algorithm is not exposed via the current crate's safe API.
+        if let Some(ssl) = session.stream().and_then(|s| s.get_ssl()) {
+            let version = ssl.version_str();
+            let cipher = ssl.current_cipher().map(|c| c.name()).unwrap_or("Unknown");
+
+            // Get the Key Exchange group name (e.g., X25519MLKEM768 or x25519)
+            let kx = ssl.curve_name()
+                .unwrap_or("Unknown");
+
+            info!(
+                "[{}] SSL connection using {} / {} / {}",
+                ctx.request_id, version, cipher, kx
+            );
+        }
+
         //
         // Get SNI from the ex_data stored during the TLS handshake and set to no_sni_upstream.sni.
         //

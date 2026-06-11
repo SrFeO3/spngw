@@ -3072,7 +3072,7 @@ dependencies = [
 
 [[package]]
 name = "spngw"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "arc-swap",
  "async-trait",
