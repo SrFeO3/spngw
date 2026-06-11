@@ -812,6 +812,12 @@ struct SniCertificateSelector {
 #[async_trait]
 impl pingora::listeners::TlsAccept for SniCertificateSelector {
     async fn certificate_callback(&self, ssl: &mut pingora::tls::ssl::SslRef) {
+        if let Err(e) = ssl.set_curves_list(
+            "X25519MLKEM768:X25519Kyber768Draft00:X25519:P-256"
+        ) {
+            warn!("Failed to set TLS groups (PQC): {}", e);
+        }
+
         let sni_opt_string = ssl
             .servername(pingora::tls::ssl::NameType::HOST_NAME)
             .map(|s| s.to_string());
