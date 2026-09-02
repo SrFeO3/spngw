@@ -1,3 +1,4 @@
+use fred::prelude::*;
 /// # Gateway Actions and Logic
 ///
 /// This file defines the core routing and middleware architecture. The `GatewayAction`
@@ -25,10 +26,7 @@
 /// These are complex, multi-step workflows encapsulated into a single action.
 /// - `RequireAuthentication`: An action for paths that require OIDC authentication. It manages
 ///   the redirect-based login flow. (Note: Callback handling is not yet implemented).
-use std::sync::{
-    Arc, OnceLock,
-};
-use fred::prelude::*;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose};
@@ -61,25 +59,37 @@ static REDIS_POOL: OnceLock<fred::clients::Pool> = OnceLock::new();
 /// Initialize the global Redis pool
 pub async fn init_redis_pool(redis_url: &str) -> Result<()> {
     let config = Config::from_url(redis_url).map_err(|e| {
-        Error::explain(ErrorType::InternalError, format!("Invalid Redis URL: {}", e))
+        Error::explain(
+            ErrorType::InternalError,
+            format!("Invalid Redis URL: {}", e),
+        )
     })?;
     // Design from redis.md: pool size 1, connect timeout 100ms, command timeout 50ms
-    let pool = Builder::from_config(config)
-        .build_pool(1)
-        .map_err(|e| Error::explain(ErrorType::InternalError, format!("Failed to build Redis pool: {}", e)))?;
+    let pool = Builder::from_config(config).build_pool(1).map_err(|e| {
+        Error::explain(
+            ErrorType::InternalError,
+            format!("Failed to build Redis pool: {}", e),
+        )
+    })?;
 
     pool.init().await.map_err(|e| {
-        Error::explain(ErrorType::InternalError, format!("Redis initialization failed: {}", e))
-    })?;
-    
-    // Perform a lightweight PING to ensure the server is ready to accept commands.
-    pool.ping::<()>(None).await.map_err(|e| {
-        Error::explain(ErrorType::InternalError, format!("Redis PING check failed: {}", e))
+        Error::explain(
+            ErrorType::InternalError,
+            format!("Redis initialization failed: {}", e),
+        )
     })?;
 
-    REDIS_POOL.set(pool).map_err(|_| {
-        Error::explain(ErrorType::InternalError, "Redis pool already initialized")
+    // Perform a lightweight PING to ensure the server is ready to accept commands.
+    pool.ping::<()>(None).await.map_err(|e| {
+        Error::explain(
+            ErrorType::InternalError,
+            format!("Redis PING check failed: {}", e),
+        )
     })?;
+
+    REDIS_POOL
+        .set(pool)
+        .map_err(|_| Error::explain(ErrorType::InternalError, "Redis pool already initialized"))?;
     Ok(())
 }
 
@@ -98,17 +108,35 @@ impl SessionStore {
         let val: Option<String> = pool.get(self.key(session_id)).await.map_err(|e| {
             Error::explain(ErrorType::InternalError, format!("Redis GET failed: {}", e))
         })?;
-        
-        Ok(val.as_deref().and_then(|s| serde_json::from_str::<ApplicationSession>(s).ok()))
+
+        Ok(val
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<ApplicationSession>(s).ok()))
     }
 
-    pub async fn insert(&self, session_id: &str, session: &ApplicationSession, ttl: u64) -> Result<()> {
+    pub async fn insert(
+        &self,
+        session_id: &str,
+        session: &ApplicationSession,
+        ttl: u64,
+    ) -> Result<()> {
         let pool = REDIS_POOL.get().expect("Redis pool not initialized");
         let json = serde_json::to_string(session).map_err(|e| {
-            Error::explain(ErrorType::InternalError, format!("Session serialization failed: {}", e))
+            Error::explain(
+                ErrorType::InternalError,
+                format!("Session serialization failed: {}", e),
+            )
         })?;
-        
-        pool.set::<(), _, _>(self.key(session_id), json, Some(Expiration::EX(ttl as i64)), None, false).await.map_err(|e| {
+
+        pool.set::<(), _, _>(
+            self.key(session_id),
+            json,
+            Some(Expiration::EX(ttl as i64)),
+            None,
+            false,
+        )
+        .await
+        .map_err(|e| {
             Error::explain(ErrorType::InternalError, format!("Redis SET failed: {}", e))
         })?;
         Ok(())
@@ -151,7 +179,7 @@ pub struct ApplicationSession {
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
     pub access_token_expires_at: Option<u64>, // Unix timestamp
-    pub expires_at: u64,                     // Unix timestamp for the session itself
+    pub expires_at: u64,                      // Unix timestamp for the session itself
     pub oidc_nonce: Option<String>,
     pub oidc_pkce_verifier: Option<String>,
     pub oidc_state: Option<String>,
@@ -491,13 +519,21 @@ async fn ensure_valid_token_and_refresh(
                         .as_deref()
                         .or(fallback_auth_scope_name);
 
-                    if let Some(scope) = scope_to_use
-                    {
+                    if let Some(scope) = scope_to_use {
                         let store = get_auth_session_store(&ctx.realm_name, scope);
                         // Distributed refresh lock using Redis SET NX
                         let lock_key = format!("lock:refresh:{}", app_session.session_id);
                         let pool = REDIS_POOL.get().expect("Redis pool not initialized");
-                        if let Ok(true) = pool.set::<bool, _, _>(lock_key, "1", Some(Expiration::EX(10)), Some(SetOptions::NX), false).await {
+                        if let Ok(true) = pool
+                            .set::<bool, _, _>(
+                                lock_key,
+                                "1",
+                                Some(Expiration::EX(10)),
+                                Some(SetOptions::NX),
+                                false,
+                            )
+                            .await
+                        {
                             should_refresh = true;
                         }
 
@@ -647,7 +683,9 @@ async fn ensure_valid_token_and_refresh(
             if let Some(scope) = scope_to_use {
                 let store = get_auth_session_store(&ctx.realm_name, scope);
                 if is_token_valid {
-                    let _ = store.insert(&app_session.session_id, app_session, ctx.session_timeout).await;
+                    let _ = store
+                        .insert(&app_session.session_id, app_session, ctx.session_timeout)
+                        .await;
                     info!(
                         "[{}] [{}] Updated session in store after refresh.",
                         ctx.request_id, action_name
@@ -793,26 +831,26 @@ impl<'a> RouteLogic for ProxyToRoute<'a> {
                 self.name(),
                 scope_name
             );
-            
+
             let session_store = get_auth_session_store(&ctx.realm_name, scope_name);
             let cookie_name = format!("CHIPIN_SESSION_ID_{}", scope_name.to_uppercase());
-            
+
             let session_id_opt = session
                 .req_header()
                 .headers
                 .get("Cookie")
                 .and_then(|cookie_header| cookie_header.to_str().ok())
                 .and_then(|cookies_str| {
-                    cookies_str.split(';').find_map(|cookie| {
-                        cookie.trim().strip_prefix(&format!("{}=", cookie_name))
-                    })
+                    cookies_str
+                        .split(';')
+                        .find_map(|cookie| cookie.trim().strip_prefix(&format!("{}=", cookie_name)))
                 });
 
             if let Some(sid) = session_id_opt {
                 ctx.action_state_app_session = session_store.get(sid).await.unwrap_or(None);
             }
         }
-        
+
         // Ensure the token is valid and refresh if necessary before connecting to upstream.
         let is_token_valid =
             ensure_valid_token_and_refresh(ctx, self.name(), self.auth_scope_name).await;
@@ -1320,8 +1358,14 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 auth_original_destination: None,
             };
 
-            let _ = session_store.insert(&new_session_id, &new_app_session, crate::UNAUTHENTICATED_SESSION_TIMEOUT_SECONDS).await;
-            
+            let _ = session_store
+                .insert(
+                    &new_session_id,
+                    &new_app_session,
+                    crate::UNAUTHENTICATED_SESSION_TIMEOUT_SECONDS,
+                )
+                .await;
+
             info!(
                 "[{}] [{}] New session stored for user: {}",
                 ctx.request_id,
@@ -1883,7 +1927,7 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 app_session.access_token_expires_at =
                     Some(Utc::now().timestamp() as u64 + tokens.expires_in);
                 app_session.refresh_token = tokens.refresh_token;
-                
+
                 // The 'sub' claim is REQUIRED by the OIDC spec. If it's missing, the token is invalid.
                 let sub = match token_data.claims.get("sub").and_then(|v| v.as_str()) {
                     Some(s) => s.to_string(),
@@ -1918,7 +1962,9 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
                 let _ = session_store.remove(&old_session_id).await;
 
                 // 2-5-6. Insert the newly authenticated session into the store under the new ID.
-                let _ = session_store.insert(&new_session_id, &app_session, ctx.session_timeout).await;
+                let _ = session_store
+                    .insert(&new_session_id, app_session, ctx.session_timeout)
+                    .await;
 
                 // 2-5-7. Prepare to issue the new session cookie to the client.
                 // This will overwrite the old session cookie.
@@ -2024,7 +2070,13 @@ impl<'a> RouteLogic for RequireAuthenticationRoute<'a> {
             app_session.auth_original_destination = Some(original_path.to_string());
 
             // 1-6. Update the session in the central store with the new OIDC values.
-            let _ = session_store.insert(&app_session.session_id, &app_session, crate::UNAUTHENTICATED_SESSION_TIMEOUT_SECONDS).await;
+            let _ = session_store
+                .insert(
+                    &app_session.session_id,
+                    &app_session,
+                    crate::UNAUTHENTICATED_SESSION_TIMEOUT_SECONDS,
+                )
+                .await;
 
             // 1-7. Build the OIDC authorization URL with all the necessary parameters.
             let mut auth_url =

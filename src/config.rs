@@ -388,7 +388,7 @@ impl CertificateCache {
                 } else {
                     info!(
                         "[ConfigReload] Realm '{}': Updating certificate for host '{}'",
-                        realm.name, &vhost.hostname
+                        realm.name, vhost.hostname
                     );
                     match (
                         pingora::tls::x509::X509::from_pem(cert_pem),
@@ -623,7 +623,7 @@ async fn fetch_config_from_url(
                 .unwrap_or_else(|_| "<failed to read body>".to_string());
             error!(
                 "API at {} returned error status {}: {}",
-                url, status, &body_text
+                url, status, body_text
             );
             return Err(format!("API error for {}: status {}", url, status).into());
         }
@@ -643,7 +643,7 @@ async fn fetch_config_from_url(
                 "Failed to deserialize JSON from {}: {}. Body: '{}'",
                 url, e, body_text
             );
-            error!("{}", &err_msg);
+            error!("{}", err_msg);
             err_msg.into()
         })
     }
@@ -834,7 +834,7 @@ impl SignalReloadService {
             Ok(res) => {
                 info!(
                     "[ConfigReload] Successfully loaded new configuration from {}.",
-                    &self.config_path
+                    self.config_path
                 );
                 res
             }

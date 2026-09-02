@@ -2302,7 +2302,7 @@ License: Apache License 2.0
 
 The above license applies to the following components:
 
-  - spngw 0.7.5
+  - spngw 0.7.6
     
 
 ===============================================================================

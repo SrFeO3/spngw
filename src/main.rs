@@ -165,8 +165,7 @@ impl ProxyHttp for GatewayRouter {
             let cipher = ssl.current_cipher().map(|c| c.name()).unwrap_or("Unknown");
 
             // Get the Key Exchange group name (e.g., X25519MLKEM768 or x25519)
-            let kx = ssl.curve_name()
-                .unwrap_or("Unknown");
+            let kx = ssl.curve_name().unwrap_or("Unknown");
 
             info!(
                 "[{}] SSL connection using {} / {} / {}",
@@ -843,9 +842,7 @@ struct SniCertificateSelector {
 #[async_trait]
 impl pingora::listeners::TlsAccept for SniCertificateSelector {
     async fn certificate_callback(&self, ssl: &mut pingora::tls::ssl::SslRef) {
-        if let Err(e) = ssl.set_curves_list(
-            "X25519MLKEM768:X25519Kyber768Draft00:X25519:P-256"
-        ) {
+        if let Err(e) = ssl.set_curves_list("X25519MLKEM768:X25519Kyber768Draft00:X25519:P-256") {
             warn!("Failed to set TLS groups (PQC): {}", e);
         }
 
@@ -932,7 +929,8 @@ fn main() -> pingora::Result<()> {
         std::env::var("APIGW_PINGORA_CONF").unwrap_or_else(|_| "conf/pinconfig.yaml".to_string());
 
     // Redis setup
-    let redis_url = std::env::var("APIGW_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
+    let redis_url =
+        std::env::var("APIGW_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(actions::init_redis_pool(&redis_url))?;
 
@@ -1029,10 +1027,7 @@ fn main() -> pingora::Result<()> {
 
     // Create and add the OIDC metadata cleanup service.
     let cleanup_service = background_services::OidcMetadataCleanupService::new();
-    my_server.add_service(background_service(
-        "OIDC Cache Cleaner",
-        cleanup_service,
-    ));
+    my_server.add_service(background_service("OIDC Cache Cleaner", cleanup_service));
 
     // Initialize a shared HTTP client for outbound requests (e.g., OIDC).
     // This enables connection pooling to reduce TLS handshake overhead.
