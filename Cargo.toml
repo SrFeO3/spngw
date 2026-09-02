@@ -1,7 +1,8 @@
 [package]
 name = "spngw"
-version = "0.7.4"
+version = "0.7.5"
 edition = "2024"
+license = "Apache-2.0"
 
 [dependencies]
 arc-swap = "1.8"
@@ -10,6 +11,7 @@ base64 = "0.22"
 boring = "4"
 bytes = "1"
 chrono = "0.4"
+clap = { version = "4", features = ["derive", "env"] }
 dashmap = "6"
 env_logger = "0.11"
 fred = "10.1"

@@ -1,6 +1,7 @@
-/target
-/old
 __pycache__/
 *.pyc
 .pytest_cache/
+/old
 reports/
+/target
+/work

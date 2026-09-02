@@ -19,6 +19,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use boring::ex_data::Index;
 use bytes::Bytes;
+use clap::{Parser, Subcommand};
 use dashmap::DashMap;
 use log::{info, warn};
 use pingora::http::ResponseHeader;
@@ -43,6 +44,20 @@ mod background_services;
 const DEFAULT_SESSION_TIMEOUT_SECONDS: u64 = 86400; // 1 day
 /// A short timeout for unauthenticated sessions to prevent store bloat from abandoned login attempts.
 pub const UNAUTHENTICATED_SESSION_TIMEOUT_SECONDS: u64 = 300; // 5 minutes
+
+/// Command-line arguments.
+#[derive(Parser)]
+struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Subcommands.
+#[derive(Subcommand)]
+enum Command {
+    /// Print third-party licensing information and exit.
+    License,
+}
 
 /// Core logic and shared state for the proxy service
 ///
@@ -892,6 +907,14 @@ impl pingora::listeners::TlsAccept for SniCertificateSelector {
 
 fn main() -> pingora::Result<()> {
     env_logger::init();
+
+    let args = Args::parse();
+
+    // `spngw license`: show the third-party notices bundled into the binary and exit.
+    if let Some(Command::License) = args.command {
+        print!("{}", include_str!("../THIRD_PARTY_LICENSES.txt"));
+        return Ok(());
+    }
 
     // Read environment variables
     let config_path = std::env::var("APIGW_INVENTORY_URL").expect(
